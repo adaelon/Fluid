@@ -1,0 +1,58 @@
+# Fluid
+
+面向零代码基础用户的**只读**代码理解环境。在不修改源码任何字节的前提下,用 LLM 生成人类可读的语义投影,帮用户理解代码每一行的含义。
+
+本文件只是术语表——定义每个名词"是什么",不含实现细节、不含决策理由(理由见 `docs/adr/`)。
+
+## Language
+
+**幽灵注释(Ghost Annotation)**:
+LLM 生成的、仅存在于内存/旁路缓存、绝不回写源码的语义解释文本。源码对其他 Agent 的 Token 成本因此为零。
+_Avoid_: 注释、comment(易与源码内真实注释混淆)、批注
+
+**零字节污染(Zero Byte Contamination)**:
+铁律——所有幽灵注释与缓存只写旁路文件,源码文件一个字节都不被改写。
+_Avoid_: 只读、无侵入
+
+**激活单元(Activation Unit)**:
+Fluid 的原子激活/生成/上下文边界,**恒为单个文件**。未打开的文件是绝对真空(零数据、零 Token);打开一个文件即对该文件整体生成语义投影。
+_Avoid_: 函数级激活、视口激活(本项目已废弃更细的激活粒度)
+
+**真空态(Vacuum State)**:
+文件未被打开时的状态——零数据、零调度、零渲染、零 Token。
+
+**函数胶囊(Function Capsule)**:
+函数粒度的语义聚合单元,含函数签名、职责摘要、复杂度、输入输出抽象。文件打开时全量生成,每个胶囊一个 LLM 请求。
+_Avoid_: 函数卡片、函数节点
+
+**重点行(Key Line)**:
+由 AST 启发式判定为"有语义负载"的源码行(含计算的赋值、分支、调用、关键 return 等)。文件打开时只为重点行默认生成行级幽灵注释;import/装饰器/纯结构行跳过。
+_Avoid_: 行原子(Line Atom,旧术语)、每一行
+
+**手动补行(Manual Line Fill)**:
+用户对一个未默认标注的非重点行,主动触发"解释这一行"的单行按需 LLM 生成。
+
+**函数清单(Function Roster)**:
+某文件内全部函数的列表(名称 + 行范围),由 Fluid 自带 AST 解析得出。作为该文件每个函数胶囊生成时的共享上下文注入。
+_Avoid_: 函数列表
+
+**旁路缓存(Bypass Cache)**:
+落盘存储已生成的函数胶囊与行级注释的缓存文件,写在源码之外。缓存键 = 文件内容 hash + 模型版本;命中则零 Token 秒显,内容或模型变更则失效重算。
+_Avoid_: 硬缓存、持久化
+
+**追问器(Query Terminal / queryInline)**:
+当前激活文件的增量问答终端,不是独立会话管理器。追问的 LLM 上下文恒为**整个当前文件**。
+_Avoid_: 聊天框、会话、chatbot
+
+**临时跨文件取源(Ephemeral Cross-File Fetch)**:
+用户明确追问未打开文件里某被调函数的内部实现时,系统只取该函数源码片段、用完即弃的破例。不打开、不缓存、不激活目标文件。
+_Avoid_: 跨文件打开、预加载
+
+**上下文图谱(Context Graph)**:
+管理项目级骨架索引(文件树 + understand-anything 的 nodes/edges)与文件级语义实例化的模块。
+
+**解释引擎(Explanation Engine)**:
+执行 AST 解析、重点行判定、LLM 调度与语义投影编译的模块。
+
+**understand-anything**:
+外部上游工具。产出 `.understand-anything/knowledge-graph.json`,含 file/class/function/document 节点摘要与 edges(calls/imports/...)。函数节点稀疏(不覆盖全部函数)、无行级数据,Fluid 将其作为输入而非完整真相源。
