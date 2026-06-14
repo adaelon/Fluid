@@ -1,0 +1,159 @@
+:root {
+  --bg: #0d1117;
+  --panel: #161b22;
+  --border: #30363d;
+  --text: #c9d1d9;
+  --muted: #8b949e;
+  --accent: #58a6ff;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  font-size: 13px;
+}
+
+.layout {
+  display: grid;
+  grid-template-columns: 280px 1fr;
+  height: 100vh;
+}
+
+/* — Sidebar / file tree — */
+.sidebar {
+  background: var(--panel);
+  border-right: 1px solid var(--border);
+  overflow: auto;
+  padding: 8px 0;
+}
+
+.sidebar-title {
+  padding: 4px 12px 10px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+}
+
+.error {
+  color: #f85149;
+  padding: 0 12px;
+}
+
+.tree-root,
+.children {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.children {
+  padding-left: 14px;
+}
+
+.node .row,
+.node.file {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.node .row:hover,
+.node.file:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.node.file.active {
+  background: rgba(88, 166, 255, 0.15);
+  color: var(--accent);
+}
+
+.caret {
+  width: 12px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.node.file .label {
+  padding-left: 16px;
+}
+
+/* — Editor pane — */
+.editor-pane {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  height: 100vh;
+}
+
+.path-bar {
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border);
+  color: var(--muted);
+  background: var(--panel);
+}
+
+.empty {
+  margin: auto;
+  color: var(--muted);
+}
+
+.cm-host {
+  flex: 1;
+  overflow: auto;
+  min-height: 0;
+}
+
+.cm-host .cm-editor {
+  height: 100%;
+}
+
+/* — Query panel: glass material (§6.3), greyed in S3 vacuum (§7.1).
+   No border-radius / shadow per §7.4 material-continuity rule. — */
+.query-panel {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  width: 320px;
+  padding: 8px;
+  background: rgba(22, 27, 34, 0.92);
+  backdrop-filter: blur(8px);
+  border: 1px solid #333;
+}
+
+.query-panel.disabled {
+  opacity: 0.55;
+}
+
+.query-anchor {
+  font-size: 11px;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+
+.query-input {
+  width: 100%;
+  padding: 6px 8px;
+  background: #1f1f1f;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  font-family: inherit;
+  font-size: 13px;
+}
+
+.query-input:disabled {
+  cursor: not-allowed;
+}
