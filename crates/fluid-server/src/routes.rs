@@ -17,13 +17,18 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::cache_store::CacheStore;
 use crate::graph_loader::{GraphLoader, KnowledgeGraph};
 use crate::project_reader::{FileNode, ProjectReader, ReadErr};
 
-/// Shared server state: file reader + optional knowledge graph.
+/// Shared server state: file reader + optional knowledge graph + bypass cache.
 pub struct AppState {
     pub reader: ProjectReader,
     pub graph: GraphLoader,
+    /// On-disk capsule cache (`.fluid/`). Exercised by S6's `/api/generate`;
+    /// S5 only wires it into state.
+    #[allow(dead_code)] // consumed in S6
+    pub cache: CacheStore,
 }
 
 type Shared = Arc<AppState>;

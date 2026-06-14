@@ -3,6 +3,10 @@
 //! S1: `fluid <project>` starts an axum server exposing the L0 file tree and
 //! single-file source reads. No graph, no LLM, no cache yet.
 
+// cache_store's API is exercised only by its own tests until S6 wires it into
+// `/api/generate`; suppress dead-code noise meanwhile (cf. S4 parser).
+#[allow(dead_code)]
+mod cache_store;
 mod graph_loader;
 mod project_reader;
 mod routes;
@@ -13,9 +17,16 @@ use std::sync::Arc;
 
 use clap::Parser;
 
+use cache_store::CacheStore;
 use graph_loader::GraphLoader;
 use project_reader::ProjectReader;
 use routes::AppState;
+
+/// Prompt template version — bump when the generation prompt changes (invalidates
+/// cache, ADR-0003). The model version is PENDING until LLMProxy lands (S6); a
+/// placeholder keeps the cache keyed without pre-committing model selection.
+const PROMPT_VERSION: &str = "p1";
+const MODEL_VERSION_PLACEHOLDER: &str = "s5-unset";
 
 #[derive(Parser)]
 #[command(name = "fluid", about = "Fluid — read-only code understanding backend")]
@@ -46,7 +57,13 @@ async fn main() -> anyhow::Result<()> {
         None => println!("No knowledge graph (.understand-anything/ absent) — running self-contained"),
     }
 
-    let app = routes::router(Arc::new(AppState { reader, graph }));
+    let cache = CacheStore::new(reader.root(), MODEL_VERSION_PLACEHOLDER, PROMPT_VERSION);
+
+    let app = routes::router(Arc::new(AppState {
+        reader,
+        graph,
+        cache,
+    }));
 
     let addr = SocketAddr::from(([127, 0, 0, 1], args.port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
