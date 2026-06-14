@@ -8,7 +8,8 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      '/api': { target: 'http://127.0.0.1:7878', changeOrigin: true },
+      // `ws: true` so the /api/generate WebSocket (S7) is proxied too, not just HTTP.
+      '/api': { target: 'http://127.0.0.1:7878', changeOrigin: true, ws: true },
     },
   },
 })

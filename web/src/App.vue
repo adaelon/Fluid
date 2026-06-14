@@ -36,7 +36,7 @@ async function open(node: FileNode) {
     </aside>
     <main class="editor-pane">
       <div v-if="current" class="path-bar">{{ current.path }}</div>
-      <Editor v-if="current" :source="current.source" :lang="current.lang" />
+      <Editor v-if="current" :source="current.source" :lang="current.lang" :path="current.path" />
       <div v-else class="empty">从左侧选择一个文件以只读查看源码</div>
     </main>
     <QueryPanel />

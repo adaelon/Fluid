@@ -111,6 +111,14 @@ body {
   color: var(--muted);
 }
 
+.cm-wrap {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
 .cm-host {
   flex: 1;
   overflow: auto;
@@ -156,4 +164,170 @@ body {
 
 .query-input:disabled {
   cursor: not-allowed;
+}
+
+/* — Ghost annotations (需求 §7) — capsule + line share ONE glass pipeline so
+   they read as the same medium at different depths (§7.4 material continuity:
+   no border-radius, no box-shadow, no font difference between the two). — */
+.fluid-ghost {
+  position: relative;
+  margin: 2px 0;
+  padding: 6px 10px 6px 14px;
+  background: rgba(22, 27, 34, 0.85);
+  backdrop-filter: blur(6px);
+  border: 1px solid rgba(48, 54, 61, 0.6);
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  font-size: 13px;
+  /* §7.2/7.3 reveal: height 0 → content via grid fr, with a fade. */
+  display: grid;
+  grid-template-rows: 1fr;
+  animation: fluid-reveal 300ms cubic-bezier(0.25, 1, 0.5, 1);
+}
+
+@keyframes fluid-reveal {
+  from {
+    grid-template-rows: 0fr;
+    opacity: 0;
+  }
+  to {
+    grid-template-rows: 1fr;
+    opacity: 1;
+  }
+}
+
+.fluid-ghost > .fluid-body {
+  min-height: 0;
+  overflow: hidden;
+  /* §7.2/7.3: text opacity 0→1, slight delay after the card opens. */
+  animation: fluid-text-in 200ms ease 100ms backwards;
+}
+
+@keyframes fluid-text-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/* Left semantic color bar — grows from the top (§7.2 step 3 / §7.3 step 3). */
+.fluid-bar {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  background: var(--c, #58a6ff);
+  transform-origin: top;
+  animation: fluid-bar-grow 350ms cubic-bezier(0.25, 1, 0.5, 1);
+}
+
+@keyframes fluid-bar-grow {
+  from {
+    transform: scaleY(0);
+  }
+  to {
+    transform: scaleY(1);
+  }
+}
+
+/* — Capsule — */
+.fluid-capsule {
+  cursor: pointer;
+}
+.fluid-capsule .fluid-sig {
+  color: var(--muted);
+  font-size: 11px;
+  margin-bottom: 2px;
+}
+.fluid-capsule .fluid-summary {
+  color: var(--text);
+}
+.fluid-capsule .fluid-meta {
+  color: var(--muted);
+  font-size: 11px;
+  margin-top: 2px;
+}
+
+/* Folded: collapse to a 4px color edge memory anchor (§7.5); lines hidden,
+   not deleted (kept in GhostStore → unfold is zero-recompute re-render). */
+.fluid-capsule.folded {
+  padding: 0;
+  min-height: 4px;
+  animation: none;
+}
+.fluid-capsule.folded .fluid-bar {
+  width: 100%;
+  height: 4px;
+  bottom: auto;
+  animation: none;
+}
+
+/* — Line annotation (indented under the capsule body) — */
+.fluid-line {
+  margin-left: 28px;
+}
+.fluid-line .fluid-linenum {
+  color: var(--muted);
+  margin-right: 8px;
+}
+.fluid-line .fluid-linetext {
+  color: var(--text);
+}
+
+/* — Generation feedback (S7.5): "生成中" skeleton / "生成失败" chip — */
+.fluid-placeholder {
+  animation: none; /* no reveal; it's a transient state, not a settled card */
+}
+.fluid-placeholder.pending .fluid-body {
+  color: var(--muted);
+  animation: fluid-pulse 1.2s ease-in-out infinite;
+}
+.fluid-placeholder.error .fluid-body {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: #ff7b72;
+}
+.fluid-retry {
+  cursor: pointer;
+  padding: 1px 9px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--text);
+  background: rgba(177, 186, 196, 0.12);
+  border: 1px solid var(--border);
+}
+.fluid-retry:hover {
+  background: rgba(177, 186, 196, 0.22);
+}
+@keyframes fluid-pulse {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 0.85;
+  }
+}
+
+/* Progress chip — floats over the editor; a temporary home until the U1
+   VSCode-style status bar lands. */
+.fluid-progress {
+  position: absolute;
+  top: 8px;
+  right: 14px;
+  z-index: 5;
+  padding: 3px 10px;
+  font-size: 12px;
+  color: var(--text);
+  background: rgba(22, 27, 34, 0.92);
+  backdrop-filter: blur(8px);
+  border: 1px solid var(--border);
+  pointer-events: none;
+  transition: opacity 400ms ease;
+}
+.fluid-progress.done {
+  color: #7ee787;
 }
