@@ -3,11 +3,10 @@
 //! S1: `fluid <project>` starts an axum server exposing the L0 file tree and
 //! single-file source reads. No graph, no LLM, no cache yet.
 
-// cache_store's API is exercised only by its own tests until S6 wires it into
-// `/api/generate`; suppress dead-code noise meanwhile (cf. S4 parser).
-#[allow(dead_code)]
 mod cache_store;
+mod context_assembler;
 mod graph_loader;
+mod llm_proxy;
 mod project_reader;
 mod routes;
 
@@ -19,14 +18,14 @@ use clap::Parser;
 
 use cache_store::CacheStore;
 use graph_loader::GraphLoader;
+use llm_proxy::{LlmProxy, DEFAULT_MODEL};
 use project_reader::ProjectReader;
 use routes::AppState;
 
 /// Prompt template version — bump when the generation prompt changes (invalidates
-/// cache, ADR-0003). The model version is PENDING until LLMProxy lands (S6); a
-/// placeholder keeps the cache keyed without pre-committing model selection.
+/// cache, ADR-0003). The model version is now the real model id (S6); both feed the
+/// cache key so a model/prompt change invalidates cached capsules.
 const PROMPT_VERSION: &str = "p1";
-const MODEL_VERSION_PLACEHOLDER: &str = "s5-unset";
 
 #[derive(Parser)]
 #[command(name = "fluid", about = "Fluid — read-only code understanding backend")]
@@ -41,6 +40,16 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Load `.env` (LLM config) from the CWD/ancestors into the process env before
+    // any env read. Real environment variables take precedence (dotenvy default).
+    // Run fluid from its own repo root, not from inside a served project that has
+    // its own .env. Absent .env is fine (env vars alone still work).
+    match dotenvy::dotenv() {
+        Ok(path) => println!("Loaded .env: {}", path.display()),
+        Err(e) if e.not_found() => {}
+        Err(e) => eprintln!("warning: .env present but unreadable: {e}"),
+    }
+
     let args = Args::parse();
 
     let reader = ProjectReader::new(args.project)
@@ -57,12 +66,23 @@ async fn main() -> anyhow::Result<()> {
         None => println!("No knowledge graph (.understand-anything/ absent) — running self-contained"),
     }
 
-    let cache = CacheStore::new(reader.root(), MODEL_VERSION_PLACEHOLDER, PROMPT_VERSION);
+    // Model id drives both the LLM call and the cache key, so they stay in
+    // lock-step (a model switch invalidates the cache). env-overridable; default
+    // glm-5.1 via the opencode zen gateway (S6 decision, see docs/代码链路.md).
+    let model = std::env::var("FLUID_LLM_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
+    let cache = CacheStore::new(reader.root(), &model, PROMPT_VERSION);
+
+    let llm = LlmProxy::from_env(&model);
+    match &llm {
+        Some(p) => println!("LLM proxy ready: model {}", p.model),
+        None => println!("LLM proxy disabled (OPENCODE_API_KEY unset) — /api/generate will 503 on cache miss"),
+    }
 
     let app = routes::router(Arc::new(AppState {
         reader,
         graph,
         cache,
+        llm,
     }));
 
     let addr = SocketAddr::from(([127, 0, 0, 1], args.port));

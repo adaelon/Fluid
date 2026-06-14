@@ -5,6 +5,9 @@
 # Fluid bypass cache (written into served projects, never this repo — defensive)
 .fluid/
 
+# Local LLM config — holds the API key, never commit. Template: .env.example
+.env
+
 # OS / editor noise
 .DS_Store
 *.swp

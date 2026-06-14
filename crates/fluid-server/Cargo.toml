@@ -17,3 +17,7 @@ clap = { version = "4", features = ["derive"] }
 walkdir = "2"
 anyhow = "1"
 encoding_rs = "0.8"
+# LLM proxy (S6): OpenAI-compatible HTTP. rustls to avoid a system OpenSSL dep on Windows.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Loads .env (LLM config) into the process env at startup; real env vars win.
+dotenvy = "0.15"
