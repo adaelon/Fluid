@@ -1,9 +1,10 @@
-//! HTTP routes for the L0 skeleton (S1).
+//! HTTP routes.
 //!
 //! - `GET /api/project/tree`        -> { files: FileNode[] }
 //! - `GET /api/file?path=<rel>`     -> { source: string }
+//! - `GET /api/project/graph`       -> KnowledgeGraph | null   (S2, optional)
 //!
-//! Both share an `Arc<ProjectReader>` as axum state.
+//! All handlers share an `Arc<AppState>` as axum state.
 
 use std::sync::Arc;
 
@@ -16,15 +17,23 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::graph_loader::{GraphLoader, KnowledgeGraph};
 use crate::project_reader::{FileNode, ProjectReader, ReadErr};
 
-type Shared = Arc<ProjectReader>;
+/// Shared server state: file reader + optional knowledge graph.
+pub struct AppState {
+    pub reader: ProjectReader,
+    pub graph: GraphLoader,
+}
 
-pub fn router(reader: Shared) -> Router {
+type Shared = Arc<AppState>;
+
+pub fn router(state: Shared) -> Router {
     Router::new()
         .route("/api/project/tree", get(tree))
         .route("/api/file", get(file))
-        .with_state(reader)
+        .route("/api/project/graph", get(graph))
+        .with_state(state)
 }
 
 #[derive(Serialize)]
@@ -32,9 +41,9 @@ struct TreeResponse {
     files: Vec<FileNode>,
 }
 
-async fn tree(State(reader): State<Shared>) -> Json<TreeResponse> {
+async fn tree(State(state): State<Shared>) -> Json<TreeResponse> {
     Json(TreeResponse {
-        files: reader.list_files(),
+        files: state.reader.list_files(),
     })
 }
 
@@ -48,12 +57,18 @@ struct FileResponse {
     source: String,
 }
 
-async fn file(State(reader): State<Shared>, Query(q): Query<FileQuery>) -> impl IntoResponse {
-    match reader.read_file(&q.path) {
+async fn file(State(state): State<Shared>, Query(q): Query<FileQuery>) -> impl IntoResponse {
+    match state.reader.read_file(&q.path) {
         Ok(source) => (StatusCode::OK, Json(FileResponse { source })).into_response(),
         Err(ReadErr::NotFound) => (StatusCode::NOT_FOUND, "file not found").into_response(),
         Err(ReadErr::Forbidden) => {
             (StatusCode::FORBIDDEN, "path outside project root").into_response()
         }
     }
+}
+
+/// Returns the knowledge graph, or `null` when no `.understand-anything/` is
+/// present (ADR-0011: optional enhancement, never required).
+async fn graph(State(state): State<Shared>) -> Json<Option<KnowledgeGraph>> {
+    Json(state.graph.graph().cloned())
 }
