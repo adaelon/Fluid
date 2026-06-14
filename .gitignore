@@ -1,0 +1,10 @@
+# Rust build artifacts
+/target
+/crates/**/target
+
+# Fluid bypass cache (written into served projects, never this repo — defensive)
+.fluid/
+
+# OS / editor noise
+.DS_Store
+*.swp
