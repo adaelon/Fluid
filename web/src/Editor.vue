@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue'
-import { EditorState, type Extension } from '@codemirror/state'
+import { Compartment, EditorState, type Extension } from '@codemirror/state'
 import { EditorView } from '@codemirror/view'
 import { basicSetup } from 'codemirror'
 import { python } from '@codemirror/lang-python'
@@ -33,6 +33,54 @@ const phase = ref<'idle' | 'running' | 'done'>('idle')
 const total = ref(0)
 const completed = ref(0)
 
+// Adjustable code font size (U-R2, 需求 §7.6). The .cm-scroller font-size lives in
+// a Compartment so it can be reconfigured live (Ctrl+= / Ctrl+- / Ctrl+0) without
+// rebuilding the editor state. Ghost notes are sized in `em` (styles.css), so they
+// scale with this proportionally. Persisted to localStorage, restored on mount.
+const FONT_KEY = 'fluid:fontPx'
+const FONT_MIN = 9
+const FONT_MAX = 28
+const FONT_DEFAULT = 13
+const fontCompartment = new Compartment()
+const fontPx = ref(loadFontPx())
+
+function loadFontPx(): number {
+  const raw = Number(localStorage.getItem(FONT_KEY))
+  return Number.isFinite(raw) && raw > 0 ? clampFont(raw) : FONT_DEFAULT
+}
+
+function clampFont(px: number): number {
+  return Math.min(FONT_MAX, Math.max(FONT_MIN, Math.round(px)))
+}
+
+function fontTheme(px: number): Extension {
+  return EditorView.theme({ '.cm-scroller': { fontSize: `${px}px` } })
+}
+
+// Apply a new code font size: clamp, persist, and reconfigure live.
+function setFont(px: number): void {
+  const next = clampFont(px)
+  if (next === fontPx.value) return
+  fontPx.value = next
+  localStorage.setItem(FONT_KEY, String(next))
+  view.value?.dispatch({ effects: fontCompartment.reconfigure(fontTheme(next)) })
+}
+
+// Ctrl+= zoom in / Ctrl+- zoom out / Ctrl+0 reset (need + handles shifted '=').
+function onFontKey(e: KeyboardEvent): void {
+  if (!e.ctrlKey || e.altKey || e.metaKey) return
+  if (e.key === '=' || e.key === '+') {
+    e.preventDefault()
+    setFont(fontPx.value + 1)
+  } else if (e.key === '-' || e.key === '_') {
+    e.preventDefault()
+    setFont(fontPx.value - 1)
+  } else if (e.key === '0') {
+    e.preventDefault()
+    setFont(FONT_DEFAULT)
+  }
+}
+
 function langExtension(lang: string): Extension {
   if (lang === 'py') return python()
   if (lang === 'rs') return rust()
@@ -45,6 +93,7 @@ function buildState(source: string, lang: string): EditorState {
     extensions: [
       basicSetup,
       fluidDarkTheme,
+      fontCompartment.of(fontTheme(fontPx.value)),
       langExtension(lang),
       EditorState.readOnly.of(true),
       EditorView.editable.of(false),
@@ -220,6 +269,7 @@ onMounted(() => {
     state: buildState(props.source, props.lang),
     parent: host.value!,
   })
+  window.addEventListener('keydown', onFontKey)
   void activate(props.source, props.lang, props.path)
 })
 
@@ -232,6 +282,7 @@ watch(
 )
 
 onBeforeUnmount(() => {
+  window.removeEventListener('keydown', onFontKey)
   teardownWs()
   view.value?.destroy()
   view.value = null

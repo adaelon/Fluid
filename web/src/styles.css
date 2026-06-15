@@ -171,9 +171,11 @@ body {
    no shadow). Layout differs: the capsule is a single-line header above the
    function definition; line notes float into a fixed-width right rail aligned
    to their source line. — */
+/* font-size is `em` (not px) so ghost notes scale proportionally with the code
+   font set on .cm-scroller via the Editor's font Compartment (U-R2, §7.6). */
 .fluid-ghost {
   font-family: 'Inter', system-ui, -apple-system, sans-serif;
-  font-size: 12px;
+  font-size: 0.92em;
   color: var(--text);
 }
 
