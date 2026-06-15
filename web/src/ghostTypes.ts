@@ -27,3 +27,11 @@ export type GenFrame =
   | { kind: 'line'; reqId: string; line: LineAnnotation }
   | { kind: 'done'; reqId: string }
   | { kind: 'error'; reqId: string; message: string }
+
+/** One inbound frame from `WS /api/query` (S10a, routes.rs QueryFrame). The answer
+ *  is free-form markdown streamed as `delta` chunks; terminal frames are
+ *  `done` | `error`. `reqId` echoes the request. */
+export type QueryFrame =
+  | { kind: 'delta'; reqId: string; text: string }
+  | { kind: 'done'; reqId: string }
+  | { kind: 'error'; reqId: string; message: string }

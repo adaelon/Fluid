@@ -320,41 +320,110 @@ body {
   height: 100%;
 }
 
-/* — Query panel: glass material (§6.3), greyed in S3 vacuum (§7.1).
-   No border-radius / shadow per §7.4 material-continuity rule. — */
+/* — Query panel (S10b): docked as a bottom panel under the editor, above the
+   status bar. Was a fixed bottom-right overlay (S3) — re-homed here to resolve the
+   right-edge collision with trailing line notes (ADR-0016 PENDING). Standard IDE
+   chrome (the §7.4 glass rule now scopes only to in-code annotations, ADR-0015). — */
 .query-panel {
-  position: fixed;
-  right: 16px;
-  bottom: 32px; /* clear the 24px status bar (U1) */
-  width: 320px;
-  padding: 8px;
-  background: rgba(22, 27, 34, 0.92);
-  backdrop-filter: blur(8px);
-  border: 1px solid #333;
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  max-height: 240px;
+  border-top: 1px solid var(--border);
+  background: var(--panel);
 }
 
 .query-panel.disabled {
-  opacity: 0.55;
+  opacity: 0.7;
 }
 
-.query-anchor {
+.query-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 24px;
+  padding: 0 10px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+}
+
+.query-title {
   font-size: 11px;
   color: var(--muted);
-  margin-bottom: 6px;
+  letter-spacing: 0.04em;
+}
+
+.query-collapse {
+  background: none;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.query-vacuum {
+  padding: 10px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.query-answer {
+  flex: 1;
+  min-height: 60px;
+  overflow-y: auto;
+  padding: 10px;
+  font-size: 13px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  color: var(--text);
+}
+
+.query-hint,
+.query-thinking {
+  color: var(--muted);
+}
+
+.query-error {
+  color: #ff7b72;
+}
+
+.query-form {
+  flex: none;
+  display: flex;
+  gap: 6px;
+  padding: 8px 10px;
+  border-top: 1px solid var(--border);
 }
 
 .query-input {
-  width: 100%;
+  flex: 1;
   padding: 6px 8px;
   background: #1f1f1f;
   border: 1px solid var(--border);
-  color: var(--muted);
+  color: var(--text);
   font-family: inherit;
   font-size: 13px;
 }
 
 .query-input:disabled {
   cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.query-send {
+  flex: none;
+  padding: 6px 12px;
+  background: var(--accent);
+  border: none;
+  color: #0d1117;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.query-send:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
 }
 
 /* — Ghost annotations (需求 §7, ADR-0016) — the capsule header and right-rail

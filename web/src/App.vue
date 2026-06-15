@@ -189,8 +189,8 @@ function closeTab(path: string) {
         />
         <div v-else class="empty">从左侧选择一个文件以只读查看源码</div>
       </main>
-      <QueryPanel />
     </div>
+    <QueryPanel :path="current?.path ?? null" />
     <StatusBar :path="current?.path ?? null" :lang="current?.lang ?? null" :progress="genProgress" />
   </div>
 </template>

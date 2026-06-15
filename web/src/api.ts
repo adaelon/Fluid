@@ -2,7 +2,7 @@
 // Requests go to /api/* and are proxied to 127.0.0.1:7878 in dev (vite.config.ts).
 
 import type { FunctionSpan } from './parser/types.ts'
-import type { LineAnnotation } from './ghostTypes'
+import type { LineAnnotation, QueryFrame } from './ghostTypes'
 
 export type Lang = 'py' | 'rs' | 'other'
 
@@ -63,4 +63,75 @@ export async function explainLine(req: {
   })
   if (!res.ok) throw new Error((await res.text()) || `/api/explain-line -> ${res.status}`)
   return (await res.json()) as LineAnnotation
+}
+
+/** Callbacks for a streaming follow-up query (S10b). */
+export interface QueryHandlers {
+  onDelta: (text: string) => void
+  onDone: () => void
+  onError: (message: string) => void
+}
+
+/** Handle to an in-flight query stream; `cancel` tears the socket down silently. */
+export interface QueryStream {
+  cancel: () => void
+}
+
+/** Open `WS /api/query`, send one question, and stream the answer back token by
+ *  token (S10a frames: delta×N → done | error). One socket per question; it is
+ *  closed on the terminal frame or on `cancel` (file switch / unmount). The S10a
+ *  backend treats roster/capsules/focus as optional — S10b sends only filePath +
+ *  question, leaving layered-capsule injection to a later enhancement. */
+export function streamQuery(
+  req: { filePath: string; question: string },
+  h: QueryHandlers,
+): QueryStream {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws'
+  const sock = new WebSocket(`${proto}://${location.host}/api/query`)
+  let settled = false
+  const close = () => {
+    try {
+      sock.close()
+    } catch {
+      /* already closing */
+    }
+  }
+  sock.onopen = () => {
+    sock.send(JSON.stringify({ reqId: 'q', filePath: req.filePath, question: req.question }))
+  }
+  sock.onmessage = (ev) => {
+    let frame: QueryFrame
+    try {
+      frame = JSON.parse(ev.data as string) as QueryFrame
+    } catch {
+      return
+    }
+    if (frame.kind === 'delta') h.onDelta(frame.text)
+    else if (frame.kind === 'done') {
+      settled = true
+      h.onDone()
+      close()
+    } else if (frame.kind === 'error') {
+      settled = true
+      h.onError(frame.message)
+      close()
+    }
+  }
+  sock.onerror = () => {
+    if (settled) return
+    settled = true
+    h.onError('连接失败')
+    close()
+  }
+  sock.onclose = () => {
+    if (settled) return
+    settled = true
+    h.onError('连接已关闭')
+  }
+  return {
+    cancel: () => {
+      settled = true
+      close()
+    },
+  }
 }
