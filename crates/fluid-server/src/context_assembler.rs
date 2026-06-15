@@ -220,7 +220,8 @@ pub fn build_query_prompt(
     ctx: &GenContext,
 ) -> (String, String) {
     let system = "你是 Fluid 的代码理解助手，面向零代码基础的读者。\
-基于下面给定的【当前文件上下文】回答用户的追问，用简体中文，可使用简单 markdown。\
+基于下面给定的【当前文件上下文】回答用户的追问，用简体中文，可使用简单 markdown；\
+需要数学公式时用 LaTeX（行内 $...$、块级 $$...$$）。\
 只依据给定信息作答；信息不足时直说，不要臆造未给出的代码细节。";
 
     let mut user = String::new();
@@ -410,6 +411,7 @@ mod tests {
             &ctx,
         );
         assert!(system.contains("当前文件上下文"));
+        assert!(system.contains("LaTeX")); // 答案可含数学公式 (ADR-0008)
         assert!(user.contains("【文件摘要】配置加载模块"));
         assert!(user.contains("【本文件函数清单】load, save"));
         assert!(user.contains("【各函数摘要】load: 读配置; save: 写配置"));

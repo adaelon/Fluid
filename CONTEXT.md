@@ -41,7 +41,7 @@ _Avoid_: 函数列表
 _Avoid_: 硬缓存、持久化
 
 **追问器(Query Terminal / queryInline)**:
-当前激活文件的增量问答终端,不是独立会话管理器。追问的 LLM 上下文恒为**整个当前文件**。
+当前激活文件的增量问答终端,不是独立会话管理器。追问的 LLM 上下文恒为**整个当前文件**。答案是 Markdown 文本(可含 LaTeX 数学公式),流式期间逐 token 显纯文本、完成后由前端渲染为格式化视图;渲染只在答案面板,源码零字节不变。
 _Avoid_: 聊天框、会话、chatbot
 
 **临时跨文件取源(Ephemeral Cross-File Fetch)**:

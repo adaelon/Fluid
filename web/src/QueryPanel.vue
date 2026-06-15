@@ -4,8 +4,12 @@
 // notes). Asks the current file a free-form question and streams the answer back
 // token by token over WS /api/query (S10a). Context is the whole current file
 // (CONTEXT 追问器); switching files vacuums the in-flight Q&A.
-import { ref, watch, onBeforeUnmount } from 'vue'
+import { ref, watch, nextTick, onBeforeUnmount } from 'vue'
+import DOMPurify from 'dompurify'
+import renderMathInElement from 'katex/contrib/auto-render'
+import 'katex/dist/katex.min.css'
 import { streamQuery, type QueryStream } from './api'
+import { renderMarkdown } from './render/markdown'
 import { EMPTY_QUERY_CONTEXT, type QueryContext } from './queryContext'
 
 const props = withDefaults(
@@ -14,10 +18,12 @@ const props = withDefaults(
 )
 
 const question = ref('')
-const answer = ref('')
+const answer = ref('') // plain token-by-token text shown while streaming
+const answerHtml = ref('') // sanitized Markdown HTML, set once on `done`
 const streaming = ref(false)
 const errorMsg = ref('')
 const collapsed = ref(false)
+const renderedEl = ref<HTMLElement | null>(null)
 let stream: QueryStream | null = null
 
 function teardown() {
@@ -32,15 +38,34 @@ watch(
   () => {
     teardown()
     answer.value = ''
+    answerHtml.value = ''
     errorMsg.value = ''
     question.value = ''
   },
 )
 
+// On `done`, render the full Markdown answer (ADR-0008): markdown-it escapes raw
+// HTML, DOMPurify is defense-in-depth, then KaTeX transforms $…$/$$…$$ in the DOM.
+async function renderAnswer() {
+  answerHtml.value = DOMPurify.sanitize(renderMarkdown(answer.value))
+  await nextTick()
+  if (!renderedEl.value) return
+  renderMathInElement(renderedEl.value, {
+    delimiters: [
+      { left: '$$', right: '$$', display: true },
+      { left: '$', right: '$', display: false },
+      { left: '\\[', right: '\\]', display: true },
+      { left: '\\(', right: '\\)', display: false },
+    ],
+    throwOnError: false,
+  })
+}
+
 function ask() {
   const q = question.value.trim()
   if (!q || !props.path || streaming.value) return
   answer.value = ''
+  answerHtml.value = ''
   errorMsg.value = ''
   streaming.value = true
   stream = streamQuery(
@@ -57,6 +82,7 @@ function ask() {
       onDone: () => {
         streaming.value = false
         stream = null
+        void renderAnswer()
       },
       onError: (m) => {
         errorMsg.value = m
@@ -83,6 +109,7 @@ onBeforeUnmount(teardown)
       <template v-else>
         <div class="query-answer">
           <span v-if="errorMsg" class="query-error">{{ errorMsg }}</span>
+          <div v-else-if="answerHtml" ref="renderedEl" class="query-answer-md" v-html="answerHtml"></div>
           <template v-else-if="answer">{{ answer }}</template>
           <span v-else-if="streaming" class="query-thinking">思考中…</span>
           <span v-else class="query-hint">就当前文件提问，例如「这个文件做什么？」</span>
