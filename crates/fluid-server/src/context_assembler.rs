@@ -203,6 +203,66 @@ JSON 形如：{\"text\":\"...\",\"color\":\"#7ee787\"}";
     (system.to_string(), user)
 }
 
+/// Build the (system, user) messages for a free-form follow-up question about the
+/// current file (S10a query). ADR-0006 default tier: the *whole file is present at
+/// summary granularity* (file summary + every function's capsule summary + edges +
+/// cross-file one-liners) so the model keeps global sight, while only the focused
+/// function is zoomed to *source granularity*. The answer is free-form markdown
+/// (not JSON), streamed back token-by-token — there is no parse step.
+///
+/// `capsules` is `(fn name, summary)` for the file's already-generated functions;
+/// `focus` is the source (with its 1-based start line) of the function the user is
+/// focused on, or `None` for a file-level question.
+pub fn build_query_prompt(
+    question: &str,
+    capsules: &[(String, String)],
+    focus: Option<(&str, u32)>,
+    ctx: &GenContext,
+) -> (String, String) {
+    let system = "你是 Fluid 的代码理解助手，面向零代码基础的读者。\
+基于下面给定的【当前文件上下文】回答用户的追问，用简体中文，可使用简单 markdown。\
+只依据给定信息作答；信息不足时直说，不要臆造未给出的代码细节。";
+
+    let mut user = String::new();
+    if let Some(fs) = &ctx.file_summary {
+        user.push_str(&format!("【文件摘要】{fs}\n"));
+    }
+    if !ctx.roster.is_empty() {
+        user.push_str(&format!("【本文件函数清单】{}\n", ctx.roster.join(", ")));
+    }
+    if !capsules.is_empty() {
+        let cs: Vec<String> = capsules
+            .iter()
+            .map(|(name, summary)| format!("{name}: {summary}"))
+            .collect();
+        user.push_str(&format!("【各函数摘要】{}\n", cs.join("; ")));
+    }
+    if !ctx.edges.is_empty() {
+        let rels: Vec<String> = ctx
+            .edges
+            .iter()
+            .map(|e| format!("{}-{}->{}", e.source, e.edge_type, e.target))
+            .collect();
+        user.push_str(&format!("【相关关系(calls/imports)】{}\n", rels.join("; ")));
+    }
+    if !ctx.callee_summaries.is_empty() {
+        let cs: Vec<String> = ctx
+            .callee_summaries
+            .iter()
+            .map(|(k, v)| format!("{k}: {v}"))
+            .collect();
+        user.push_str(&format!("【跨文件被调摘要】{}\n", cs.join("; ")));
+    }
+    if let Some((src, start)) = focus {
+        user.push_str("【聚焦函数源码(带绝对行号)】\n");
+        user.push_str(&number_lines(src, start));
+        user.push('\n');
+    }
+    user.push_str(&format!("\n【用户问题】{question}\n"));
+
+    (system.to_string(), user)
+}
+
 /// Prefix each line with its absolute line number, e.g. `  12 | code`.
 fn number_lines(src: &str, start_line: u32) -> String {
     src.lines()
@@ -330,5 +390,40 @@ mod tests {
         assert!(user.contains("【所在函数】f"));
         assert!(user.contains("【目标行号】11"));
         assert!(user.contains("  11 |     y = 1"));
+    }
+
+    #[test]
+    fn query_prompt_carries_layered_context_and_focus_source() {
+        let g = KnowledgeGraph {
+            nodes: vec![node("file:a.py", "file", "a.py", "配置加载模块")],
+            edges: vec![],
+        };
+        let ctx = assemble_gen_context(Some(&g), "a.py", &["load".into(), "save".into()], &SharedContext::default());
+        let capsules = vec![
+            ("load".to_string(), "读配置".to_string()),
+            ("save".to_string(), "写配置".to_string()),
+        ];
+        let (system, user) = build_query_prompt(
+            "load 为什么要先校验？",
+            &capsules,
+            Some(("def load():\n    return 1", 10)),
+            &ctx,
+        );
+        assert!(system.contains("当前文件上下文"));
+        assert!(user.contains("【文件摘要】配置加载模块"));
+        assert!(user.contains("【本文件函数清单】load, save"));
+        assert!(user.contains("【各函数摘要】load: 读配置; save: 写配置"));
+        assert!(user.contains("【聚焦函数源码(带绝对行号)】"));
+        assert!(user.contains("  10 | def load():"));
+        assert!(user.contains("【用户问题】load 为什么要先校验？"));
+    }
+
+    #[test]
+    fn query_prompt_omits_focus_and_capsules_when_absent() {
+        let ctx = assemble_gen_context(None, "a.py", &[], &SharedContext::default());
+        let (_, user) = build_query_prompt("这个文件是做什么的？", &[], None, &ctx);
+        assert!(!user.contains("【各函数摘要】"));
+        assert!(!user.contains("【聚焦函数源码"));
+        assert!(user.contains("【用户问题】这个文件是做什么的？"));
     }
 }

@@ -24,12 +24,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::cache_store::{Capsule, CacheStore, CapsuleEntry, LineAnnotation};
 use crate::context_assembler::{
-    assemble_gen_context, build_explain_line_prompt, build_gen_prompt, slice_span, FunctionSpan,
-    SharedContext,
+    assemble_gen_context, build_explain_line_prompt, build_gen_prompt, build_query_prompt,
+    slice_span, FunctionSpan, SharedContext,
 };
 use crate::graph_loader::{GraphLoader, KnowledgeGraph};
-use crate::llm_proxy::{parse_generation, parse_line_annotation, LlmProxy};
+use crate::llm_proxy::{parse_generation, parse_line_annotation, LlmProxy, SseDecoder};
 use crate::project_reader::{FileNode, ProjectReader, ReadErr};
+use futures_util::StreamExt;
 
 /// The root-bound trio: file reader + optional knowledge graph + bypass cache.
 /// All three are rebuilt together when the project root changes (U3 Open Folder),
@@ -83,6 +84,7 @@ pub fn router(state: Shared) -> Router {
         .route("/api/project/pick", post(pick_folder))
         .route("/api/explain-line", post(explain_line))
         .route("/api/generate", get(generate_ws))
+        .route("/api/query", get(query_ws))
         .with_state(state)
 }
 
@@ -508,6 +510,210 @@ async fn explain_line(
     }
 }
 
+// — WS /api/query — streaming follow-up Q&A over the current file (S10a) —
+//
+// Unlike /api/generate (structured capsule/line frames from a single non-streaming
+// call), a query answer is free-form markdown streamed token-by-token. Protocol:
+//
+//   ok   : delta×N → done
+//   fail : error                  (terminal, no done)
+//
+// Context is assembled per ADR-0006 *default tier*: the whole file at summary
+// granularity (file summary + every function's capsule summary + edges + cross-file
+// one-liners) plus the focused function at source granularity. Over-window
+// degradation (S10a-降级) and cross-file ephemeral fetch (S10c) are NOT wired here.
+
+#[derive(Deserialize)]
+struct CapsuleSummary {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    summary: String,
+}
+
+#[derive(Deserialize)]
+struct QueryRequest {
+    #[serde(rename = "reqId", default)]
+    req_id: String,
+    #[serde(rename = "filePath")]
+    file_path: String,
+    question: String,
+    /// The function the user is focused on (its source is zoomed in); None = file-level.
+    #[serde(default)]
+    focus: Option<FunctionSpan>,
+    #[serde(default)]
+    roster: Vec<String>,
+    /// Per-function capsule summaries the frontend already holds (ghost store).
+    #[serde(default)]
+    capsules: Vec<CapsuleSummary>,
+    #[serde(default)]
+    shared: SharedContext,
+}
+
+/// One outbound frame on the `/api/query` socket (kebab `kind`: `delta` / `done` /
+/// `error`); `reqId` injected by the sender.
+#[derive(Debug, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+enum QueryFrame {
+    Delta { text: String },
+    Done,
+    Error { message: String },
+}
+
+/// The synchronous (locked) phase of a query: either an early terminal error, or
+/// the assembled `(system, user)` prompt for the streaming LLM call.
+enum QueryStep {
+    Err(String),
+    NeedLlm { system: String, user: String },
+}
+
+/// Assemble the query prompt while holding the project lock, then hand it back so
+/// the caller can stream the LLM call *after* the lock is dropped (no lock across
+/// await, mirroring `run_generation`).
+fn prepare_query(state: &AppState, req: &QueryRequest) -> QueryStep {
+    let proj = state.project.read().unwrap();
+
+    let source = match proj.reader.read_file(&req.file_path) {
+        Ok(s) => s,
+        Err(ReadErr::NotFound) => return QueryStep::Err("file not found".into()),
+        Err(ReadErr::Forbidden) => return QueryStep::Err("path outside project root".into()),
+    };
+
+    // The focused function zoomed to source granularity, if a focus was given.
+    let focus = match &req.focus {
+        Some(f) => match slice_span(&source, f.line_range) {
+            Some(src) => Some((src, f.line_range[0])),
+            None => return QueryStep::Err("invalid lineRange for focus".into()),
+        },
+        None => None,
+    };
+
+    if state.llm.is_none() {
+        return QueryStep::Err("LLM not configured: set OPENCODE_API_KEY".into());
+    }
+
+    let ctx = assemble_gen_context(proj.graph.graph(), &req.file_path, &req.roster, &req.shared);
+    let capsules: Vec<(String, String)> = req
+        .capsules
+        .iter()
+        .map(|c| (c.name.clone(), c.summary.clone()))
+        .collect();
+    let focus_ref = focus.as_ref().map(|(s, n)| (s.as_str(), *n));
+    let (system, user) = build_query_prompt(&req.question, &capsules, focus_ref, &ctx);
+    QueryStep::NeedLlm { system, user }
+}
+
+/// Run one query request, streaming `delta` frames to the socket then `done`. On a
+/// pre-LLM error or an LLM/stream failure, a single terminal `error` frame is sent
+/// and the socket is left alive for the next question. `Err(())` means the peer is
+/// gone (a send failed) and the caller should stop reading.
+async fn run_query(
+    state: &AppState,
+    req: QueryRequest,
+    socket: &mut WebSocket,
+    req_id: &str,
+) -> Result<(), ()> {
+    let (system, user) = match prepare_query(state, &req) {
+        QueryStep::Err(msg) => {
+            return send_query_frame(socket, req_id, &QueryFrame::Error { message: msg })
+                .await
+                .map_err(|_| ());
+        }
+        QueryStep::NeedLlm { system, user } => (system, user),
+    };
+
+    let llm = state.llm.as_ref().expect("NeedLlm implies llm is Some");
+    eprintln!("[query] {} — streaming ({})", req.file_path, llm.model);
+    let resp = match llm.open_chat_stream(&system, &user).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[query] LLM error {}: {e}", req.file_path);
+            return send_query_frame(
+                socket,
+                req_id,
+                &QueryFrame::Error { message: format!("LLM error: {e}") },
+            )
+            .await
+            .map_err(|_| ());
+        }
+    };
+
+    let mut stream = resp.bytes_stream();
+    let mut decoder = SseDecoder::new();
+    while let Some(chunk) = stream.next().await {
+        let bytes = match chunk {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("[query] stream error {}: {e}", req.file_path);
+                return send_query_frame(
+                    socket,
+                    req_id,
+                    &QueryFrame::Error { message: format!("LLM stream error: {e}") },
+                )
+                .await
+                .map_err(|_| ());
+            }
+        };
+        for delta in decoder.push(&String::from_utf8_lossy(&bytes)) {
+            send_query_frame(socket, req_id, &QueryFrame::Delta { text: delta })
+                .await
+                .map_err(|_| ())?;
+        }
+    }
+
+    send_query_frame(socket, req_id, &QueryFrame::Done)
+        .await
+        .map_err(|_| ())
+}
+
+async fn query_ws(ws: WebSocketUpgrade, State(state): State<Shared>) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_query_socket(socket, state))
+}
+
+/// Drive one `/api/query` socket: read question frames, stream each answer back
+/// tagged with the request's `reqId`.
+async fn handle_query_socket(mut socket: WebSocket, state: Shared) {
+    while let Some(Ok(msg)) = socket.recv().await {
+        let text = match msg {
+            Message::Text(t) => t,
+            Message::Close(_) => break,
+            _ => continue,
+        };
+
+        let req: QueryRequest = match serde_json::from_str(&text) {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = send_query_frame(
+                    &mut socket,
+                    "",
+                    &QueryFrame::Error { message: format!("bad request: {e}") },
+                )
+                .await;
+                continue;
+            }
+        };
+        let req_id = req.req_id.clone();
+        if run_query(&state, req, &mut socket, &req_id).await.is_err() {
+            return; // peer gone
+        }
+    }
+}
+
+/// Serialize a query frame and inject `reqId` before sending it as a text message.
+async fn send_query_frame(
+    socket: &mut WebSocket,
+    req_id: &str,
+    frame: &QueryFrame,
+) -> Result<(), axum::Error> {
+    let mut v = serde_json::to_value(frame).unwrap_or_else(|_| {
+        serde_json::json!({ "kind": "error", "message": "frame serialize failed" })
+    });
+    if let serde_json::Value::Object(map) = &mut v {
+        map.insert("reqId".to_string(), serde_json::Value::String(req_id.to_string()));
+    }
+    socket.send(Message::Text(v.to_string())).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -790,5 +996,69 @@ mod tests {
         let state = make_state(tmp.path(), None);
         let err = run_explain_line(&state, explain_req("nope.py", [1, 2], 1)).await.unwrap_err();
         assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
+
+    // — S10a /api/query —
+
+    fn query_req(file_path: &str, focus: Option<[u32; 2]>) -> QueryRequest {
+        QueryRequest {
+            req_id: "q1".into(),
+            file_path: file_path.into(),
+            question: "这个函数做什么？".into(),
+            focus: focus.map(|lr| FunctionSpan {
+                id: "f#1".into(),
+                name: "f".into(),
+                line_range: lr,
+            }),
+            roster: vec![],
+            capsules: vec![],
+            shared: SharedContext::default(),
+        }
+    }
+
+    #[test]
+    fn query_frame_serializes_with_kebab_kind() {
+        let v = serde_json::to_value(QueryFrame::Delta { text: "你好".into() }).unwrap();
+        assert_eq!(v["kind"], "delta");
+        assert_eq!(v["text"], "你好");
+        let v = serde_json::to_value(QueryFrame::Done).unwrap();
+        assert_eq!(v["kind"], "done");
+        let v = serde_json::to_value(QueryFrame::Error { message: "x".into() }).unwrap();
+        assert_eq!(v["kind"], "error");
+        assert_eq!(v["message"], "x");
+    }
+
+    #[test]
+    fn prepare_query_without_llm_is_an_error() {
+        let tmp = TmpDir::new();
+        std::fs::write(tmp.path().join("a.py"), "def f():\n    return 1\n").unwrap();
+        let state = make_state(tmp.path(), None);
+        match prepare_query(&state, &query_req("a.py", Some([1, 2]))) {
+            QueryStep::Err(msg) => assert!(msg.contains("LLM not configured")),
+            _ => panic!("expected Err without llm"),
+        }
+    }
+
+    #[test]
+    fn prepare_query_rejects_invalid_focus_range() {
+        let tmp = TmpDir::new();
+        std::fs::write(tmp.path().join("a.py"), "def f():\n    return 1\n").unwrap();
+        let state = make_state(tmp.path(), None);
+        // Line 9 is out of bounds for the 2-line file → focus slice fails *before* the
+        // llm check, so this reports the focus error rather than "LLM not configured".
+        match prepare_query(&state, &query_req("a.py", Some([1, 9]))) {
+            QueryStep::Err(msg) => assert!(msg.contains("invalid lineRange for focus")),
+            _ => panic!("expected Err on bad focus"),
+        }
+    }
+
+    #[test]
+    fn prepare_query_missing_file_is_an_error() {
+        let tmp = TmpDir::new();
+        let state = make_state(tmp.path(), None);
+        match prepare_query(&state, &query_req("nope.py", None)) {
+            QueryStep::Err(msg) => assert!(msg.contains("file not found")),
+            _ => panic!("expected Err for missing file"),
+        }
     }
 }

@@ -79,6 +79,86 @@ impl LlmProxy {
             .map(|c| c.message.content)
             .ok_or_else(|| anyhow::anyhow!("LLM returned no choices"))
     }
+
+    /// Open a streaming chat completion (`stream: true`) and return the live
+    /// `reqwest::Response` once headers are in and the status is success (S10a
+    /// /api/query). The caller drives `resp.bytes_stream()` through an `SseDecoder`
+    /// to pull content deltas. A non-2xx status is drained and turned into an error
+    /// here, so the caller only ever streams a healthy body.
+    pub async fn open_chat_stream(&self, system: &str, user: &str) -> anyhow::Result<reqwest::Response> {
+        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
+        let body = serde_json::json!({
+            "model": self.model,
+            "temperature": 0.2,
+            "stream": true,
+            "messages": [
+                { "role": "system", "content": system },
+                { "role": "user", "content": user },
+            ],
+        });
+
+        let resp = self
+            .client
+            .post(&url)
+            .bearer_auth(&self.api_key)
+            .json(&body)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("LLM HTTP {status}: {text}");
+        }
+        Ok(resp)
+    }
+}
+
+/// Incremental decoder for an OpenAI-compatible SSE stream. The byte stream is
+/// chunked arbitrarily (a chunk may split a line mid-way), so `push` buffers a
+/// trailing partial line and only emits content deltas for *complete* `data:`
+/// lines. The `[DONE]` sentinel and role-only/empty deltas yield nothing.
+#[derive(Default)]
+pub struct SseDecoder {
+    buf: String,
+}
+
+impl SseDecoder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append a raw text chunk and return the content deltas of any lines that are
+    /// now complete (ended by a newline). A trailing partial line stays buffered.
+    pub fn push(&mut self, chunk: &str) -> Vec<String> {
+        self.buf.push_str(chunk);
+        let mut out = Vec::new();
+        while let Some(nl) = self.buf.find('\n') {
+            let line: String = self.buf.drain(..=nl).collect();
+            let line = line.trim();
+            let Some(data) = line.strip_prefix("data:") else {
+                continue; // SSE comment / blank separator / event: line
+            };
+            let data = data.trim();
+            if data.is_empty() || data == "[DONE]" {
+                continue;
+            }
+            if let Some(delta) = parse_chunk_delta(data) {
+                if !delta.is_empty() {
+                    out.push(delta);
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Pull `choices[0].delta.content` out of one SSE `data:` JSON payload, if present.
+fn parse_chunk_delta(data: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(data).ok()?;
+    v["choices"][0]["delta"]["content"]
+        .as_str()
+        .map(|s| s.to_string())
 }
 
 #[derive(Deserialize)]
@@ -284,5 +364,43 @@ mod tests {
     #[test]
     fn non_json_line_is_an_error_not_a_panic() {
         assert!(parse_line_annotation("我不知道", "f#1", 2).is_err());
+    }
+
+    #[test]
+    fn sse_decoder_extracts_content_deltas_in_order() {
+        let mut d = SseDecoder::new();
+        let out = d.push(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"你\"}}]}\n\
+             data: {\"choices\":[{\"delta\":{\"content\":\"好\"}}]}\n",
+        );
+        assert_eq!(out, vec!["你".to_string(), "好".to_string()]);
+    }
+
+    #[test]
+    fn sse_decoder_buffers_a_partial_line_across_pushes() {
+        let mut d = SseDecoder::new();
+        // First chunk cuts the JSON line in half — nothing complete yet.
+        assert!(d.push("data: {\"choices\":[{\"delta\":{\"con").is_empty());
+        // Second chunk completes the line.
+        let out = d.push("tent\":\"x\"}}]}\n");
+        assert_eq!(out, vec!["x".to_string()]);
+    }
+
+    #[test]
+    fn sse_decoder_skips_done_sentinel_and_role_only_delta() {
+        let mut d = SseDecoder::new();
+        let out = d.push(
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\
+             data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\
+             data: [DONE]\n",
+        );
+        assert_eq!(out, vec!["hi".to_string()]);
+    }
+
+    #[test]
+    fn sse_decoder_ignores_blank_lines_and_comments() {
+        let mut d = SseDecoder::new();
+        let out = d.push(": keep-alive\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n");
+        assert_eq!(out, vec!["a".to_string()]);
     }
 }

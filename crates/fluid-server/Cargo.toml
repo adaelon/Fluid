@@ -18,7 +18,10 @@ walkdir = "2"
 anyhow = "1"
 encoding_rs = "0.8"
 # LLM proxy (S6): OpenAI-compatible HTTP. rustls to avoid a system OpenSSL dep on Windows.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# `stream` enables `bytes_stream()` for SSE token streaming (S10a /api/query).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+# StreamExt::next over reqwest's byte stream (S10a streaming).
+futures-util = { version = "0.3", default-features = false }
 # Loads .env (LLM config) into the process env at startup; real env vars win.
 dotenvy = "0.15"
 # Native OS folder picker for Open Folder (U3 revision). The local backend pops
