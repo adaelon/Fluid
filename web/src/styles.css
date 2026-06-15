@@ -179,11 +179,70 @@ body {
   font-weight: 600;
 }
 
+/* — Tab strip (U2): one tab per open file; active is highlighted. — */
+.tabs {
+  display: flex;
+  flex: none;
+  background: #0d1117;
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+}
+.tab {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  max-width: 200px;
+  border-right: 1px solid var(--border);
+  border-top: 2px solid transparent;
+  color: var(--muted);
+  background: transparent;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.tab:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+.tab.active {
+  color: var(--text);
+  background: var(--panel);
+  border-top-color: var(--accent);
+}
+.tab-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tab-close {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  line-height: 14px;
+  padding: 0;
+  font-size: 14px;
+  color: var(--muted);
+  background: none;
+  border: none;
+  border-radius: 3px;
+  cursor: pointer;
+}
+.tab-close:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.12);
+}
+
+/* — Breadcrumb path bar (U2) — */
 .path-bar {
   padding: 6px 12px;
   border-bottom: 1px solid var(--border);
   color: var(--muted);
   background: var(--panel);
+}
+.crumb {
+  display: inline;
+}
+.crumb-sep {
+  margin: 0 6px;
+  opacity: 0.6;
 }
 
 .empty {
