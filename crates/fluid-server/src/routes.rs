@@ -23,9 +23,12 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::cache_store::{Capsule, CacheStore, CapsuleEntry, LineAnnotation};
-use crate::context_assembler::{assemble_gen_context, build_gen_prompt, slice_span, FunctionSpan, SharedContext};
+use crate::context_assembler::{
+    assemble_gen_context, build_explain_line_prompt, build_gen_prompt, slice_span, FunctionSpan,
+    SharedContext,
+};
 use crate::graph_loader::{GraphLoader, KnowledgeGraph};
-use crate::llm_proxy::{parse_generation, LlmProxy};
+use crate::llm_proxy::{parse_generation, parse_line_annotation, LlmProxy};
 use crate::project_reader::{FileNode, ProjectReader, ReadErr};
 
 /// The root-bound trio: file reader + optional knowledge graph + bypass cache.
@@ -78,6 +81,7 @@ pub fn router(state: Shared) -> Router {
         .route("/api/project/graph", get(graph))
         .route("/api/project/open", post(open_folder))
         .route("/api/project/pick", post(pick_folder))
+        .route("/api/explain-line", post(explain_line))
         .route("/api/generate", get(generate_ws))
         .with_state(state)
 }
@@ -366,6 +370,144 @@ async fn send_frame(socket: &mut WebSocket, req_id: &str, frame: &GenFrame) -> R
     socket.send(Message::Text(v.to_string())).await
 }
 
+// — POST /api/explain-line — manual single-line fill (S9) —
+//
+// The long-tail companion to /api/generate: a function's capsule + key lines are
+// generated on open, but NON-key lines stay bare by design (CONTEXT 重点行 vs
+// 手动补行). This endpoint explains one such line on demand, returning a single
+// `LineAnnotation`. Unlike generate it's a plain request/response (one line, no
+// streaming). A cache hit returns before the LLM is consulted (zero-token, like
+// run_generation); the line entry is keyed by `line_key` so it never aliases the
+// function's capsule entry.
+
+#[derive(Deserialize)]
+struct ExplainLineRequest {
+    #[serde(rename = "filePath")]
+    file_path: String,
+    #[serde(rename = "fn")]
+    func: FunctionSpan,
+    #[serde(rename = "lineNumber")]
+    line_number: u32,
+    #[serde(default)]
+    roster: Vec<String>,
+    #[serde(default)]
+    shared: SharedContext,
+}
+
+/// Resolve one manual-line annotation to either a finished line (cache hit / the
+/// LLM result) or an error mapped to an HTTP status. Mirrors `run_generation`'s
+/// lock discipline: the project lock is held only for the synchronous
+/// read/slice/cache/assemble phase and dropped before the LLM await.
+async fn run_explain_line(
+    state: &AppState,
+    req: ExplainLineRequest,
+) -> Result<LineAnnotation, (StatusCode, String)> {
+    enum Step {
+        Ready(LineAnnotation),
+        NeedLlm {
+            system: String,
+            user: String,
+            fn_source: String,
+        },
+    }
+
+    let step = {
+        let proj = state.project.read().unwrap();
+
+        let source = match proj.reader.read_file(&req.file_path) {
+            Ok(s) => s,
+            Err(ReadErr::NotFound) => return Err((StatusCode::NOT_FOUND, "file not found".into())),
+            Err(ReadErr::Forbidden) => {
+                return Err((StatusCode::FORBIDDEN, "path outside project root".into()))
+            }
+        };
+        let Some(fn_source) = slice_span(&source, req.func.line_range) else {
+            return Err((StatusCode::BAD_REQUEST, "invalid lineRange for file".into()));
+        };
+        // The target line must sit inside the enclosing function span.
+        let [start, end] = req.func.line_range;
+        if req.line_number < start || req.line_number > end {
+            return Err((StatusCode::BAD_REQUEST, "lineNumber outside function".into()));
+        }
+
+        if let Some(line) = proj.cache.get_line(&fn_source, req.line_number) {
+            eprintln!(
+                "[explain-line] cache HIT {}#{} L{} — zero token",
+                req.file_path, req.func.name, req.line_number
+            );
+            Step::Ready(line)
+        } else if state.llm.is_none() {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "LLM not configured: set OPENCODE_API_KEY".into(),
+            ));
+        } else {
+            let ctx =
+                assemble_gen_context(proj.graph.graph(), &req.file_path, &req.roster, &req.shared);
+            let (system, user) =
+                build_explain_line_prompt(&req.func, &fn_source, req.line_number, &ctx);
+            Step::NeedLlm { system, user, fn_source }
+        }
+    }; // project lock dropped here — before any await.
+
+    let (system, user, fn_source) = match step {
+        Step::Ready(line) => return Ok(line),
+        Step::NeedLlm { system, user, fn_source } => (system, user, fn_source),
+    };
+
+    let llm = state.llm.as_ref().expect("NeedLlm implies llm is Some");
+    eprintln!(
+        "[explain-line] cache MISS {}#{} L{} — calling LLM ({})",
+        req.file_path, req.func.name, req.line_number, llm.model
+    );
+    let content = match llm.complete(&system, &user).await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "[explain-line] LLM error {}#{} L{}: {e}",
+                req.file_path, req.func.name, req.line_number
+            );
+            return Err((StatusCode::BAD_GATEWAY, format!("LLM error: {e}")));
+        }
+    };
+    let line = match parse_line_annotation(&content, &req.func.id, req.line_number) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!(
+                "[explain-line] LLM parse error {}#{} L{}: {e}",
+                req.file_path, req.func.name, req.line_number
+            );
+            return Err((StatusCode::BAD_GATEWAY, format!("LLM parse error: {e}")));
+        }
+    };
+
+    // Persist for the next open (best-effort; a write failure must not fail the
+    // response). Re-acquire the lock briefly for the cache write.
+    if let Err(e) = state
+        .project
+        .read()
+        .unwrap()
+        .cache
+        .put_line(&fn_source, req.line_number, &line)
+    {
+        eprintln!("[explain-line] warning: cache put failed: {e}");
+    }
+
+    Ok(line)
+}
+
+/// `POST /api/explain-line { filePath, fn, lineNumber, roster?, shared? }` →
+/// `LineAnnotation` (200), or a status + message on error (S9).
+async fn explain_line(
+    State(state): State<Shared>,
+    Json(req): Json<ExplainLineRequest>,
+) -> impl IntoResponse {
+    match run_explain_line(&state, req).await {
+        Ok(line) => (StatusCode::OK, Json(line)).into_response(),
+        Err((code, msg)) => (code, msg).into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -575,5 +717,78 @@ mod tests {
             proj.reader.read_file("b.py/../../etc"),
             Err(ReadErr::Forbidden)
         ));
+    }
+
+    // — S9 explain-line —
+
+    fn explain_req(file_path: &str, line_range: [u32; 2], line_number: u32) -> ExplainLineRequest {
+        ExplainLineRequest {
+            file_path: file_path.into(),
+            func: FunctionSpan {
+                id: "f#1".into(),
+                name: "f".into(),
+                line_range,
+            },
+            line_number,
+            roster: vec![],
+            shared: SharedContext::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn explain_line_cache_hit_returns_line_with_zero_llm() {
+        let tmp = TmpDir::new();
+        std::fs::write(tmp.path().join("a.py"), "def f():\n    return 1\n").unwrap();
+        // llm: None — yet a pre-populated line cache must still succeed (zero token).
+        let state = make_state(tmp.path(), None);
+        let fn_source = "def f():\n    return 1";
+        state
+            .project
+            .read()
+            .unwrap()
+            .cache
+            .put_line(fn_source, 2, &line("f#1", 2))
+            .unwrap();
+
+        let got = run_explain_line(&state, explain_req("a.py", [1, 2], 2)).await;
+        assert_eq!(got.unwrap(), line("f#1", 2));
+    }
+
+    #[tokio::test]
+    async fn explain_line_invalid_line_range_is_bad_request() {
+        let tmp = TmpDir::new();
+        std::fs::write(tmp.path().join("a.py"), "def f():\n    return 1\n").unwrap();
+        let state = make_state(tmp.path(), None);
+        let err = run_explain_line(&state, explain_req("a.py", [5, 9], 5)).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn explain_line_outside_function_is_bad_request() {
+        let tmp = TmpDir::new();
+        std::fs::write(tmp.path().join("a.py"), "def f():\n    return 1\n").unwrap();
+        let state = make_state(tmp.path(), None);
+        // Line 9 is outside the function span [1, 2].
+        let err = run_explain_line(&state, explain_req("a.py", [1, 2], 9)).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("outside function"));
+    }
+
+    #[tokio::test]
+    async fn explain_line_miss_without_llm_is_service_unavailable() {
+        let tmp = TmpDir::new();
+        std::fs::write(tmp.path().join("a.py"), "def f():\n    return 1\n").unwrap();
+        let state = make_state(tmp.path(), None);
+        let err = run_explain_line(&state, explain_req("a.py", [1, 2], 2)).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(err.1.contains("LLM not configured"));
+    }
+
+    #[tokio::test]
+    async fn explain_line_missing_file_is_not_found() {
+        let tmp = TmpDir::new();
+        let state = make_state(tmp.path(), None);
+        let err = run_explain_line(&state, explain_req("nope.py", [1, 2], 1)).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
     }
 }

@@ -114,6 +114,47 @@ impl CacheStore {
     fn path_for(&self, fn_source: &str) -> PathBuf {
         self.dir.join(format!("{}.json", self.key(fn_source)))
     }
+
+    /// Cache key for a single manual-line annotation (S9 explain-line). Folds the
+    /// target line number and a discriminant into the function-span key, so a
+    /// line entry never aliases the function's capsule entry (different bytes →
+    /// different hash) even for the same source.
+    pub fn line_key(&self, fn_source: &str, line_number: u32) -> String {
+        let mut hash = FNV_OFFSET;
+        for part in [
+            self.model_version.as_str(),
+            self.prompt_version.as_str(),
+            "explain-line",
+            fn_source,
+        ] {
+            // NUL separator so concatenation can't alias across fields.
+            hash = fnv1a_step(hash, part.as_bytes());
+            hash = fnv1a_step(hash, &[0]);
+        }
+        hash = fnv1a_step(hash, &line_number.to_le_bytes());
+        hash = fnv1a_step(hash, &[0]);
+        format!("{hash:016x}")
+    }
+
+    /// Look up a single manual-line annotation. Same miss/corrupt semantics as
+    /// `get` (S9): a missing or unreadable entry reads as absent → recompute.
+    pub fn get_line(&self, fn_source: &str, line_number: u32) -> Option<LineAnnotation> {
+        let path = self.line_path_for(fn_source, line_number);
+        let bytes = std::fs::read(&path).ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    /// Persist a single manual-line annotation under `.fluid/capsules/<line_key>.json`.
+    pub fn put_line(&self, fn_source: &str, line_number: u32, line: &LineAnnotation) -> std::io::Result<()> {
+        std::fs::create_dir_all(&self.dir)?;
+        let json = serde_json::to_vec_pretty(line)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(self.line_path_for(fn_source, line_number), json)
+    }
+
+    fn line_path_for(&self, fn_source: &str, line_number: u32) -> PathBuf {
+        self.dir.join(format!("{}.json", self.line_key(fn_source, line_number)))
+    }
 }
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
@@ -234,6 +275,52 @@ mod tests {
         std::fs::write(cap_dir.join(format!("{}.json", cache.key(src))), b"{ not json").unwrap();
 
         assert!(cache.get(src).is_none(), "corrupt entry must read as miss");
+    }
+
+    fn sample_line(fn_id: &str, n: u32) -> LineAnnotation {
+        LineAnnotation {
+            fn_id: fn_id.to_string(),
+            line_number: n,
+            text: "把结果赋给 x".to_string(),
+            color: "#f0883e".to_string(),
+        }
+    }
+
+    #[test]
+    fn line_put_then_get_hits_and_round_trips() {
+        let dir = tempdir_guard::TempDir::new();
+        let cache = store(dir.path());
+        let src = "def f(x):\n    y = x + 1\n    return y\n";
+        let line = sample_line("f#1", 2);
+
+        assert!(cache.get_line(src, 2).is_none(), "cold line cache must miss");
+        cache.put_line(src, 2, &line).unwrap();
+        assert_eq!(cache.get_line(src, 2), Some(line));
+    }
+
+    #[test]
+    fn line_key_differs_from_capsule_key_and_per_line() {
+        let dir = tempdir_guard::TempDir::new();
+        let cache = store(dir.path());
+        let src = "def f(x):\n    y = x + 1\n    return y\n";
+        // A line key never aliases the function's capsule key for the same source.
+        assert_ne!(cache.line_key(src, 2), cache.key(src));
+        // Different target lines get distinct keys.
+        assert_ne!(cache.line_key(src, 2), cache.line_key(src, 3));
+    }
+
+    #[test]
+    fn line_cache_misses_on_changed_span_or_version() {
+        let dir = tempdir_guard::TempDir::new();
+        let src = "def f(x):\n    y = x + 1\n    return y\n";
+        store(dir.path()).put_line(src, 2, &sample_line("f#1", 2)).unwrap();
+
+        // Edited span → different line key → miss.
+        let edited = "def f(x):\n    y = x + 2\n    return y\n";
+        assert!(store(dir.path()).get_line(edited, 2).is_none());
+        // Bumped model version → miss (same invalidation as capsules, ADR-0003).
+        let bumped = CacheStore::new(dir.path(), "model-v2", "prompt-v1");
+        assert!(bumped.get_line(src, 2).is_none());
     }
 
     /// Minimal self-cleaning temp dir (same pattern as project_reader's S1 tests;

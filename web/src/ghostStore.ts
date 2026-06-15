@@ -22,6 +22,8 @@ export class GhostStore {
   private status = new Map<string, GhostStatus>()
   /** Last error message per function (S7.6): shown on the "生成失败" chip. */
   private errors = new Map<string, string>()
+  /** In-flight manual line fills (S9): `${fnId}:${lineNumber}` → "解释中…" hotspot. */
+  private explaining = new Set<string>()
 
   /** Drop everything — called on file close / switch (releases memory, §7 VACUUM). */
   reset(): void {
@@ -32,6 +34,7 @@ export class GhostStore {
     this.folded.clear()
     this.status.clear()
     this.errors.clear()
+    this.explaining.clear()
   }
 
   /** Establish the functions to render and their key lines (from tree-sitter). */
@@ -95,5 +98,23 @@ export class GhostStore {
 
   errorOf(fnId: string): string {
     return this.errors.get(fnId) ?? ''
+  }
+
+  // — manual line fill in-flight (S9) —
+
+  private explainKey(fnId: string, lineNumber: number): string {
+    return `${fnId}:${lineNumber}`
+  }
+
+  markExplaining(fnId: string, lineNumber: number): void {
+    this.explaining.add(this.explainKey(fnId, lineNumber))
+  }
+
+  clearExplaining(fnId: string, lineNumber: number): void {
+    this.explaining.delete(this.explainKey(fnId, lineNumber))
+  }
+
+  isExplaining(fnId: string, lineNumber: number): boolean {
+    return this.explaining.has(this.explainKey(fnId, lineNumber))
   }
 }

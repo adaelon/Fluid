@@ -12,6 +12,7 @@ import type { GhostStore } from '../ghostStore'
 import { CapsuleWidget } from './capsuleWidget'
 import { LineWidget } from './lineWidget'
 import { PlaceholderWidget } from './placeholderWidget'
+import { ExplainHotspotWidget } from './gutter'
 
 /** Dispatched after the store changes to ask the field to re-project. */
 export const refreshGhosts = StateEffect.define<void>()
@@ -51,6 +52,24 @@ function build(store: GhostStore, state: EditorState): DecorationSet {
         // fixed gap right of the code (trailing each line), wrapping when long and
         // growing the line height so code stays at the row top (ADR-0016).
         ranges.push(Decoration.widget({ widget: new LineWidget(ln), side: 1 }).range(at))
+      }
+
+      // S9 manual line fill: once the function is generated (capsule present),
+      // offer a hover-revealed "解释这一行" hotspot on each eligible NON-key line —
+      // inside the body (excludes the def line), not a key line (those auto-
+      // annotate), not already annotated, and not blank. import/structure lines
+      // outside any function are naturally excluded (no enclosing fn).
+      if (store.capsule(fn.id)) {
+        const keyLines = new Set(store.keyLinesOf(fn.id))
+        const annotated = new Set(store.lines(fn.id).map((l) => l.lineNumber))
+        const end = Math.min(fn.lineRange[1], docLines)
+        for (let l = start + 1; l <= end; l++) {
+          if (keyLines.has(l) || annotated.has(l)) continue
+          const lineObj = state.doc.line(l)
+          if (lineObj.text.trim() === '') continue
+          const widget = new ExplainHotspotWidget(fn.id, l, store.isExplaining(fn.id, l))
+          ranges.push(Decoration.widget({ widget, side: 1 }).range(lineObj.to))
+        }
       }
     }
   }

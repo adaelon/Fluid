@@ -160,6 +160,42 @@ pub fn parse_generation(content: &str, fn_id: &str) -> anyhow::Result<(Capsule, 
     Ok((capsule, lines))
 }
 
+#[derive(Deserialize)]
+struct RawLineAnnotation {
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    color: String,
+}
+
+/// Parse the model's reply for a single manual-line explanation (S9) into one
+/// `LineAnnotation`. The model returns only `{text, color}`; `fn_id` and
+/// `line_number` are injected by us. Tolerates fences/prose like `parse_generation`;
+/// an empty `text` is an error (no point caching a blank annotation), a missing
+/// color defaults to the neutral tone.
+pub fn parse_line_annotation(
+    content: &str,
+    fn_id: &str,
+    line_number: u32,
+) -> anyhow::Result<LineAnnotation> {
+    let json = extract_json(content);
+    let raw: RawLineAnnotation = serde_json::from_str(json)
+        .map_err(|e| anyhow::anyhow!("LLM did not return the expected JSON: {e}; content: {content}"))?;
+    if raw.text.trim().is_empty() {
+        anyhow::bail!("LLM returned an empty line annotation; content: {content}");
+    }
+    Ok(LineAnnotation {
+        fn_id: fn_id.to_string(),
+        line_number,
+        text: raw.text,
+        color: if raw.color.trim().is_empty() {
+            DEFAULT_LINE_COLOR.to_string()
+        } else {
+            raw.color
+        },
+    })
+}
+
 /// Pull the JSON object out of the model's reply: strips a leading ```/```json
 /// fence if present, otherwise takes the span from the first `{` to the last `}`.
 fn extract_json(content: &str) -> &str {
@@ -219,5 +255,34 @@ mod tests {
     #[test]
     fn non_json_is_an_error_not_a_panic() {
         assert!(parse_generation("抱歉我无法完成", "f#1").is_err());
+    }
+
+    #[test]
+    fn parses_single_line_annotation_and_injects_fn_id_and_line() {
+        let content = r##"{"text":"把 x+1 赋给 y","color":"#f0883e"}"##;
+        let line = parse_line_annotation(content, "f#1", 12).unwrap();
+        assert_eq!(line.fn_id, "f#1");
+        assert_eq!(line.line_number, 12);
+        assert_eq!(line.text, "把 x+1 赋给 y");
+        assert_eq!(line.color, "#f0883e");
+    }
+
+    #[test]
+    fn line_annotation_missing_color_defaults() {
+        let content = r#"包裹一下：{"text":"返回结果"} 完"#;
+        let line = parse_line_annotation(content, "g#3", 5).unwrap();
+        assert_eq!(line.text, "返回结果");
+        assert_eq!(line.color, DEFAULT_LINE_COLOR);
+    }
+
+    #[test]
+    fn empty_line_text_is_an_error() {
+        let content = r##"{"text":"   ","color":"#7ee787"}"##;
+        assert!(parse_line_annotation(content, "f#1", 2).is_err());
+    }
+
+    #[test]
+    fn non_json_line_is_an_error_not_a_panic() {
+        assert!(parse_line_annotation("我不知道", "f#1", 2).is_err());
     }
 }

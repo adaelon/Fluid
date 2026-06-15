@@ -173,6 +173,36 @@ JSON 形如：{\"capsule\":{\"signature\":\"...\",\"summary\":\"...\",\"complexi
     (system.to_string(), user)
 }
 
+/// Build the (system, user) messages for explaining ONE arbitrary line (S9 manual
+/// line fill). Unlike `build_gen_prompt` this asks for a single annotation on the
+/// target line, returned as a bare `{text, color}` JSON object. The enclosing
+/// function source is shown with absolute line numbers so the model can ground the
+/// target line in its local context.
+pub fn build_explain_line_prompt(
+    func: &FunctionSpan,
+    fn_source: &str,
+    line_number: u32,
+    ctx: &GenContext,
+) -> (String, String) {
+    let system = "你是 Fluid 的代码理解助手，面向零代码基础的读者。\
+用户指定了某个函数内的【某一行】，请用一句简体中文解释这一行在做什么、为什么，\
+结合所在函数的上下文，但避免逐字复述代码。\
+给一个语义色温的十六进制颜色（color，如 #7ee787 表正常流、#f0883e 表分支、#ff7b72 表异常/return）。\
+只输出一个 JSON 对象，禁止任何额外文字或 markdown 代码围栏。\
+JSON 形如：{\"text\":\"...\",\"color\":\"#7ee787\"}";
+
+    let mut user = String::new();
+    if let Some(fs) = &ctx.file_summary {
+        user.push_str(&format!("【文件摘要】{fs}\n"));
+    }
+    user.push_str(&format!("【所在函数】{}\n", func.name));
+    user.push_str(&format!("【目标行号】{line_number}\n"));
+    user.push_str("【源码(带绝对行号)】\n");
+    user.push_str(&number_lines(fn_source, func.line_range[0]));
+
+    (system.to_string(), user)
+}
+
 /// Prefix each line with its absolute line number, e.g. `  12 | code`.
 fn number_lines(src: &str, start_line: u32) -> String {
     src.lines()
@@ -283,5 +313,22 @@ mod tests {
         assert!(user.contains("  10 | def f():"));
         assert!(user.contains("  11 |     return 1"));
         assert!(user.contains("【需要标注的重点行(行号)】11"));
+    }
+
+    #[test]
+    fn explain_line_prompt_numbers_lines_and_targets_the_line() {
+        let func = FunctionSpan {
+            id: "f#10".into(),
+            name: "f".into(),
+            line_range: [10, 12],
+        };
+        let ctx = assemble_gen_context(None, "a.py", &["f".into()], &SharedContext::default());
+        let (system, user) =
+            build_explain_line_prompt(&func, "def f():\n    y = 1\n    return y", 11, &ctx);
+        assert!(system.contains("某一行"));
+        assert!(system.contains("{\"text\":"));
+        assert!(user.contains("【所在函数】f"));
+        assert!(user.contains("【目标行号】11"));
+        assert!(user.contains("  11 |     y = 1"));
     }
 }

@@ -7,6 +7,8 @@ import { python } from '@codemirror/lang-python'
 import { rust } from '@codemirror/lang-rust'
 import { GhostStore } from './ghostStore'
 import { ghostField, foldClickHandler, retryClickHandler, refreshGhosts } from './render/ghostField'
+import { fnGutter, explainClickHandler } from './render/gutter'
+import { explainLine as fetchExplainLine } from './api'
 import { getParser } from './parser/browser'
 import { fluidDarkTheme } from './theme'
 import { GenScheduler, viewportDistance } from './scheduler'
@@ -109,8 +111,10 @@ function buildState(source: string, lang: string): EditorState {
       EditorState.readOnly.of(true),
       EditorView.editable.of(false),
       ghostField(store),
+      fnGutter(store),
       foldClickHandler(store),
       retryClickHandler(retry),
+      explainClickHandler(explainLine),
       // Scroll → re-order the pending generation queue by the new viewport (S8).
       EditorView.updateListener.of((u) => {
         if (u.viewportChanged) scheduler?.reprioritize(viewportDist())
@@ -212,6 +216,28 @@ function retry(fnId: string): void {
   phase.value = 'running'
   refresh()
   scheduler?.retry(fnId)
+}
+
+// Manual single-line fill (S9): explain one non-key line on demand via
+// POST /api/explain-line, then drop the returned annotation into the store. A
+// "解释中…" hotspot shows while in flight. Guarded by activationToken so a file
+// switch mid-request can't apply the result to the wrong file.
+async function explainLine(fnId: string, lineNumber: number): Promise<void> {
+  const fn = currentRoster.find((r) => r.id === fnId)
+  if (!fn || store.isExplaining(fnId, lineNumber)) return
+  const token = activationToken
+  store.markExplaining(fnId, lineNumber)
+  refresh()
+  try {
+    const line = await fetchExplainLine({ filePath: currentPath, fn, lineNumber })
+    if (token !== activationToken) return // switched files mid-request
+    store.putLine(line)
+  } catch (e) {
+    console.warn('[explain-line]', fnId, lineNumber, e)
+  } finally {
+    store.clearExplaining(fnId, lineNumber)
+    refresh()
+  }
 }
 
 // Activate a file: parse → open WS → stream per-function generation → render.

@@ -486,3 +486,49 @@ body {
     opacity: 0.85;
   }
 }
+
+/* — S9 gutter dot: a hollow ring on each function's start line (§7.2 discovery).
+   Gutter chrome, not annotation material, so a radius is fine here (§7.4 governs
+   only the in-code glass notes). — */
+.fluid-fn-gutter {
+  width: 12px;
+}
+.fluid-gutter-fn-dot {
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  margin-top: 0.5em;
+  border: 1px solid #484f58;
+  border-radius: 50%;
+  box-sizing: border-box;
+}
+
+/* — S9 manual line fill: "解释这一行" hotspot, hidden until its line is hovered;
+   trails the code like a line note but is an affordance (not §7.4 glass). — */
+.fluid-explain-hotspot {
+  display: inline-block;
+  vertical-align: top;
+  margin-left: 28px;
+  padding: 0 8px;
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  font-size: 0.82em;
+  line-height: 1.5;
+  color: var(--muted);
+  background: rgba(177, 186, 196, 0.08);
+  border: 1px solid var(--border);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+.cm-line:hover .fluid-explain-hotspot {
+  opacity: 0.7;
+}
+.fluid-explain-hotspot:hover {
+  opacity: 1;
+  background: rgba(177, 186, 196, 0.18);
+}
+.fluid-explain-hotspot.loading {
+  opacity: 1;
+  cursor: default;
+  animation: fluid-pulse 1.2s ease-in-out infinite;
+}
