@@ -24,3 +24,15 @@ export async function fetchFile(path: string): Promise<string> {
   const data = (await res.json()) as { source: string }
   return data.source
 }
+
+/** POST /api/project/open { path } -> new canonical root (U3 single-root swap). */
+export async function openFolder(path: string): Promise<string> {
+  const res = await fetch('/api/project/open', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path }),
+  })
+  if (!res.ok) throw new Error((await res.text()) || `/api/project/open -> ${res.status}`)
+  const data = (await res.json()) as { root: string }
+  return data.root
+}

@@ -54,9 +54,16 @@ pub struct ProjectReader {
 
 impl ProjectReader {
     /// Build a reader rooted at `root`. The root is canonicalized so later
-    /// `starts_with` containment checks are sound.
+    /// `starts_with` containment checks are sound, and must be a directory
+    /// (U3 Open Folder feeds arbitrary user paths here).
     pub fn new(root: PathBuf) -> std::io::Result<Self> {
         let root = root.canonicalize()?;
+        if !root.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "project root is not a directory",
+            ));
+        }
         Ok(Self { root })
     }
 

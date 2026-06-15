@@ -78,12 +78,14 @@ async fn main() -> anyhow::Result<()> {
         None => println!("LLM proxy disabled (OPENCODE_API_KEY unset) — /api/generate will 503 on cache miss"),
     }
 
-    let app = routes::router(Arc::new(AppState {
+    let app = routes::router(Arc::new(AppState::new(
         reader,
         graph,
         cache,
         llm,
-    }));
+        model,
+        PROMPT_VERSION,
+    )));
 
     let addr = SocketAddr::from(([127, 0, 0, 1], args.port));
     let listener = tokio::net::TcpListener::bind(addr).await?;

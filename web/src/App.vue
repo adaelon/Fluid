@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
-import { fetchFile, fetchTree, type FileNode } from './api'
+import { fetchFile, fetchTree, openFolder, type FileNode } from './api'
 import FileTree from './FileTree.vue'
 import Editor from './Editor.vue'
 import QueryPanel from './QueryPanel.vue'
@@ -86,6 +86,28 @@ function activate(path: string) {
   activePath.value = path
 }
 
+// Open Folder (U3): switch the backend project root, then reload the tree and
+// drop all open tabs (the old root's files no longer belong to this session).
+const folderInput = ref('')
+const switching = ref(false)
+async function switchFolder() {
+  const path = folderInput.value.trim()
+  if (!path || switching.value) return
+  switching.value = true
+  loadError.value = null
+  try {
+    await openFolder(path)
+    openFiles.value = []
+    activePath.value = null
+    files.value = await fetchTree()
+    folderInput.value = ''
+  } catch (e) {
+    loadError.value = String(e)
+  } finally {
+    switching.value = false
+  }
+}
+
 // Close a tab; if it was active, fall to the right neighbor, else the left,
 // else vacuum (U2).
 function closeTab(path: string) {
@@ -104,6 +126,17 @@ function closeTab(path: string) {
       <ActivityBar />
       <aside class="sidebar" :style="{ width: sidebarWidth + 'px' }">
         <div class="sidebar-title">资源管理器</div>
+        <form class="open-folder" @submit.prevent="switchFolder">
+          <input
+            v-model="folderInput"
+            class="open-folder-input"
+            placeholder="打开文件夹:输入绝对路径"
+            :disabled="switching"
+          />
+          <button class="open-folder-btn" type="submit" :disabled="switching || !folderInput.trim()">
+            {{ switching ? '…' : '打开' }}
+          </button>
+        </form>
         <p v-if="loadError" class="error">{{ loadError }}</p>
         <FileTree :files="files" :active="current?.path ?? null" @select="open" />
       </aside>

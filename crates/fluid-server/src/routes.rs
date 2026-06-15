@@ -7,7 +7,8 @@
 //!
 //! All handlers share an `Arc<AppState>` as axum state.
 
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 
 use axum::{
     extract::{
@@ -16,7 +17,7 @@ use axum::{
     },
     http::StatusCode,
     response::IntoResponse,
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -27,15 +28,45 @@ use crate::graph_loader::{GraphLoader, KnowledgeGraph};
 use crate::llm_proxy::{parse_generation, LlmProxy};
 use crate::project_reader::{FileNode, ProjectReader, ReadErr};
 
-/// Shared server state: file reader + optional knowledge graph + bypass cache +
-/// optional LLM proxy (None when no API key is configured — S1–S5 paths still work).
+/// The root-bound trio: file reader + optional knowledge graph + bypass cache.
+/// All three are rebuilt together when the project root changes (U3 Open Folder),
+/// so they live behind one lock and swap atomically.
+struct ProjectCtx {
+    reader: ProjectReader,
+    graph: GraphLoader,
+    cache: CacheStore,
+}
+
+/// Shared server state. The root-bound `project` swaps on Open Folder (U3); the
+/// LLM proxy and the model/prompt versions are root-independent (the latter two
+/// are kept so the cache can be rebuilt for a new root with the same key inputs).
 pub struct AppState {
-    pub reader: ProjectReader,
-    pub graph: GraphLoader,
-    /// On-disk capsule cache (`.fluid/`), consumed by `/api/generate` (S6).
-    pub cache: CacheStore,
+    /// Swappable per-project context (reader + graph + cache).
+    project: RwLock<ProjectCtx>,
     /// LLM proxy; `None` when `OPENCODE_API_KEY` is unset (generate → error frame).
-    pub llm: Option<LlmProxy>,
+    llm: Option<LlmProxy>,
+    /// Model id — feeds the cache key; needed to rebuild the cache on root swap.
+    model: String,
+    /// Prompt template version — feeds the cache key (ADR-0003).
+    prompt_version: &'static str,
+}
+
+impl AppState {
+    pub fn new(
+        reader: ProjectReader,
+        graph: GraphLoader,
+        cache: CacheStore,
+        llm: Option<LlmProxy>,
+        model: String,
+        prompt_version: &'static str,
+    ) -> Self {
+        Self {
+            project: RwLock::new(ProjectCtx { reader, graph, cache }),
+            llm,
+            model,
+            prompt_version,
+        }
+    }
 }
 
 type Shared = Arc<AppState>;
@@ -45,6 +76,7 @@ pub fn router(state: Shared) -> Router {
         .route("/api/project/tree", get(tree))
         .route("/api/file", get(file))
         .route("/api/project/graph", get(graph))
+        .route("/api/project/open", post(open_folder))
         .route("/api/generate", get(generate_ws))
         .with_state(state)
 }
@@ -56,7 +88,7 @@ struct TreeResponse {
 
 async fn tree(State(state): State<Shared>) -> Json<TreeResponse> {
     Json(TreeResponse {
-        files: state.reader.list_files(),
+        files: state.project.read().unwrap().reader.list_files(),
     })
 }
 
@@ -71,7 +103,8 @@ struct FileResponse {
 }
 
 async fn file(State(state): State<Shared>, Query(q): Query<FileQuery>) -> impl IntoResponse {
-    match state.reader.read_file(&q.path) {
+    let result = state.project.read().unwrap().reader.read_file(&q.path);
+    match result {
         Ok(source) => (StatusCode::OK, Json(FileResponse { source })).into_response(),
         Err(ReadErr::NotFound) => (StatusCode::NOT_FOUND, "file not found").into_response(),
         Err(ReadErr::Forbidden) => {
@@ -83,7 +116,37 @@ async fn file(State(state): State<Shared>, Query(q): Query<FileQuery>) -> impl I
 /// Returns the knowledge graph, or `null` when no `.understand-anything/` is
 /// present (ADR-0011: optional enhancement, never required).
 async fn graph(State(state): State<Shared>) -> Json<Option<KnowledgeGraph>> {
-    Json(state.graph.graph().cloned())
+    Json(state.project.read().unwrap().graph.graph().cloned())
+}
+
+#[derive(Deserialize)]
+struct OpenRequest {
+    path: String,
+}
+
+#[derive(Serialize)]
+struct OpenResponse {
+    root: String,
+}
+
+/// `POST /api/project/open { path }` — switch the served project root (U3, single
+/// root swap). Validates the path is an existing directory, then atomically swaps
+/// in a fresh reader + graph + cache built for the new root (same model/prompt so
+/// the cache key inputs are unchanged). Traversal protection is per-reader, so the
+/// new reader enforces containment against the new root automatically.
+async fn open_folder(State(state): State<Shared>, Json(req): Json<OpenRequest>) -> impl IntoResponse {
+    let reader = match ProjectReader::new(PathBuf::from(&req.path)) {
+        Ok(r) => r,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, format!("cannot open directory: {e}")).into_response()
+        }
+    };
+    let graph = GraphLoader::load(reader.root());
+    let cache = CacheStore::new(reader.root(), &state.model, state.prompt_version);
+    let root = reader.root().display().to_string();
+    *state.project.write().unwrap() = ProjectCtx { reader, graph, cache };
+    eprintln!("[open] switched project root to {root}");
+    (StatusCode::OK, Json(OpenResponse { root })).into_response()
 }
 
 // — WS /api/generate — per-function streaming generation (S7a) —
@@ -149,34 +212,58 @@ fn build_frames(cache_hit: bool, capsule: Capsule, lines: Vec<LineAnnotation>) -
     frames
 }
 
+/// The synchronous (locked) phase of a generation: either fully resolved frames
+/// (cache hit / error), or the prompt + span needed for an LLM call (cache miss).
+enum GenStep {
+    Ready(Vec<GenFrame>),
+    NeedLlm {
+        system: String,
+        user: String,
+        fn_source: String,
+    },
+}
+
 /// Run one generation request to a complete frame sequence. A cache hit returns
 /// before the LLM is ever consulted (the zero-token contract). On any failure a
-/// single terminal `error` frame is returned.
+/// single terminal `error` frame is returned. The project lock is held only for
+/// the synchronous read/cache/assemble phase and is dropped before the LLM await
+/// (so the future stays Send and a concurrent Open Folder can't deadlock).
 async fn run_generation(state: &AppState, req: GenerateRequest) -> Vec<GenFrame> {
-    // 1. Resolve the function source span (deterministic; the cache key derives from it).
-    let source = match state.reader.read_file(&req.file_path) {
-        Ok(s) => s,
-        Err(ReadErr::NotFound) => return vec![err("file not found")],
-        Err(ReadErr::Forbidden) => return vec![err("path outside project root")],
+    let step = {
+        let proj = state.project.read().unwrap();
+
+        // 1. Resolve the function source span (deterministic; the cache key derives from it).
+        let source = match proj.reader.read_file(&req.file_path) {
+            Ok(s) => s,
+            Err(ReadErr::NotFound) => return vec![err("file not found")],
+            Err(ReadErr::Forbidden) => return vec![err("path outside project root")],
+        };
+        let Some(fn_source) = slice_span(&source, req.func.line_range) else {
+            return vec![err("invalid lineRange for file")];
+        };
+
+        // 2. Cache: a hit returns the stored entry with zero token, no LLM (核心律).
+        if let Some(entry) = proj.cache.get(&fn_source) {
+            eprintln!("[generate] cache HIT {}#{} — zero token", req.file_path, req.func.name);
+            GenStep::Ready(build_frames(true, entry.capsule, entry.lines))
+        } else if state.llm.is_none() {
+            // 3a. Miss but no LLM configured.
+            GenStep::Ready(vec![err("LLM not configured: set OPENCODE_API_KEY")])
+        } else {
+            // 3b. Miss → assemble the prompt while we still hold the project lock.
+            let ctx =
+                assemble_gen_context(proj.graph.graph(), &req.file_path, &req.roster, &req.shared);
+            let (system, user) = build_gen_prompt(&req.func, &fn_source, &req.key_lines, &ctx);
+            GenStep::NeedLlm { system, user, fn_source }
+        }
+    }; // project lock dropped here — before any await.
+
+    let (system, user, fn_source) = match step {
+        GenStep::Ready(frames) => return frames,
+        GenStep::NeedLlm { system, user, fn_source } => (system, user, fn_source),
     };
-    let Some(fn_source) = slice_span(&source, req.func.line_range) else {
-        return vec![err("invalid lineRange for file")];
-    };
 
-    // 2. Cache: a hit returns the stored entry with zero token, no LLM (核心律).
-    if let Some(entry) = state.cache.get(&fn_source) {
-        eprintln!("[generate] cache HIT {}#{} — zero token", req.file_path, req.func.name);
-        return build_frames(true, entry.capsule, entry.lines);
-    }
-
-    // 3. Miss → need the LLM.
-    let Some(llm) = state.llm.as_ref() else {
-        return vec![err("LLM not configured: set OPENCODE_API_KEY")];
-    };
-
-    let ctx = assemble_gen_context(state.graph.graph(), &req.file_path, &req.roster, &req.shared);
-    let (system, user) = build_gen_prompt(&req.func, &fn_source, &req.key_lines, &ctx);
-
+    let llm = state.llm.as_ref().expect("NeedLlm implies llm is Some");
     eprintln!("[generate] cache MISS {}#{} — calling LLM ({})", req.file_path, req.func.name, llm.model);
     let content = match llm.complete(&system, &user).await {
         Ok(c) => c,
@@ -193,12 +280,13 @@ async fn run_generation(state: &AppState, req: GenerateRequest) -> Vec<GenFrame>
         }
     };
 
-    // 4. Persist for the next open (best-effort; a write failure must not fail the response).
+    // 4. Persist for the next open (best-effort; a write failure must not fail the
+    //    response). Re-acquire the lock briefly for the cache write.
     let entry = CapsuleEntry {
         capsule: capsule.clone(),
         lines: lines.clone(),
     };
-    if let Err(e) = state.cache.put(&fn_source, &entry) {
+    if let Err(e) = state.project.read().unwrap().cache.put(&fn_source, &entry) {
         eprintln!("[generate] warning: cache put failed: {e}");
     }
 
@@ -305,12 +393,22 @@ mod tests {
     }
 
     fn make_state(root: &Path, llm: Option<LlmProxy>) -> AppState {
-        AppState {
-            reader: ProjectReader::new(root.to_path_buf()).unwrap(),
-            graph: GraphLoader::load(root),
-            cache: CacheStore::new(root, "test-model", "p1"),
+        AppState::new(
+            ProjectReader::new(root.to_path_buf()).unwrap(),
+            GraphLoader::load(root),
+            CacheStore::new(root, "test-model", "p1"),
             llm,
-        }
+            "test-model".to_string(),
+            "p1",
+        )
+    }
+
+    /// Swap the project root in place, the way `POST /api/project/open` does.
+    fn swap_root(state: &AppState, root: &Path) {
+        let reader = ProjectReader::new(root.to_path_buf()).unwrap();
+        let graph = GraphLoader::load(root);
+        let cache = CacheStore::new(root, &state.model, state.prompt_version);
+        *state.project.write().unwrap() = ProjectCtx { reader, graph, cache };
     }
 
     fn req(file_path: &str, line_range: [u32; 2]) -> GenerateRequest {
@@ -364,6 +462,9 @@ mod tests {
         let state = make_state(tmp.path(), None);
         let fn_source = "def f():\n    return 1";
         state
+            .project
+            .read()
+            .unwrap()
             .cache
             .put(
                 fn_source,
@@ -401,5 +502,53 @@ mod tests {
             GenFrame::Error { message } => assert!(message.contains("LLM not configured")),
             other => panic!("expected error frame, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn root_swap_switches_the_listed_tree_and_readable_files() {
+        // Two distinct project roots (U3 single-root swap).
+        let one = TmpDir::new();
+        std::fs::write(one.path().join("a.py"), "x = 1\n").unwrap();
+        let two = TmpDir::new();
+        std::fs::write(two.path().join("b.py"), "y = 2\n").unwrap();
+
+        let state = make_state(one.path(), None);
+        // Before swap: tree lists a.py, b.py is unreadable (outside root).
+        let names: Vec<String> = state
+            .project
+            .read()
+            .unwrap()
+            .reader
+            .list_files()
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+        assert_eq!(names, vec!["a.py"]);
+
+        swap_root(&state, two.path());
+        // After swap: tree lists b.py only; a.py is now outside the (new) root.
+        let proj = state.project.read().unwrap();
+        let names: Vec<String> = proj.reader.list_files().into_iter().map(|f| f.path).collect();
+        assert_eq!(names, vec!["b.py"]);
+        assert_eq!(proj.reader.read_file("b.py").unwrap(), "y = 2\n");
+        assert!(matches!(proj.reader.read_file("a.py"), Err(ReadErr::NotFound)));
+    }
+
+    #[test]
+    fn root_swap_traversal_protection_holds_on_new_root() {
+        let one = TmpDir::new();
+        std::fs::write(one.path().join("a.py"), "x = 1\n").unwrap();
+        let two = TmpDir::new();
+        std::fs::write(two.path().join("b.py"), "y = 2\n").unwrap();
+
+        let state = make_state(one.path(), None);
+        swap_root(&state, two.path());
+        // Traversal / absolute paths are still refused against the new root.
+        let proj = state.project.read().unwrap();
+        assert!(matches!(proj.reader.read_file("../a.py"), Err(ReadErr::Forbidden)));
+        assert!(matches!(
+            proj.reader.read_file("b.py/../../etc"),
+            Err(ReadErr::Forbidden)
+        ));
     }
 }
