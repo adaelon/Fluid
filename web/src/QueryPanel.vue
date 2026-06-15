@@ -73,6 +73,7 @@ function ask() {
       filePath: props.path,
       question: q,
       roster: props.ctx.roster,
+      rosterSpans: props.ctx.rosterSpans,
       capsules: props.ctx.capsules,
     },
     {

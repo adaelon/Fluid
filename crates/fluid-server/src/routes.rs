@@ -24,11 +24,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::cache_store::{Capsule, CacheStore, CapsuleEntry, LineAnnotation};
 use crate::context_assembler::{
-    assemble_gen_context, build_explain_line_prompt, build_gen_prompt, build_query_prompt,
-    slice_span, FunctionSpan, SharedContext,
+    assemble_gen_context, build_explain_line_prompt, build_gen_prompt, build_query_planning_prompt,
+    build_query_prompt, query_degraded_names, slice_requested_sources, slice_span, FunctionSpan,
+    GenContext, QueryFocus, SharedContext, QUERY_FETCH_BUDGET_CHARS,
 };
 use crate::graph_loader::{GraphLoader, KnowledgeGraph};
-use crate::llm_proxy::{parse_generation, parse_line_annotation, LlmProxy, SseDecoder};
+use crate::llm_proxy::{parse_fetch_plan, parse_generation, parse_line_annotation, LlmProxy, SseDecoder};
 use crate::project_reader::{FileNode, ProjectReader, ReadErr};
 use futures_util::StreamExt;
 
@@ -543,6 +544,11 @@ struct QueryRequest {
     focus: Option<FunctionSpan>,
     #[serde(default)]
     roster: Vec<String>,
+    /// Per-function line ranges so the backend can slice a function's source by name
+    /// for on-demand fetch (S10a-追源, ADR-0017). Optional; absent (older client) →
+    /// fetch is skipped and a degraded query just answers over the trimmed context.
+    #[serde(rename = "rosterSpans", default)]
+    roster_spans: Vec<FunctionSpan>,
     /// Per-function capsule summaries the frontend already holds (ghost store).
     #[serde(default)]
     capsules: Vec<CapsuleSummary>,
@@ -560,36 +566,54 @@ enum QueryFrame {
     Error { message: String },
 }
 
-/// The synchronous (locked) phase of a query: either an early terminal error, or
-/// the assembled `(system, user)` prompt for the streaming LLM call.
-enum QueryStep {
+/// The synchronous (locked) phase of a query. Either an early terminal error; a
+/// `Direct` single-call prompt (nothing degraded); or a `Degraded` two-phase plan
+/// (S10a-追源, ADR-0017) carrying the planning prompt plus everything needed to
+/// re-assemble the answer prompt after the model names the sources it wants — all
+/// owned so it survives the lock drop and the planning await.
+enum QueryPlan {
     Err(String),
-    NeedLlm { system: String, user: String },
+    Direct {
+        system: String,
+        user: String,
+    },
+    Degraded {
+        planning_system: String,
+        planning_user: String,
+        file_source: String,
+        ctx: GenContext,
+        capsules: Vec<(String, String)>,
+        focus: Option<(String, u32, String)>,
+        fetchable: Vec<String>,
+    },
 }
 
-/// Assemble the query prompt while holding the project lock, then hand it back so
-/// the caller can stream the LLM call *after* the lock is dropped (no lock across
-/// await, mirroring `run_generation`).
-fn prepare_query(state: &AppState, req: &QueryRequest) -> QueryStep {
+/// Assemble the query plan while holding the project lock, then hand it back so the
+/// caller can run the LLM call(s) *after* the lock is dropped (no lock across await,
+/// mirroring `run_generation`). When the degradation ladder reduced same-file
+/// functions to name-only AND we have spans to slice them, returns a two-phase plan;
+/// otherwise a direct single-call prompt.
+fn prepare_query(state: &AppState, req: &QueryRequest) -> QueryPlan {
     let proj = state.project.read().unwrap();
 
     let source = match proj.reader.read_file(&req.file_path) {
         Ok(s) => s,
-        Err(ReadErr::NotFound) => return QueryStep::Err("file not found".into()),
-        Err(ReadErr::Forbidden) => return QueryStep::Err("path outside project root".into()),
+        Err(ReadErr::NotFound) => return QueryPlan::Err("file not found".into()),
+        Err(ReadErr::Forbidden) => return QueryPlan::Err("path outside project root".into()),
     };
 
-    // The focused function zoomed to source granularity, if a focus was given.
-    let focus = match &req.focus {
+    // The focused function zoomed to source granularity (owned so it survives the
+    // lock drop / planning await). Its name rides along for prioritization + fetch.
+    let focus: Option<(String, u32, String)> = match &req.focus {
         Some(f) => match slice_span(&source, f.line_range) {
-            Some(src) => Some((src, f.line_range[0])),
-            None => return QueryStep::Err("invalid lineRange for focus".into()),
+            Some(src) => Some((src, f.line_range[0], f.name.clone())),
+            None => return QueryPlan::Err("invalid lineRange for focus".into()),
         },
         None => None,
     };
 
     if state.llm.is_none() {
-        return QueryStep::Err("LLM not configured: set OPENCODE_API_KEY".into());
+        return QueryPlan::Err("LLM not configured: set OPENCODE_API_KEY".into());
     }
 
     let ctx = assemble_gen_context(proj.graph.graph(), &req.file_path, &req.roster, &req.shared);
@@ -598,9 +622,36 @@ fn prepare_query(state: &AppState, req: &QueryRequest) -> QueryStep {
         .iter()
         .map(|c| (c.name.clone(), c.summary.clone()))
         .collect();
-    let focus_ref = focus.as_ref().map(|(s, n)| (s.as_str(), *n));
-    let (system, user) = build_query_prompt(&req.question, &capsules, focus_ref, &ctx);
-    QueryStep::NeedLlm { system, user }
+    let focus_ref = focus.as_ref().map(|(s, n, name)| QueryFocus {
+        source: s.as_str(),
+        start_line: *n,
+        name: name.as_str(),
+    });
+
+    // Functions degraded to name-only that we can actually slice (have a span) form
+    // the fetchable set. Empty → nothing to fetch → single streaming call.
+    let degraded = query_degraded_names(&req.question, &capsules, focus_ref.as_ref(), &ctx);
+    let fetchable: Vec<String> = degraded
+        .into_iter()
+        .filter(|name| req.roster_spans.iter().any(|s| &s.name == name))
+        .collect();
+
+    if fetchable.is_empty() {
+        let (system, user) = build_query_prompt(&req.question, &capsules, focus_ref, &ctx, &[]);
+        return QueryPlan::Direct { system, user };
+    }
+
+    let (planning_system, planning_user) =
+        build_query_planning_prompt(&req.question, &capsules, focus_ref, &ctx, &fetchable);
+    QueryPlan::Degraded {
+        planning_system,
+        planning_user,
+        file_source: source,
+        ctx,
+        capsules,
+        focus,
+        fetchable,
+    }
 }
 
 /// Run one query request, streaming `delta` frames to the socket then `done`. On a
@@ -614,15 +665,58 @@ async fn run_query(
     req_id: &str,
 ) -> Result<(), ()> {
     let (system, user) = match prepare_query(state, &req) {
-        QueryStep::Err(msg) => {
+        QueryPlan::Err(msg) => {
             return send_query_frame(socket, req_id, &QueryFrame::Error { message: msg })
                 .await
                 .map_err(|_| ());
         }
-        QueryStep::NeedLlm { system, user } => (system, user),
+        QueryPlan::Direct { system, user } => (system, user),
+        QueryPlan::Degraded {
+            planning_system,
+            planning_user,
+            file_source,
+            ctx,
+            capsules,
+            focus,
+            fetchable,
+        } => {
+            // Phase 1: planning (non-streaming). A failed call or unparseable plan
+            // degrades to answering with no extra source — the fetch must never fail
+            // the query (ADR-0017). One round only: no recursion.
+            let llm = state.llm.as_ref().expect("Degraded implies llm is Some");
+            eprintln!(
+                "[query] {} — degraded, planning fetch ({} fetchable)",
+                req.file_path,
+                fetchable.len()
+            );
+            let need = match llm.complete(&planning_system, &planning_user).await {
+                Ok(c) => parse_fetch_plan(&c),
+                Err(e) => {
+                    eprintln!("[query] planning failed {}: {e} — answering without fetch", req.file_path);
+                    Vec::new()
+                }
+            };
+            let extra = slice_requested_sources(
+                &file_source,
+                &req.roster_spans,
+                &need,
+                &fetchable,
+                QUERY_FETCH_BUDGET_CHARS,
+            );
+            if !extra.is_empty() {
+                let got: Vec<&str> = extra.iter().map(|(n, _)| n.as_str()).collect();
+                eprintln!("[query] {} — fetched sources: {}", req.file_path, got.join(", "));
+            }
+            let focus_ref = focus.as_ref().map(|(s, n, name)| QueryFocus {
+                source: s.as_str(),
+                start_line: *n,
+                name: name.as_str(),
+            });
+            build_query_prompt(&req.question, &capsules, focus_ref, &ctx, &extra)
+        }
     };
 
-    let llm = state.llm.as_ref().expect("NeedLlm implies llm is Some");
+    let llm = state.llm.as_ref().expect("a non-Err plan implies llm is Some");
     eprintln!("[query] {} — streaming ({})", req.file_path, llm.model);
     let resp = match llm.open_chat_stream(&system, &user).await {
         Ok(r) => r,
@@ -1011,6 +1105,7 @@ mod tests {
                 line_range: lr,
             }),
             roster: vec![],
+            roster_spans: vec![],
             capsules: vec![],
             shared: SharedContext::default(),
         }
@@ -1034,7 +1129,7 @@ mod tests {
         std::fs::write(tmp.path().join("a.py"), "def f():\n    return 1\n").unwrap();
         let state = make_state(tmp.path(), None);
         match prepare_query(&state, &query_req("a.py", Some([1, 2]))) {
-            QueryStep::Err(msg) => assert!(msg.contains("LLM not configured")),
+            QueryPlan::Err(msg) => assert!(msg.contains("LLM not configured")),
             _ => panic!("expected Err without llm"),
         }
     }
@@ -1047,7 +1142,7 @@ mod tests {
         // Line 9 is out of bounds for the 2-line file → focus slice fails *before* the
         // llm check, so this reports the focus error rather than "LLM not configured".
         match prepare_query(&state, &query_req("a.py", Some([1, 9]))) {
-            QueryStep::Err(msg) => assert!(msg.contains("invalid lineRange for focus")),
+            QueryPlan::Err(msg) => assert!(msg.contains("invalid lineRange for focus")),
             _ => panic!("expected Err on bad focus"),
         }
     }
@@ -1057,7 +1152,7 @@ mod tests {
         let tmp = TmpDir::new();
         let state = make_state(tmp.path(), None);
         match prepare_query(&state, &query_req("nope.py", None)) {
-            QueryStep::Err(msg) => assert!(msg.contains("file not found")),
+            QueryPlan::Err(msg) => assert!(msg.contains("file not found")),
             _ => panic!("expected Err for missing file"),
         }
     }

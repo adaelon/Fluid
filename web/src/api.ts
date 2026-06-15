@@ -85,7 +85,13 @@ export interface QueryStream {
  *  current file's roster + generated capsule summaries so the answer no longer
  *  leans on the graph's file_summary backstop alone. */
 export function streamQuery(
-  req: { filePath: string; question: string; roster?: string[]; capsules?: CapsuleSummary[] },
+  req: {
+    filePath: string
+    question: string
+    roster?: string[]
+    rosterSpans?: FunctionSpan[]
+    capsules?: CapsuleSummary[]
+  },
   h: QueryHandlers,
 ): QueryStream {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws'
@@ -105,6 +111,7 @@ export function streamQuery(
         filePath: req.filePath,
         question: req.question,
         roster: req.roster ?? [],
+        rosterSpans: req.rosterSpans ?? [],
         capsules: req.capsules ?? [],
       }),
     )

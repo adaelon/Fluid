@@ -276,6 +276,23 @@ pub fn parse_line_annotation(
     })
 }
 
+#[derive(Deserialize)]
+struct RawFetchPlan {
+    #[serde(default)]
+    need: Vec<String>,
+}
+
+/// Parse the phase-1 planning reply of on-demand fetch (S10a-追源, ADR-0017) into
+/// the list of function names the model wants source for. Tolerates fences/prose
+/// like the other parsers; **any** failure (bad JSON, missing field) yields an
+/// empty list — the caller then simply answers over the degraded context, so a
+/// malformed plan can never fail the query.
+pub fn parse_fetch_plan(content: &str) -> Vec<String> {
+    serde_json::from_str::<RawFetchPlan>(extract_json(content))
+        .map(|p| p.need)
+        .unwrap_or_default()
+}
+
 /// Pull the JSON object out of the model's reply: strips a leading ```/```json
 /// fence if present, otherwise takes the span from the first `{` to the last `}`.
 fn extract_json(content: &str) -> &str {
@@ -402,5 +419,24 @@ mod tests {
         let mut d = SseDecoder::new();
         let out = d.push(": keep-alive\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n");
         assert_eq!(out, vec!["a".to_string()]);
+    }
+
+    // — S10a-追源 plan parsing (ADR-0017) —
+
+    #[test]
+    fn parse_fetch_plan_reads_need_list_tolerating_prose() {
+        let need = parse_fetch_plan("好的：{\"need\":[\"save\",\"verify\"]} 完毕");
+        assert_eq!(need, vec!["save".to_string(), "verify".to_string()]);
+    }
+
+    #[test]
+    fn parse_fetch_plan_empty_when_none_needed() {
+        assert!(parse_fetch_plan("{\"need\":[]}").is_empty());
+    }
+
+    #[test]
+    fn parse_fetch_plan_bad_json_is_empty_not_panic() {
+        assert!(parse_fetch_plan("我不需要任何源码").is_empty());
+        assert!(parse_fetch_plan("{\"other\":1}").is_empty()); // missing field → default empty
     }
 }
