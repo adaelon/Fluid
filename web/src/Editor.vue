@@ -8,6 +8,7 @@ import { rust } from '@codemirror/lang-rust'
 import { GhostStore } from './ghostStore'
 import { ghostField, foldClickHandler, retryClickHandler, refreshGhosts } from './render/ghostField'
 import { getParser } from './parser/browser'
+import { fluidDarkTheme } from './theme'
 import type { FunctionSpan, ParserLang } from './parser/types.ts'
 import type { GenFrame } from './ghostTypes'
 
@@ -43,6 +44,7 @@ function buildState(source: string, lang: string): EditorState {
     doc: source,
     extensions: [
       basicSetup,
+      fluidDarkTheme,
       langExtension(lang),
       EditorState.readOnly.of(true),
       EditorView.editable.of(false),

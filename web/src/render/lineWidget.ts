@@ -1,7 +1,11 @@
-// LineWidget — CM6 block widget rendering a key-line ghost annotation above the
-// annotated source line (需求 §7.3). Left bar uses the annotation's semantic
-// color (#7ee787 normal / #f0883e branch / #ff7b72 exception). Shares the
-// .fluid-ghost glass pipeline with CapsuleWidget (§7.4 material continuity).
+// LineWidget — key-line ghost annotation that TRAILS its source line (需求 §7.3,
+// ADR-0016). It is an *inline* widget placed at the END of the annotated line;
+// CSS renders it as an inline-block a fixed gap to the right of the code, so each
+// note starts just past its own line (not in a shared column) and wraps when
+// long. Being inline-block it grows the line height, keeping code at the row top
+// and the note fully visible without breaking the code column. Left bar carries
+// the semantic color (#7ee787 normal / #f0883e branch / #ff7b72 exception).
+// Shares the .fluid-ghost material with the capsule header (§7.4 continuity).
 
 import { WidgetType } from '@codemirror/view'
 import type { LineAnnotation } from '../ghostTypes'
@@ -21,26 +25,10 @@ export class LineWidget extends WidgetType {
   }
 
   toDOM(): HTMLElement {
-    const root = document.createElement('div')
-    root.className = 'fluid-ghost fluid-line'
-
-    const bar = document.createElement('span')
-    bar.className = 'fluid-bar'
-    bar.style.setProperty('--c', this.ln.color)
-
-    const body = document.createElement('div')
-    body.className = 'fluid-body'
-
-    const num = document.createElement('span')
-    num.className = 'fluid-linenum'
-    num.textContent = 'L' + this.ln.lineNumber
-
-    const text = document.createElement('span')
-    text.className = 'fluid-linetext'
-    text.textContent = this.ln.text
-
-    body.append(num, text)
-    root.append(bar, body)
+    const root = document.createElement('span')
+    root.className = 'fluid-ghost fluid-line-anno'
+    root.style.setProperty('--c', this.ln.color)
+    root.textContent = this.ln.text
     return root
   }
 }

@@ -166,123 +166,105 @@ body {
   cursor: not-allowed;
 }
 
-/* — Ghost annotations (需求 §7) — capsule + line share ONE glass pipeline so
-   they read as the same medium at different depths (§7.4 material continuity:
-   no border-radius, no box-shadow, no font difference between the two). — */
+/* — Ghost annotations (需求 §7, ADR-0016) — the capsule header and right-rail
+   line notes share ONE glass material (§7.4 continuity: same font, no radius,
+   no shadow). Layout differs: the capsule is a single-line header above the
+   function definition; line notes float into a fixed-width right rail aligned
+   to their source line. — */
 .fluid-ghost {
-  position: relative;
-  margin: 2px 0;
-  padding: 6px 10px 6px 14px;
-  background: rgba(22, 27, 34, 0.85);
-  backdrop-filter: blur(6px);
-  border: 1px solid rgba(48, 54, 61, 0.6);
   font-family: 'Inter', system-ui, -apple-system, sans-serif;
-  font-size: 13px;
-  /* §7.2/7.3 reveal: height 0 → content via grid fr, with a fade. */
-  display: grid;
-  grid-template-rows: 1fr;
-  animation: fluid-reveal 300ms cubic-bezier(0.25, 1, 0.5, 1);
-}
-
-@keyframes fluid-reveal {
-  from {
-    grid-template-rows: 0fr;
-    opacity: 0;
-  }
-  to {
-    grid-template-rows: 1fr;
-    opacity: 1;
-  }
-}
-
-.fluid-ghost > .fluid-body {
-  min-height: 0;
-  overflow: hidden;
-  /* §7.2/7.3: text opacity 0→1, slight delay after the card opens. */
-  animation: fluid-text-in 200ms ease 100ms backwards;
-}
-
-@keyframes fluid-text-in {
-  from {
-    opacity: 0;
-  }
-  to {
-    opacity: 1;
-  }
-}
-
-/* Left semantic color bar — grows from the top (§7.2 step 3 / §7.3 step 3). */
-.fluid-bar {
-  position: absolute;
-  left: 0;
-  top: 0;
-  bottom: 0;
-  width: 3px;
-  background: var(--c, #58a6ff);
-  transform-origin: top;
-  animation: fluid-bar-grow 350ms cubic-bezier(0.25, 1, 0.5, 1);
-}
-
-@keyframes fluid-bar-grow {
-  from {
-    transform: scaleY(0);
-  }
-  to {
-    transform: scaleY(1);
-  }
-}
-
-/* — Capsule — */
-.fluid-capsule {
-  cursor: pointer;
-}
-.fluid-capsule .fluid-sig {
-  color: var(--muted);
-  font-size: 11px;
-  margin-bottom: 2px;
-}
-.fluid-capsule .fluid-summary {
+  font-size: 12px;
   color: var(--text);
 }
-.fluid-capsule .fluid-meta {
+
+/* — Capsule: header above the function definition; wraps to multiple lines when
+   long instead of truncating (§7.2, ADR-0016). — */
+.fluid-capsule {
+  margin: 2px 0 0;
+  padding: 3px 10px 3px 12px;
+  background: rgba(22, 27, 34, 0.6);
+  border-left: 2px solid var(--c, #58a6ff);
+  cursor: pointer;
+  white-space: normal;
+  line-height: 1.5;
+  animation: fluid-fade-in 220ms ease;
+}
+.fluid-cap-sig {
   color: var(--muted);
-  font-size: 11px;
-  margin-top: 2px;
+}
+.fluid-cap-sum {
+  color: var(--text);
+}
+.fluid-cap-meta {
+  margin-left: 6px;
+  color: var(--muted);
 }
 
-/* Folded: collapse to a 4px color edge memory anchor (§7.5); lines hidden,
+/* Folded: collapse the header to a 4px color edge (§7.5); line notes hidden,
    not deleted (kept in GhostStore → unfold is zero-recompute re-render). */
 .fluid-capsule.folded {
   padding: 0;
   min-height: 4px;
-  animation: none;
-}
-.fluid-capsule.folded .fluid-bar {
-  width: 100%;
-  height: 4px;
-  bottom: auto;
+  border-left: none;
+  background: var(--c, #58a6ff);
   animation: none;
 }
 
-/* — Line annotation (indented under the capsule body) — */
-.fluid-line {
+/* — Line note: trails the code at a fixed gap (each note starts just right of
+   its own line, not in a shared column), wrapping when long; being inline-block
+   it grows the line height so code stays at the row top (§7.3, ADR-0016). — */
+.fluid-line-anno {
+  display: inline-block;
+  vertical-align: top;
+  max-width: 460px;
   margin-left: 28px;
-}
-.fluid-line .fluid-linenum {
-  color: var(--muted);
-  margin-right: 8px;
-}
-.fluid-line .fluid-linetext {
+  padding-left: 10px;
+  border-left: 2px solid var(--c, #58a6ff);
+  white-space: normal;
+  line-height: 1.45;
   color: var(--text);
+  animation: fluid-rail-in 220ms cubic-bezier(0.25, 1, 0.5, 1);
+}
+
+@keyframes fluid-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@keyframes fluid-rail-in {
+  from {
+    opacity: 0;
+    transform: translateX(8px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
 }
 
 /* — Generation feedback (S7.5): "生成中" skeleton / "生成失败" chip — */
 .fluid-placeholder {
-  animation: none; /* no reveal; it's a transient state, not a settled card */
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 2px 0 0;
+  padding: 3px 10px 3px 12px;
+  background: rgba(22, 27, 34, 0.6);
+  border-left: 2px solid #484f58;
+  animation: none; /* transient state, not a settled card */
+}
+.fluid-placeholder .fluid-bar {
+  display: none; /* placeholder uses border-left as its bar */
 }
 .fluid-placeholder.pending .fluid-body {
   color: var(--muted);
   animation: fluid-pulse 1.2s ease-in-out infinite;
+}
+.fluid-placeholder.error {
+  border-left-color: #ff7b72;
 }
 .fluid-placeholder.error .fluid-body {
   display: flex;

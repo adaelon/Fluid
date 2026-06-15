@@ -34,31 +34,24 @@ export class CapsuleWidget extends WidgetType {
     root.className = 'fluid-ghost fluid-capsule' + (this.folded ? ' folded' : '')
     root.setAttribute('data-fold', this.cap.fnId)
     root.title = this.folded ? '展开函数胶囊' : '折叠函数胶囊'
-
-    const bar = document.createElement('span')
-    bar.className = 'fluid-bar'
-    bar.style.setProperty('--c', CAPSULE_ACCENT)
-    root.appendChild(bar)
+    root.style.setProperty('--c', CAPSULE_ACCENT)
 
     if (this.folded) return root
 
-    const body = document.createElement('div')
-    body.className = 'fluid-body'
-
-    const sig = document.createElement('div')
-    sig.className = 'fluid-sig'
+    // Single-line header: signature · summary … complexity · io (§7.2, ADR-0016).
+    const sig = document.createElement('span')
+    sig.className = 'fluid-cap-sig'
     sig.textContent = this.cap.signature || this.cap.fnId
 
-    const summary = document.createElement('div')
-    summary.className = 'fluid-summary'
-    summary.textContent = this.cap.summary
+    const sum = document.createElement('span')
+    sum.className = 'fluid-cap-sum'
+    sum.textContent = this.cap.summary ? '· ' + this.cap.summary : ''
 
-    const meta = document.createElement('div')
-    meta.className = 'fluid-meta'
+    const meta = document.createElement('span')
+    meta.className = 'fluid-cap-meta'
     meta.textContent = [this.cap.complexity, this.cap.io].filter(Boolean).join(' · ')
 
-    body.append(sig, summary, meta)
-    root.appendChild(body)
+    root.append(sig, sum, meta)
     return root
   }
 

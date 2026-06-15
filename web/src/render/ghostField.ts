@@ -46,10 +46,11 @@ function build(store: GhostStore, state: EditorState): DecorationSet {
     if (!folded) {
       for (const ln of store.lines(fn.id)) {
         if (ln.lineNumber < 1 || ln.lineNumber > docLines) continue
-        const at = state.doc.line(ln.lineNumber).from
-        ranges.push(
-          Decoration.widget({ widget: new LineWidget(ln), block: true, side: -1 }).range(at),
-        )
+        const at = state.doc.line(ln.lineNumber).to
+        // Inline note widget at the line end; CSS renders it as an inline-block a
+        // fixed gap right of the code (trailing each line), wrapping when long and
+        // growing the line height so code stays at the row top (ADR-0016).
+        ranges.push(Decoration.widget({ widget: new LineWidget(ln), side: 1 }).range(at))
       }
     }
   }
