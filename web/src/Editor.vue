@@ -9,6 +9,7 @@ import { GhostStore } from './ghostStore'
 import { ghostField, foldClickHandler, retryClickHandler, refreshGhosts } from './render/ghostField'
 import { getParser } from './parser/browser'
 import { fluidDarkTheme } from './theme'
+import { GenScheduler, viewportDistance } from './scheduler'
 import type { FunctionSpan, ParserLang } from './parser/types.ts'
 import type { GenFrame } from './ghostTypes'
 
@@ -22,11 +23,14 @@ const host = shallowRef<HTMLDivElement | null>(null)
 // ADR-0014: the CM6 EditorView is an imperative object. Hold it in a
 // shallowRef so Vue never deep-proxies its internal state. NEVER a plain ref().
 const view = shallowRef<EditorView | null>(null)
-// GhostStore + WS are imperative too — plain (non-reactive) component state.
+// GhostStore + scheduler are imperative too — plain (non-reactive) component state.
 const store = new GhostStore()
-let ws: WebSocket | null = null
-// Guards async (parser load / WS frames) against rapid file switches: each
-// activation bumps the token; stale callbacks see a mismatch and bail.
+// Viewport-aware generation scheduler (S8): orders requests by viewport
+// proximity, runs a small pool of parallel sockets, re-orders on scroll. Created
+// on mount with closures reading the live current-file state below.
+let scheduler: GenScheduler | null = null
+// Guards async parser load against rapid file switches: each activation bumps the
+// token; a stale callback (parser resolved after a switch) sees a mismatch and bails.
 let activationToken = 0
 // Current file's roster + path — needed to resend a single function on retry (S7.6).
 let currentRoster: FunctionSpan[] = []
@@ -107,6 +111,10 @@ function buildState(source: string, lang: string): EditorState {
       ghostField(store),
       foldClickHandler(store),
       retryClickHandler(retry),
+      // Scroll → re-order the pending generation queue by the new viewport (S8).
+      EditorView.updateListener.of((u) => {
+        if (u.viewportChanged) scheduler?.reprioritize(viewportDist())
+      }),
     ],
   })
 }
@@ -120,18 +128,57 @@ function wsUrl(): string {
   return `${proto}://${location.host}/api/generate`
 }
 
-function teardownWs(): void {
-  if (ws) {
-    ws.onmessage = null
-    ws.onopen = null
-    ws.onerror = null
-    try {
-      ws.close()
-    } catch {
-      /* already closing */
-    }
-    ws = null
+// Build the generation request payload for one function (reqId = fn.id, the
+// scheduler routes terminal frames by it). Reads the live current-file state.
+function buildRequest(fnId: string): unknown {
+  const fn = currentRoster.find((r) => r.id === fnId)
+  return {
+    reqId: fnId,
+    filePath: currentPath,
+    fn,
+    roster: currentRoster.map((r) => r.name),
+    keyLines: store.keyLinesOf(fnId),
+    shared: {},
   }
+}
+
+// Route one inbound generation frame to the store / progress (S7.5/S7.6).
+function onFrame(frame: GenFrame): void {
+  switch (frame.kind) {
+    case 'capsule':
+      store.putCapsule(frame.capsule)
+      refresh()
+      break
+    case 'line':
+      store.putLine(frame.line)
+      refresh()
+      break
+    case 'done':
+      settle(frame.reqId, true)
+      break
+    case 'error':
+      console.warn('[generate]', frame.reqId, frame.message)
+      settle(frame.reqId, false, frame.message)
+      break
+    // 'cache-hit': no rendering effect (capsule/line/done frames follow).
+  }
+}
+
+// Current viewport distance per function (S8 scheduling priority). Functions
+// whose definition line is on screen sort first; falls back to start line when
+// the view isn't ready yet.
+function viewportDist(): Map<string, number> {
+  const m = new Map<string, number>()
+  const v = view.value
+  if (!v) {
+    for (const fn of currentRoster) m.set(fn.id, fn.lineRange[0])
+    return m
+  }
+  const { from, to } = v.viewport
+  const fromLine = v.state.doc.lineAt(from).number
+  const toLine = v.state.doc.lineAt(to).number
+  for (const fn of currentRoster) m.set(fn.id, viewportDistance(fn.lineRange[0], { fromLine, toLine }))
+  return m
 }
 
 function refresh(): void {
@@ -155,69 +202,8 @@ function settle(fnId: string, ok: boolean, message = ''): void {
   }
 }
 
-// Send a generation request for one function over an open socket.
-function sendRequest(sock: WebSocket, fn: FunctionSpan): void {
-  sock.send(
-    JSON.stringify({
-      reqId: fn.id,
-      filePath: currentPath,
-      fn,
-      roster: currentRoster.map((r) => r.name),
-      keyLines: store.keyLinesOf(fn.id),
-      shared: {},
-    }),
-  )
-}
-
-// Open a generation socket and request every function still pending. Used for
-// the initial activation (all pending) and to reconnect on retry if the socket
-// has dropped (only the re-marked pending functions get resent).
-function openSocket(token: number): void {
-  const sock = new WebSocket(wsUrl())
-  ws = sock
-  sock.onopen = () => {
-    if (token !== activationToken) {
-      try {
-        sock.close()
-      } catch {
-        /* noop */
-      }
-      return
-    }
-    // One request per function (scheduling/ordering is S8 — sequential is fine).
-    for (const fn of currentRoster) if (store.statusOf(fn.id) === 'pending') sendRequest(sock, fn)
-  }
-  sock.onmessage = (ev) => {
-    if (token !== activationToken) return
-    let frame: GenFrame
-    try {
-      frame = JSON.parse(ev.data as string) as GenFrame
-    } catch {
-      return
-    }
-    switch (frame.kind) {
-      case 'capsule':
-        store.putCapsule(frame.capsule)
-        refresh()
-        break
-      case 'line':
-        store.putLine(frame.line)
-        refresh()
-        break
-      case 'done':
-        settle(frame.reqId, true)
-        break
-      case 'error':
-        console.warn('[generate]', frame.reqId, frame.message)
-        settle(frame.reqId, false, frame.message)
-        break
-      // 'cache-hit': no rendering effect (capsule/line/done frames follow).
-    }
-  }
-}
-
 // Retry one failed function (S7.6): re-arm it to pending, rewind progress one
-// step, and resend on the live socket (reconnecting if it dropped).
+// step, and hand it back to the scheduler (jumps the queue, S8).
 function retry(fnId: string): void {
   const fn = currentRoster.find((r) => r.id === fnId)
   if (!fn) return
@@ -225,13 +211,12 @@ function retry(fnId: string): void {
   store.markPending(fnId)
   phase.value = 'running'
   refresh()
-  if (ws && ws.readyState === WebSocket.OPEN) sendRequest(ws, fn)
-  else openSocket(activationToken)
+  scheduler?.retry(fnId)
 }
 
 // Activate a file: parse → open WS → stream per-function generation → render.
 async function activate(source: string, lang: string, path: string): Promise<void> {
-  teardownWs()
+  scheduler?.stop()
   store.reset()
   currentRoster = []
   currentPath = path
@@ -268,10 +253,15 @@ async function activate(source: string, lang: string, path: string): Promise<voi
   phase.value = parsed.roster.length > 0 ? 'running' : 'idle'
   refresh()
 
-  openSocket(token)
+  // Hand the roster to the scheduler, ordered by current viewport proximity (S8).
+  const ids = parsed.roster.map((fn) => fn.id)
+  scheduler?.start(ids, viewportDist())
 }
 
 onMounted(() => {
+  // One scheduler for the Editor's lifetime; its closures read the live
+  // current-file state, and stop()/start() re-arm it on every file switch (S8).
+  scheduler = new GenScheduler({ wsUrl: wsUrl(), buildRequest, onFrame })
   view.value = new EditorView({
     state: buildState(props.source, props.lang),
     parent: host.value!,
@@ -290,7 +280,8 @@ watch(
 
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', onFontKey)
-  teardownWs()
+  scheduler?.stop()
+  scheduler = null
   view.value?.destroy()
   view.value = null
 })
