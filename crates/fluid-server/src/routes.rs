@@ -77,6 +77,7 @@ pub fn router(state: Shared) -> Router {
         .route("/api/file", get(file))
         .route("/api/project/graph", get(graph))
         .route("/api/project/open", post(open_folder))
+        .route("/api/project/pick", post(pick_folder))
         .route("/api/generate", get(generate_ws))
         .with_state(state)
 }
@@ -147,6 +148,30 @@ async fn open_folder(State(state): State<Shared>, Json(req): Json<OpenRequest>) 
     *state.project.write().unwrap() = ProjectCtx { reader, graph, cache };
     eprintln!("[open] switched project root to {root}");
     (StatusCode::OK, Json(OpenResponse { root })).into_response()
+}
+
+#[derive(Serialize)]
+struct PickResponse {
+    /// Chosen absolute path, or null when the user cancelled the dialog.
+    path: Option<String>,
+}
+
+/// `POST /api/project/pick` — pop a native OS folder picker and return the chosen
+/// absolute path (or null on cancel). The browser sandbox can't hand a
+/// server-side absolute path to the backend, so the *backend* — which runs on the
+/// user's own machine (ADR-0010 local topology) — opens the dialog; the frontend
+/// then feeds the returned path to `/api/project/open`. The dialog is blocking, so
+/// it runs on a dedicated thread to keep the async runtime free.
+async fn pick_folder() -> impl IntoResponse {
+    let picked = tokio::task::spawn_blocking(|| {
+        rfd::FileDialog::new()
+            .set_title("选择项目文件夹")
+            .pick_folder()
+            .map(|p| p.display().to_string())
+    })
+    .await
+    .unwrap_or(None);
+    Json(PickResponse { path: picked })
 }
 
 // — WS /api/generate — per-function streaming generation (S7a) —

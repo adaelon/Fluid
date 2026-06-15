@@ -36,3 +36,12 @@ export async function openFolder(path: string): Promise<string> {
   const data = (await res.json()) as { root: string }
   return data.root
 }
+
+/** POST /api/project/pick -> chosen absolute path, or null if the user cancelled
+ *  the native folder dialog (opened by the local backend, U3 revision). */
+export async function pickFolder(): Promise<string | null> {
+  const res = await fetch('/api/project/pick', { method: 'POST' })
+  if (!res.ok) throw new Error((await res.text()) || `/api/project/pick -> ${res.status}`)
+  const data = (await res.json()) as { path: string | null }
+  return data.path
+}

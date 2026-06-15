@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
-import { fetchFile, fetchTree, openFolder, type FileNode } from './api'
+import { fetchFile, fetchTree, openFolder, pickFolder, type FileNode } from './api'
 import FileTree from './FileTree.vue'
 import Editor from './Editor.vue'
 import QueryPanel from './QueryPanel.vue'
@@ -90,8 +90,8 @@ function activate(path: string) {
 // drop all open tabs (the old root's files no longer belong to this session).
 const folderInput = ref('')
 const switching = ref(false)
-async function switchFolder() {
-  const path = folderInput.value.trim()
+
+async function doSwitch(path: string) {
   if (!path || switching.value) return
   switching.value = true
   loadError.value = null
@@ -106,6 +106,23 @@ async function switchFolder() {
   } finally {
     switching.value = false
   }
+}
+
+// Primary affordance (U3 revision): the local backend pops a native OS folder
+// picker; the chosen absolute path then drives the root switch.
+async function chooseFolder() {
+  if (switching.value) return
+  try {
+    const path = await pickFolder()
+    if (path) await doSwitch(path)
+  } catch (e) {
+    loadError.value = String(e)
+  }
+}
+
+// Fallback: type an absolute path directly (when the native dialog is unavailable).
+function switchFolder() {
+  void doSwitch(folderInput.value.trim())
 }
 
 // Close a tab; if it was active, fall to the right neighbor, else the left,
@@ -126,11 +143,14 @@ function closeTab(path: string) {
       <ActivityBar />
       <aside class="sidebar" :style="{ width: sidebarWidth + 'px' }">
         <div class="sidebar-title">资源管理器</div>
+        <button class="open-folder-pick" :disabled="switching" @click="chooseFolder">
+          {{ switching ? '打开中…' : '打开文件夹…' }}
+        </button>
         <form class="open-folder" @submit.prevent="switchFolder">
           <input
             v-model="folderInput"
             class="open-folder-input"
-            placeholder="打开文件夹:输入绝对路径"
+            placeholder="或输入绝对路径"
             :disabled="switching"
           />
           <button class="open-folder-btn" type="submit" :disabled="switching || !folderInput.trim()">

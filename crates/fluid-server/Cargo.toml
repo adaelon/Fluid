@@ -21,3 +21,6 @@ encoding_rs = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # Loads .env (LLM config) into the process env at startup; real env vars win.
 dotenvy = "0.15"
+# Native OS folder picker for Open Folder (U3 revision). The local backend pops
+# the dialog (browser can't hand a server-side absolute path to the backend).
+rfd = "0.15"

@@ -103,7 +103,27 @@ body {
   padding: 0 12px;
 }
 
-/* — Open Folder control (U3): type an absolute path to switch the project root. — */
+/* — Open Folder control (U3): native folder picker button (primary) + an
+     absolute-path text field (fallback) to switch the project root. — */
+.open-folder-pick {
+  display: block;
+  width: calc(100% - 24px);
+  margin: 0 12px 6px;
+  padding: 6px 10px;
+  font-size: 12px;
+  text-align: left;
+  color: var(--text);
+  background: rgba(56, 139, 253, 0.15);
+  border: 1px solid var(--border);
+  cursor: pointer;
+}
+.open-folder-pick:hover:not(:disabled) {
+  background: rgba(56, 139, 253, 0.28);
+}
+.open-folder-pick:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
 .open-folder {
   display: flex;
   gap: 4px;
