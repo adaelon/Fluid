@@ -6,8 +6,12 @@
 // (CONTEXT 追问器); switching files vacuums the in-flight Q&A.
 import { ref, watch, onBeforeUnmount } from 'vue'
 import { streamQuery, type QueryStream } from './api'
+import { EMPTY_QUERY_CONTEXT, type QueryContext } from './queryContext'
 
-const props = defineProps<{ path: string | null }>()
+const props = withDefaults(
+  defineProps<{ path: string | null; ctx?: QueryContext }>(),
+  { ctx: () => EMPTY_QUERY_CONTEXT },
+)
 
 const question = ref('')
 const answer = ref('')
@@ -40,7 +44,12 @@ function ask() {
   errorMsg.value = ''
   streaming.value = true
   stream = streamQuery(
-    { filePath: props.path, question: q },
+    {
+      filePath: props.path,
+      question: q,
+      roster: props.ctx.roster,
+      capsules: props.ctx.capsules,
+    },
     {
       onDelta: (t) => {
         answer.value += t

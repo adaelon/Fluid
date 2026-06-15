@@ -3,6 +3,7 @@
 
 import type { FunctionSpan } from './parser/types.ts'
 import type { LineAnnotation, QueryFrame } from './ghostTypes'
+import type { CapsuleSummary } from './queryContext'
 
 export type Lang = 'py' | 'rs' | 'other'
 
@@ -80,10 +81,11 @@ export interface QueryStream {
 /** Open `WS /api/query`, send one question, and stream the answer back token by
  *  token (S10a frames: delta×N → done | error). One socket per question; it is
  *  closed on the terminal frame or on `cancel` (file switch / unmount). The S10a
- *  backend treats roster/capsules/focus as optional — S10b sends only filePath +
- *  question, leaving layered-capsule injection to a later enhancement. */
+ *  backend treats roster/capsules/focus as optional; S10b-cap layers in the
+ *  current file's roster + generated capsule summaries so the answer no longer
+ *  leans on the graph's file_summary backstop alone. */
 export function streamQuery(
-  req: { filePath: string; question: string },
+  req: { filePath: string; question: string; roster?: string[]; capsules?: CapsuleSummary[] },
   h: QueryHandlers,
 ): QueryStream {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws'
@@ -97,7 +99,15 @@ export function streamQuery(
     }
   }
   sock.onopen = () => {
-    sock.send(JSON.stringify({ reqId: 'q', filePath: req.filePath, question: req.question }))
+    sock.send(
+      JSON.stringify({
+        reqId: 'q',
+        filePath: req.filePath,
+        question: req.question,
+        roster: req.roster ?? [],
+        capsules: req.capsules ?? [],
+      }),
+    )
   }
   sock.onmessage = (ev) => {
     let frame: QueryFrame

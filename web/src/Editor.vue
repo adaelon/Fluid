@@ -12,14 +12,25 @@ import { explainLine as fetchExplainLine } from './api'
 import { getParser } from './parser/browser'
 import { fluidDarkTheme } from './theme'
 import { GenScheduler, viewportDistance } from './scheduler'
+import { buildQueryContext, type QueryContext } from './queryContext'
 import type { FunctionSpan, ParserLang } from './parser/types.ts'
 import type { GenFrame } from './ghostTypes'
 
 const props = defineProps<{ source: string; lang: string; path: string }>()
-// Generation progress surfaces to the status bar (U1): App lifts it via @progress.
+// Generation progress surfaces to the status bar (U1) via @progress; the
+// per-file query context (roster + generated capsules) surfaces to QueryPanel
+// via @context (S10b-cap), lifted through App as a sibling-component bridge.
 const emit = defineEmits<{
   progress: [{ phase: 'idle' | 'running' | 'done'; completed: number; total: number }]
+  context: [QueryContext]
 }>()
+
+// Push the current-file query snapshot up to QueryPanel (S10b-cap). Called on
+// reset (→ empty), once the roster is parsed, and after each capsule arrives, so
+// follow-ups always carry whatever has been generated so far.
+function emitContext(): void {
+  emit('context', buildQueryContext(currentRoster, (id) => store.capsule(id)?.summary))
+}
 
 const host = shallowRef<HTMLDivElement | null>(null)
 // ADR-0014: the CM6 EditorView is an imperative object. Hold it in a
@@ -152,6 +163,7 @@ function onFrame(frame: GenFrame): void {
     case 'capsule':
       store.putCapsule(frame.capsule)
       refresh()
+      emitContext() // new summary available → refresh QueryPanel's snapshot
       break
     case 'line':
       store.putLine(frame.line)
@@ -250,6 +262,7 @@ async function activate(source: string, lang: string, path: string): Promise<voi
   total.value = 0
   completed.value = 0
   refresh()
+  emitContext() // vacuum the QueryPanel snapshot on every file switch (§7)
   const token = ++activationToken
 
   if (!isParserLang(lang)) return // non py/rs: read-only source only (§7 VACUUM stays bare)
@@ -272,6 +285,7 @@ async function activate(source: string, lang: string, path: string): Promise<voi
   }
   store.setRoster(parsed.roster, parsed.keyLines)
   currentRoster = parsed.roster
+  emitContext() // roster known (capsules still streaming in)
   // Show "生成中" skeletons immediately (before the WS even opens) + arm progress.
   for (const fn of parsed.roster) store.markPending(fn.id)
   total.value = parsed.roster.length

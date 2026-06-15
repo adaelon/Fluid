@@ -7,6 +7,7 @@ import QueryPanel from './QueryPanel.vue'
 import ActivityBar from './shell/ActivityBar.vue'
 import StatusBar from './shell/StatusBar.vue'
 import Tabs from './shell/Tabs.vue'
+import { EMPTY_QUERY_CONTEXT, type QueryContext } from './queryContext'
 
 type OpenFile = { path: string; lang: string; source: string }
 
@@ -27,6 +28,12 @@ const genProgress = ref<{ phase: 'idle' | 'running' | 'done'; completed: number;
   completed: 0,
   total: 0,
 })
+
+// Current-file query context lifted from Editor (S10b-cap) → handed to QueryPanel
+// so follow-ups carry the roster + generated capsule summaries. Editor emits a
+// fresh snapshot on switch/capsule arrival; we still null it out when no file is
+// open (Editor is v-if'd away then and can't emit).
+const queryCtx = ref<QueryContext>(EMPTY_QUERY_CONTEXT)
 
 // Resizable explorer sidebar (U1). Width persisted to localStorage.
 const SIDEBAR_KEY = 'fluid:sidebarPx'
@@ -186,11 +193,12 @@ function closeTab(path: string) {
           :lang="current.lang"
           :path="current.path"
           @progress="genProgress = $event"
+          @context="queryCtx = $event"
         />
         <div v-else class="empty">从左侧选择一个文件以只读查看源码</div>
       </main>
     </div>
-    <QueryPanel :path="current?.path ?? null" />
+    <QueryPanel :path="current?.path ?? null" :ctx="current ? queryCtx : EMPTY_QUERY_CONTEXT" />
     <StatusBar :path="current?.path ?? null" :lang="current?.lang ?? null" :progress="genProgress" />
   </div>
 </template>
