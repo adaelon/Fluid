@@ -25,18 +25,71 @@ body {
   font-size: 13px;
 }
 
-.layout {
-  display: grid;
-  grid-template-columns: 280px 1fr;
+/* — VSCode-like shell (U1, ADR-0015): column = body + status bar; body row =
+   activity bar | sidebar | resizer | editor. Standard IDE chrome. — */
+.ide-shell {
+  display: flex;
+  flex-direction: column;
   height: 100vh;
 }
 
-/* — Sidebar / file tree — */
+.ide-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
+/* — Activity bar: left vertical icon strip — */
+.activity-bar {
+  width: 48px;
+  flex: none;
+  background: #0d1117;
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding-top: 8px;
+}
+.activity-item {
+  width: 40px;
+  height: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: none;
+  border-left: 2px solid transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+.activity-item:hover {
+  color: var(--text);
+}
+.activity-item.active {
+  color: var(--text);
+  border-left-color: var(--accent);
+}
+
+/* — Resizer handle between sidebar and editor — */
+.resizer {
+  width: 4px;
+  flex: none;
+  cursor: col-resize;
+  background: transparent;
+}
+.resizer:hover,
+.resizer:active {
+  background: var(--accent);
+}
+
+/* — Sidebar / file tree (width driven by inline style, resizable) — */
 .sidebar {
+  flex: none;
   background: var(--panel);
   border-right: 1px solid var(--border);
   overflow: auto;
   padding: 8px 0;
+  min-height: 0;
 }
 
 .sidebar-title {
@@ -93,10 +146,37 @@ body {
 
 /* — Editor pane — */
 .editor-pane {
+  flex: 1;
   display: flex;
   flex-direction: column;
   min-width: 0;
-  height: 100vh;
+  min-height: 0;
+}
+
+/* — Status bar: bottom of the shell; right side carries generation progress
+   (S7.5 chip migrated here from the editor overlay). — */
+.status-bar {
+  flex: none;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 12px;
+  font-size: 12px;
+  background: var(--accent);
+  color: #0d1117;
+}
+.status-left,
+.status-right {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.status-lang {
+  opacity: 0.8;
+}
+.status-right.done {
+  font-weight: 600;
 }
 
 .path-bar {
@@ -134,7 +214,7 @@ body {
 .query-panel {
   position: fixed;
   right: 16px;
-  bottom: 16px;
+  bottom: 32px; /* clear the 24px status bar (U1) */
   width: 320px;
   padding: 8px;
   background: rgba(22, 27, 34, 0.92);
@@ -294,24 +374,4 @@ body {
   50% {
     opacity: 0.85;
   }
-}
-
-/* Progress chip — floats over the editor; a temporary home until the U1
-   VSCode-style status bar lands. */
-.fluid-progress {
-  position: absolute;
-  top: 8px;
-  right: 14px;
-  z-index: 5;
-  padding: 3px 10px;
-  font-size: 12px;
-  color: var(--text);
-  background: rgba(22, 27, 34, 0.92);
-  backdrop-filter: blur(8px);
-  border: 1px solid var(--border);
-  pointer-events: none;
-  transition: opacity 400ms ease;
-}
-.fluid-progress.done {
-  color: #7ee787;
 }

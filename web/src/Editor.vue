@@ -13,6 +13,10 @@ import type { FunctionSpan, ParserLang } from './parser/types.ts'
 import type { GenFrame } from './ghostTypes'
 
 const props = defineProps<{ source: string; lang: string; path: string }>()
+// Generation progress surfaces to the status bar (U1): App lifts it via @progress.
+const emit = defineEmits<{
+  progress: [{ phase: 'idle' | 'running' | 'done'; completed: number; total: number }]
+}>()
 
 const host = shallowRef<HTMLDivElement | null>(null)
 // ADR-0014: the CM6 EditorView is an imperative object. Hold it in a
@@ -28,10 +32,13 @@ let activationToken = 0
 let currentRoster: FunctionSpan[] = []
 let currentPath = ''
 
-// Generation progress (S7.5) — reactive, drives the progress chip.
+// Generation progress (S7.5) — reactive; emitted up to the status bar (U1).
 const phase = ref<'idle' | 'running' | 'done'>('idle')
 const total = ref(0)
 const completed = ref(0)
+watch([phase, total, completed], () => {
+  emit('progress', { phase: phase.value, completed: completed.value, total: total.value })
+})
 
 // Adjustable code font size (U-R2, 需求 §7.6). The .cm-scroller font-size lives in
 // a Compartment so it can be reconfigured live (Ctrl+= / Ctrl+- / Ctrl+0) without
@@ -292,9 +299,5 @@ onBeforeUnmount(() => {
 <template>
   <div class="cm-wrap">
     <div ref="host" class="cm-host"></div>
-    <div v-if="phase !== 'idle'" class="fluid-progress" :class="{ done: phase === 'done' }">
-      <template v-if="phase === 'running'">⟳ 生成中 {{ completed }}/{{ total }}</template>
-      <template v-else>✓ {{ total }} 个函数已显影</template>
-    </div>
   </div>
 </template>
