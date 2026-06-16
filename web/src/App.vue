@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onBeforeUnmount, ref } from 'vue'
 import { fetchFile, fetchTree, openFolder, pickFolder, type FileNode } from './api'
 import FileTree from './FileTree.vue'
 import Editor from './Editor.vue'
@@ -8,6 +8,7 @@ import ActivityBar from './shell/ActivityBar.vue'
 import StatusBar from './shell/StatusBar.vue'
 import Tabs from './shell/Tabs.vue'
 import SettingsModal from './shell/SettingsModal.vue'
+import CommandPalette, { type PaletteItem } from './shell/CommandPalette.vue'
 import { EMPTY_QUERY_CONTEXT, type QueryContext } from './queryContext'
 
 type OpenFile = { path: string; lang: string; source: string }
@@ -44,6 +45,53 @@ const queryPanelOpen = ref(false)
 // LLM backend settings modal (U5b, ADR-0018), opened from the activity-bar gear.
 const settingsOpen = ref(false)
 
+// Command palette (U4): Ctrl/Cmd+P → fuzzy file open, Ctrl/Cmd+Shift+P → app
+// commands. Null = closed. Items are rebuilt per mode from current app state.
+const paletteMode = ref<'files' | 'commands' | null>(null)
+const palettePlaceholder = computed(() =>
+  paletteMode.value === 'commands' ? '输入命令…' : '输入文件名…',
+)
+const paletteItems = computed<PaletteItem[]>(() => {
+  if (paletteMode.value === 'files') {
+    return files.value.map((f) => ({
+      id: f.path,
+      label: f.path,
+      hint: f.lang,
+      run: () => open(f),
+    }))
+  }
+  if (paletteMode.value === 'commands') {
+    const cmds: PaletteItem[] = [
+      { id: 'settings', label: '设置 · LLM 后端', run: () => (settingsOpen.value = true) },
+      { id: 'open-folder', label: '打开文件夹…', run: () => void chooseFolder() },
+    ]
+    // Commands that need an open file are only offered when one is active.
+    if (current.value) {
+      cmds.push({
+        id: 'toggle-query',
+        label: '切换追问器',
+        run: () => (queryPanelOpen.value = !queryPanelOpen.value),
+      })
+    }
+    if (activePath.value) {
+      const path = activePath.value
+      cmds.push({ id: 'close-tab', label: '关闭当前标签页', run: () => closeTab(path) })
+    }
+    return cmds
+  }
+  return []
+})
+
+// Global shortcut: Ctrl/Cmd+P opens quick-open, +Shift opens the command palette.
+// preventDefault stops the browser's native print/quick-find on those chords.
+function onGlobalKey(e: KeyboardEvent) {
+  if (!(e.ctrlKey || e.metaKey)) return
+  if (e.key.toLowerCase() === 'p') {
+    e.preventDefault()
+    paletteMode.value = e.shiftKey ? 'commands' : 'files'
+  }
+}
+
 // Resizable explorer sidebar (U1). Width persisted to localStorage.
 const SIDEBAR_KEY = 'fluid:sidebarPx'
 const SIDEBAR_MIN = 160
@@ -75,12 +123,14 @@ function endResize(e: PointerEvent): void {
 }
 
 onMounted(async () => {
+  window.addEventListener('keydown', onGlobalKey)
   try {
     files.value = await fetchTree()
   } catch (e) {
     loadError.value = String(e)
   }
 })
+onBeforeUnmount(() => window.removeEventListener('keydown', onGlobalKey))
 
 // Open a file from the tree: if already open just activate its tab; otherwise
 // fetch the source once, append a tab, and activate it (U2).
@@ -221,5 +271,11 @@ function closeTab(path: string) {
       @toggle-query="queryPanelOpen = !queryPanelOpen"
     />
     <SettingsModal v-if="settingsOpen" @close="settingsOpen = false" />
+    <CommandPalette
+      v-if="paletteMode"
+      :items="paletteItems"
+      :placeholder="palettePlaceholder"
+      @close="paletteMode = null"
+    />
   </div>
 </template>
