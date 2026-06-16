@@ -901,6 +901,16 @@ body {
   font-size: 12px;
   color: var(--accent);
 }
+.settings-test {
+  margin: 0;
+  font-size: 12px;
+}
+.settings-test-ok {
+  color: var(--c-normal);
+}
+.settings-test-err {
+  color: var(--danger);
+}
 .settings-actions {
   display: flex;
   justify-content: flex-end;

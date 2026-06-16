@@ -1,40 +1,34 @@
-# SESSION_CHECKPOINT — 2026-06-15 (U3-R 完成 · 待提交 + 待眼验)
+# SESSION_CHECKPOINT — 2026-06-16 (U5 设置面板轨 a+b+c 全部完成 · 待 commit)
 
 ## 新鲜度自检
 - git 仓库,远程 `https://github.com/adaelon/Fluid.git`,分支 `main`(逐刀直提主干,无 PR)。
-- 最新 commit:`4ec9142` S8(已 push);其下 `7800f3e` U3、`f441fbf` U2、`d1f3499` U1。
-- **U3-R 代码已完成但尚未 commit**(本会话新改动)。读入时对比 `git log --oneline -3`,若已见 U3-R commit 说明已提交,以 git 为准。
+- 写入时最新 commit:`acc8980` U5b(已 push);**U5c 已写完代码 + 测试绿,尚未 commit**(见下「未提交」)。
+- 读入时对比 `git log --oneline -3`;不一致以 git 为准。
 
 ## 当前在做什么
-**U3-R · Open Folder 改系统文件夹选择器**(修订 U3 / 用户反馈"要点击弹文件管理器而非输绝对路径")。**已完成**,`cargo test` **33/33** + `npm run build` 绿(CSS 5.92kB),**待 commit + 待眼验**。
-机制:后端加 `rfd` + `POST /api/project/pick` 弹原生对话框→回服务端绝对路径→前端喂现成 `/api/project/open` 换根;文本框降为兜底。绕过"浏览器拿不到绝对路径"(让后端而非浏览器开对话框,ADR-0010 本地拓扑)。
+**U5 设置面板轨(运行时配置 LLM 后端,ADR-0018)a+b+c 全部完成**。U5c=测试连接刚做完,代码+测试就绪,等 commit/push。
+- **U5a 后端(`3ce44c4`)**:`settings.rs`(`LlmConfig`/`mask_key`/`rewrite_env`);`AppState.llm`→`RwLock<LlmState{config,proxy:Option<Arc<LlmProxy>>}>` + `env_path`;`GET/POST /api/settings/llm`(write-only、masked、空 apiKey 保持);POST 热重建代理 + model 变重建 cache + 回写 `.env`。
+- **U5b 前端(`acc8980`)**:`api.ts` getLlmSettings/saveLlmSettings;`ActivityBar` 底部齿轮;`SettingsModal.vue`(GET 填充 / write-only key / Esc·遮罩关闭 / 保存即时生效);`App.vue` `settingsOpen`;`styles.css` 模态全套。
+- **U5c 测试连接(未 commit)**:`routes.rs` 加 `POST /api/settings/llm/test` + `test_llm_settings` + `resolve_test_key`(纯函数,write-only key 解析);`LlmTestRequest/Response`。临时配置纯探针(用请求值构造代理做最小 `complete`,不落 .env、不改运行时)。前端 `api.ts:testLlmSettings`、`SettingsModal.vue`「测试连接」按钮+结果行、`styles.css:.settings-test(-ok/-err)`。
 
 ## 下一步(可直接接手)
-1. **提交 U3-R**(若用户同意):`git add Cargo.lock crates/fluid-server/Cargo.toml crates/fluid-server/src/routes.rs web/src/{App.vue,api.ts,styles.css} docs/adr/0015-*.md docs/代码链路.md SESSION_CHECKPOINT.md` → commit「U3-R: Open Folder 改系统文件夹选择器 — 后端 rfd 原生对话框 (修订 ADR-0015)」→ push。**不要 add `defaults`**(0 字节疑误产物)。
-2. **眼验**(留用户,沙箱无 GUI):`start.bat` → 侧栏头点「打开文件夹…」→ 系统对话框弹出→选目录→树切换+tab 清空;取消无变化;文本框兜底仍可用。连带眼验 S8(`[sched] dispatch` 顺序=视口邻近、在途 ≤4)。
-3. **下一刀(择一)**:
-   - **S9 gutter + 手动单行**(=反馈#2):重点行脉动点 + 非重点行 hover「解释这一行」→ `/api/explain-line`。
-   - **U4 命令面板(可选)**:`Ctrl+P` 模糊找文件 / `Ctrl+Shift+P`(收口 U 轨)。
-4. **U 轨收口后**:起 `docs/架构.md`(C3,U1 起 PENDING 至今);S10 追问器 dock QueryPanel 到 rail。
+1. **commit + push U5c**(项目惯例逐刀直提 main):`git add -A && git commit && git push`。建议信息「U5c: 测试连接 — POST /api/settings/llm/test + 面板按钮」。注意先排除根目录 0 字节 `defaults`(未跟踪,勿入 commit)。
+2. **眼验 U5 端到端**(留用户,沙箱无浏览器+禁网):齿轮开模态 → 填配置 → 点「测试连接」看 ✓/✗ → 保存 → 下次生成/追问走新后端、`.env` 真实回写、刷新后 GET 回填。
+3. **或转其他轨**:S9 手动单行补注(`/api/explain-line` 后端已有 handler+缓存,前端 `explainLine` 已有,差 gutter/hover 接线)、U1/U2 IDE 壳骨架、消化 PENDING(⑥ reqwest timeout、⑦ 代码块语法高亮)、或 U 轨收口 → 解锁 `docs/架构.md`(C3,PENDING⑨)。
 
 ## 未提交 / 未完成
-- **U3-R 全部改动未 commit**:`Cargo.lock`、`crates/fluid-server/Cargo.toml`(+rfd)、`routes.rs`(pick_folder)、`web/src/{App.vue,api.ts,styles.css}`、`docs/adr/0015`(修订段)、`docs/代码链路.md`(U3-R 条)、本 checkpoint。
-- `cargo test` 33/33;`npm run build` 绿。
-- **杂项**:仓库根 0 字节空文件 `defaults`(未跟踪)——可删,待用户确认。
-- **磁盘**:C: 曾满至 0(用户已清,现 ~3.5GB);rfd fetch 须 `--target x86_64-pc-windows-msvc` 才精简(否则拉 mac/linux 全树撑爆)。
-- PENDING:① rfd 同步对话框 mac 须主线程事件循环(Windows 现可用);② 追问器仍浮层(dock 留 S10);③ `docs/架构.md` 待 U 轨收口起;④ reqwest 无 timeout;⑤ S9 手动单行(=反馈#2);⑥ S8 worker 间无工作窃取(够用)。
-- **A2 未自动验证项**:浏览器/GUI 内 U-R2/U1/U2/U3/U3-R/S8 全部交互 —— 沙箱无 GUI+禁出网,靠 `start.bat` 由用户眼验。换根核心 + S8 排序/并发逻辑 + 后端编译已确定性覆盖。
+- **U5c 全部改动未 commit**:`routes.rs`/`api.ts`/`SettingsModal.vue`/`styles.css` + 文档(`代码链路.md`/`切片计划.md`/本 checkpoint)。后端 `cargo test` **85/85**(+1 resolve_test_key)、clippy 净;前端 `npm run build` 绿。
+- **杂项**:仓库根 0 字节 `defaults`(未跟踪)——可删,勿入 commit。
+- PENDING:⑥ reqwest 无 timeout;⑦ 代码块语法高亮未做;⑨ `docs/架构.md` 待 U 轨收口起(C3);⑮ 追问器开关态不持久化;⑱ `theme.ts` 手工跟 token;⑲ `Tabs.vue` 的 `×` 未换 SVG;⑳ chrome 阴影浓度待眼验;㉑ `apply_llm_settings` 内 read(root)→write(cache) 间隙并发 open_folder 换根 TOCTOU(罕见);㉒ 仅 OpenAI 兼容协议;㉓ 前端设置不持久化「最近用过的 provider」(后端 .env 即真相)。
 
 ## 冷启动读序
 按顺序读这些文件能还原全局上下文:
-1. `docs/adr/0015-前端壳-类VSCode界面.md`(含 U3-R 修订)+ `0016-代码阅读区右栏对齐注释.md` — UI 主线决策
-2. `docs/代码链路.md` 末「U1/U2/U3/S8/U3-R」条 — 触达账本 + 机制注
-3. `docs/切片计划.md` U 轨 + S8/S9/S10 — 已完/待做(下一刀=S9 或 U4)
-4. `web/src/scheduler.ts` — S8 调度核;`web/src/Editor.vue` — 激活链 + scheduler 接线 + 字号/进度
-5. `web/src/App.vue` + `web/src/shell/{ActivityBar,StatusBar,Tabs}.vue` — IDE 壳(U1/U2/U3/U3-R)
-6. `crates/fluid-server/src/routes.rs`(`AppState`/`open_folder`/`pick_folder`/`run_generation`)+ `project_reader.rs` — 后端换根 + 穿越防护 + 选择器 + WS 串行
-7. `需求文档.md §7` + `CONTEXT.md` — 视觉规范 + 术语(激活单元 _Avoid_「视口激活」= S8 不做门控的依据)
+1. `docs/adr/0006~0008`+`0017`(追问骨架)、`0018`(运行时配置 LLM,U5 轨)
+2. `docs/代码链路.md` 末「S11-a/b/c/d」「U5a/U5b/U5c」条 — 触达账本
+3. `docs/切片计划.md` S11 视觉轨(全✅)/ U5 轨(a✅ b✅ c✅)/ U-R 轨 / U 轨 / S9 — 已完/待做
+4. 后端:`crates/fluid-server/src/settings.rs` + `routes.rs`(`AppState`/`apply_llm_settings`/`test_llm_settings`/`resolve_test_key`/`/api/settings/llm*`)+ `llm_proxy.rs`(`from_config`/`complete`)+ `main.rs`
+5. 前端:`web/src/api.ts`(settings 三函数)+ `shell/{ActivityBar,SettingsModal,StatusBar,Tabs}.vue` + `App.vue` + `styles.css` + 追问/编辑核
+6. `CONTEXT.md` — 术语表(设置面板为基建件,未入术语表)
 
 ## 本会话决策摘要
-- **S8 并发载体 = 前端 N 条并行 WS**(`4ec9142`,已落档 代码链路 S8);**S8 放弃大文件视口门控**(避免重引入已废弃「视口激活」)。
-- **U3-R 选择器 = 本地后端弹 rfd 原生对话框**(非浏览器选择器):绕过"浏览器拿不到服务端绝对路径";后端=用户本机(ADR-0010)。已落档 代码链路 U3-R + ADR-0015 修订段。
+- **U5c 测试连接 = 临时配置纯探针,B2 锚=真端点 ok/err**(ADR-0018):用请求里的值临时构造代理(非运行时 proxy,因要验"还没保存的配置")做最小 completion;不落 .env / 不改运行时 / 不重试;key 解析抽 `resolve_test_key` 纯函数与 `apply_llm_settings` 共享 write-only 语义并单测。已落档 `代码链路.md` U5c。

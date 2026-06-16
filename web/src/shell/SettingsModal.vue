@@ -5,7 +5,7 @@
 // write-only: the field starts blank and only overwrites when typed (an empty
 // field keeps the existing key, per the masked hint). Standard IDE chrome.
 import { ref, onMounted, onBeforeUnmount } from 'vue'
-import { getLlmSettings, saveLlmSettings } from '../api'
+import { getLlmSettings, saveLlmSettings, testLlmSettings } from '../api'
 
 const emit = defineEmits<{ close: [] }>()
 
@@ -19,6 +19,8 @@ const loading = ref(true)
 const saving = ref(false)
 const error = ref('')
 const saved = ref(false)
+const testing = ref(false)
+const testResult = ref<{ ok: boolean; message: string } | null>(null)
 
 onMounted(async () => {
   window.addEventListener('keydown', onKey)
@@ -61,6 +63,30 @@ async function save() {
     error.value = String(e)
   } finally {
     saving.value = false
+  }
+}
+
+const canTest = () => !testing.value && !!baseUrl.value.trim() && !!model.value.trim()
+
+async function test() {
+  if (!canTest()) return
+  testing.value = true
+  error.value = ''
+  saved.value = false
+  testResult.value = null
+  try {
+    const r = await testLlmSettings({
+      baseUrl: baseUrl.value.trim(),
+      model: model.value.trim(),
+      apiKey: apiKey.value.trim() || undefined,
+    })
+    testResult.value = r.ok
+      ? { ok: true, message: '✓ 连接正常' }
+      : { ok: false, message: `✗ ${r.error ?? '连接失败'}` }
+  } catch (e) {
+    testResult.value = { ok: false, message: `✗ ${String(e)}` }
+  } finally {
+    testing.value = false
   }
 }
 
@@ -107,8 +133,18 @@ const keyPlaceholder = () =>
         </p>
         <p v-if="error" class="settings-error">{{ error }}</p>
         <p v-else-if="saved" class="settings-saved">✓ 已保存 — 已即时生效(无需重启)</p>
+        <p
+          v-if="testResult"
+          class="settings-test"
+          :class="testResult.ok ? 'settings-test-ok' : 'settings-test-err'"
+        >
+          {{ testResult.message }}
+        </p>
         <div class="settings-actions">
           <button type="button" class="settings-btn" @click="emit('close')">关闭</button>
+          <button type="button" class="settings-btn" :disabled="!canTest()" @click="test">
+            {{ testing ? '测试中…' : '测试连接' }}
+          </button>
           <button type="submit" class="settings-btn primary" :disabled="!canSave()">
             {{ saving ? '保存中…' : '保存' }}
           </button>

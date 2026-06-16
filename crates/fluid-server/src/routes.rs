@@ -109,6 +109,7 @@ pub fn router(state: Shared) -> Router {
         .route("/api/project/open", post(open_folder))
         .route("/api/project/pick", post(pick_folder))
         .route("/api/settings/llm", get(get_llm_settings).post(put_llm_settings))
+        .route("/api/settings/llm/test", post(test_llm_settings))
         .route("/api/explain-line", post(explain_line))
         .route("/api/generate", get(generate_ws))
         .route("/api/query", get(query_ws))
@@ -307,6 +308,77 @@ fn apply_llm_settings(
         state.project.write().unwrap().cache = cache;
     }
     cfg
+}
+
+// — Settings: test the LLM connection (U5c, ADR-0018) —
+//
+// POST /api/settings/llm/test makes one minimal completion with the *given*
+// values so the user can verify a backend before saving. It is purely a probe:
+// it never writes `.env`, never touches the runtime proxy, never retries. An
+// omitted/empty `apiKey` reuses the currently-stored key (write-only — the UI
+// need not echo the secret to test the other fields).
+
+#[derive(Deserialize)]
+struct LlmTestRequest {
+    #[serde(rename = "baseUrl")]
+    base_url: String,
+    model: String,
+    #[serde(rename = "apiKey", default)]
+    api_key: Option<String>,
+}
+
+#[derive(Serialize)]
+struct LlmTestResponse {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+/// Which key a connection test should use: an explicit non-empty `req_key`, else
+/// the currently-stored key. Mirrors the write-only resolution in
+/// `apply_llm_settings` so a test reflects what a save would actually use.
+fn resolve_test_key(req_key: Option<String>, current: &str) -> String {
+    match req_key {
+        Some(k) if !k.trim().is_empty() => k,
+        _ => current.to_string(),
+    }
+}
+
+async fn test_llm_settings(
+    State(state): State<Shared>,
+    Json(req): Json<LlmTestRequest>,
+) -> Json<LlmTestResponse> {
+    if req.base_url.trim().is_empty() || req.model.trim().is_empty() {
+        return Json(LlmTestResponse {
+            ok: false,
+            error: Some("baseUrl 和 model 不能为空".to_string()),
+        });
+    }
+    // Snapshot the stored key under the read lock, then drop it before the await.
+    let key = {
+        let s = state.llm.read().unwrap();
+        resolve_test_key(req.api_key, &s.config.api_key)
+    };
+    let cfg = LlmConfig {
+        base_url: req.base_url,
+        model: req.model,
+        api_key: key,
+    };
+    let Some(proxy) = LlmProxy::from_config(&cfg) else {
+        return Json(LlmTestResponse {
+            ok: false,
+            error: Some("未配置 API Key".to_string()),
+        });
+    };
+    // Minimal probe: a one-token reply is enough to prove the endpoint + key +
+    // model are reachable. We discard the content; only success/failure matters.
+    match proxy.complete("你是连接测试助手，只回复 ok。", "ping").await {
+        Ok(_) => Json(LlmTestResponse { ok: true, error: None }),
+        Err(e) => Json(LlmTestResponse {
+            ok: false,
+            error: Some(e.to_string()),
+        }),
+    }
 }
 
 // — WS /api/generate — per-function streaming generation (S7a) —
@@ -1376,6 +1448,19 @@ mod tests {
         let r2 = LlmSettingsResponse::of(&unset);
         assert_eq!(r2.key_status, "unset");
         assert_eq!(r2.key_hint, None);
+    }
+
+    // — U5c test-connection key resolution (ADR-0018) —
+
+    #[test]
+    fn resolve_test_key_uses_typed_key_or_falls_back_to_current() {
+        // A typed, non-empty key wins (testing a brand-new backend).
+        assert_eq!(resolve_test_key(Some("new-key".into()), "current"), "new-key");
+        // Blank or whitespace-only typed key → reuse the stored one (write-only).
+        assert_eq!(resolve_test_key(Some("".into()), "current"), "current");
+        assert_eq!(resolve_test_key(Some("   ".into()), "current"), "current");
+        // Omitted key → reuse the stored one.
+        assert_eq!(resolve_test_key(None, "current"), "current");
     }
 
     #[test]

@@ -85,6 +85,24 @@ export async function saveLlmSettings(req: {
   return (await res.json()) as LlmSettings
 }
 
+/** POST /api/settings/llm/test -> probe the given backend with one minimal
+ *  completion before saving (U5c). Omit `apiKey` (or leave it blank) to test with
+ *  the currently-stored key. Returns `{ ok }` on success or `{ ok: false, error }`
+ *  with the backend's failure message; the HTTP call itself is always 200. */
+export async function testLlmSettings(req: {
+  baseUrl: string
+  model: string
+  apiKey?: string
+}): Promise<{ ok: boolean; error?: string }> {
+  const res = await fetch('/api/settings/llm/test', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(req),
+  })
+  if (!res.ok) throw new Error((await res.text()) || `/api/settings/llm/test -> ${res.status}`)
+  return (await res.json()) as { ok: boolean; error?: string }
+}
+
 /** POST /api/explain-line -> one LineAnnotation for a manually-picked non-key
  *  line (S9 手动补行). The line number must sit inside the function's range. */
 export async function explainLine(req: {
