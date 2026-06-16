@@ -474,17 +474,18 @@ pub fn slice_requested_sources(
 /// planning phase; the backend slices `line_range` out of `file_path`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CrossFileTarget {
-    /// Callee function name — what the model names in `{"need":[...]}`.
+    /// Callee name (function or class) — what the model names in `{"need":[...]}`.
     pub name: String,
     /// Project-relative path of the file that defines it.
     pub file_path: String,
-    /// 1-based inclusive `[start, end]` span of the function in that file.
+    /// 1-based inclusive `[start, end]` span of the definition in that file.
     pub line_range: [u32; 2],
 }
 
 /// Cross-file callees of `file_path` the graph can locate (S10c, ADR-0007 修订):
 /// `calls` edges whose source node lives in `file_path` and whose target is a
-/// `function` node in *another* file carrying a `line_range`. Excludes any name
+/// `function` *or* `class` node in *another* file carrying a `line_range` (a class
+/// instantiation is modeled as a `calls` edge to a `class` node). Excludes any name
 /// already in the local `roster` (local precedence — keeps the model's plan
 /// unambiguous: a named function resolves to exactly one pool, same-file or
 /// cross-file). Deduplicated by name (first wins) so each fetchable name maps to a
@@ -512,8 +513,12 @@ pub fn cross_file_targets(
         let Some(t) = g.nodes.iter().find(|n| n.id == e.target) else {
             continue; // dangling edge target
         };
-        if t.node_type != "function" || t.file_path == file_path {
-            continue; // only cross-file function definitions
+        // Accept both `function` and `class` definitions: `understand-anything`
+        // models a Python class instantiation as a `calls` edge to a `class` node,
+        // and classes are the majority node type — restricting to `function` here
+        // silently dropped most cross-file "show me the implementation" callees.
+        if !matches!(t.node_type.as_str(), "function" | "class") || t.file_path == file_path {
+            continue; // only cross-file code definitions (function/class)
         }
         let Some(line_range) = t.line_range else {
             continue; // sparse node with no span — can't slice, leave name-only
@@ -907,9 +912,17 @@ mod tests {
     // --- S10c: cross-file ephemeral fetch (ADR-0007 修订) ---
 
     fn fn_node(id: &str, name: &str, file: &str, lr: [u32; 2]) -> GraphNode {
+        span_node(id, "function", name, file, lr)
+    }
+
+    fn class_node(id: &str, name: &str, file: &str, lr: [u32; 2]) -> GraphNode {
+        span_node(id, "class", name, file, lr)
+    }
+
+    fn span_node(id: &str, ty: &str, name: &str, file: &str, lr: [u32; 2]) -> GraphNode {
         GraphNode {
             id: id.to_string(),
-            node_type: "function".to_string(),
+            node_type: ty.to_string(),
             name: name.to_string(),
             file_path: file.to_string(),
             summary: String::new(),
@@ -946,6 +959,38 @@ mod tests {
         let enc = targets.iter().find(|t| t.name == "encrypt").unwrap();
         assert_eq!(enc.file_path, "b.py");
         assert_eq!(enc.line_range, [10, 20]);
+    }
+
+    #[test]
+    fn cross_file_targets_locates_cross_file_class_callees() {
+        // Mirrors the real alphaGPT graph: a `class` node in this file `calls` a
+        // `class` node defined in another file (a Python class instantiation —
+        // `understand-anything` models the callee as a `class`, not `function`).
+        // The callee class carries a span, so its source must be fetchable just
+        // like a function; classes are the majority node type, so excluding them
+        // silently broke S10c for most cross-file "show me the implementation"
+        // questions.
+        let g = KnowledgeGraph {
+            nodes: vec![
+                class_node("class:engine.py:AlphaEngine", "AlphaEngine", "engine.py", [1, 50]),
+                class_node(
+                    "class:alphagpt.py:NewtonSchulzLowRankDecay",
+                    "NewtonSchulzLowRankDecay",
+                    "alphagpt.py",
+                    [8, 67],
+                ),
+            ],
+            edges: vec![edge(
+                "class:engine.py:AlphaEngine",
+                "class:alphagpt.py:NewtonSchulzLowRankDecay",
+                "calls",
+            )],
+        };
+        let targets = cross_file_targets(Some(&g), "engine.py", &[]);
+        let names: Vec<&str> = targets.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["NewtonSchulzLowRankDecay"]);
+        assert_eq!(targets[0].file_path, "alphagpt.py");
+        assert_eq!(targets[0].line_range, [8, 67]);
     }
 
     #[test]
