@@ -50,6 +50,41 @@ export async function pickFolder(): Promise<string | null> {
   return data.path
 }
 
+/** The LLM backend settings the frontend can see (U5b, ADR-0018). `keyStatus` +
+ *  `keyHint` are all that is ever exposed of the key (write-only): the full key
+ *  never leaves the backend. `keyHint` is a masked tail like `···1234` or null. */
+export interface LlmSettings {
+  baseUrl: string
+  model: string
+  keyStatus: 'set' | 'unset'
+  keyHint: string | null
+}
+
+/** GET /api/settings/llm -> the current (masked) LLM backend config. */
+export async function getLlmSettings(): Promise<LlmSettings> {
+  const res = await fetch('/api/settings/llm')
+  if (!res.ok) throw new Error((await res.text()) || `/api/settings/llm -> ${res.status}`)
+  return (await res.json()) as LlmSettings
+}
+
+/** POST /api/settings/llm -> apply new config (hot-rebuilds the backend proxy +
+ *  writes .env). Omit `apiKey` (or leave it blank) to keep the existing key —
+ *  the UI never has to echo the secret to change the other fields. Returns the
+ *  updated masked settings. */
+export async function saveLlmSettings(req: {
+  baseUrl: string
+  model: string
+  apiKey?: string
+}): Promise<LlmSettings> {
+  const res = await fetch('/api/settings/llm', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(req),
+  })
+  if (!res.ok) throw new Error((await res.text()) || `/api/settings/llm -> ${res.status}`)
+  return (await res.json()) as LlmSettings
+}
+
 /** POST /api/explain-line -> one LineAnnotation for a manually-picked non-key
  *  line (S9 手动补行). The line number must sit inside the function's range. */
 export async function explainLine(req: {

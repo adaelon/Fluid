@@ -131,6 +131,11 @@ body {
   color: var(--text);
   border-left-color: var(--accent);
 }
+/* S11-d/U5b: the settings gear sits at the bottom of the strip (VSCode habit). */
+.activity-settings {
+  margin-top: auto;
+  margin-bottom: 8px;
+}
 
 /* — Resizer handle between sidebar and editor — */
 .resizer {
@@ -792,4 +797,137 @@ body {
   opacity: 1;
   cursor: default;
   animation: fluid-pulse 1.2s ease-in-out infinite;
+}
+
+/* — Settings modal (U5b, ADR-0018): a centered dialog over a scrim, opened from
+   the activity-bar gear. Chrome layer, so radius/shadow are fine (§7.4 governs
+   only the code-area glass notes). — */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.5);
+}
+.modal {
+  width: 440px;
+  max-width: calc(100vw - 32px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+}
+.modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+}
+.modal-title {
+  font-weight: 600;
+  letter-spacing: 0.3px;
+}
+.modal-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  background: none;
+  border: none;
+  border-radius: 3px;
+  color: var(--muted);
+  cursor: pointer;
+}
+.modal-close:hover {
+  color: var(--text);
+  background: var(--hover);
+}
+.modal-body {
+  padding: 14px;
+}
+.settings-loading {
+  color: var(--muted);
+}
+.settings-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.settings-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.settings-label {
+  font-size: 12px;
+  color: var(--muted);
+}
+.settings-input {
+  padding: 7px 9px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 13px;
+}
+.settings-input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-soft);
+}
+.settings-note {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--muted);
+}
+.settings-error {
+  margin: 0;
+  font-size: 12px;
+  color: var(--danger);
+}
+.settings-saved {
+  margin: 0;
+  font-size: 12px;
+  color: var(--accent);
+}
+.settings-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 2px;
+}
+.settings-btn {
+  padding: 6px 14px;
+  background: var(--btn);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  font-size: 13px;
+  cursor: pointer;
+}
+.settings-btn:hover:not(:disabled) {
+  background: var(--btn-hover);
+}
+.settings-btn.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--on-accent);
+}
+.settings-btn.primary:hover:not(:disabled) {
+  opacity: 0.9;
+}
+.settings-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }

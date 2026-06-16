@@ -7,6 +7,7 @@ import QueryPanel from './QueryPanel.vue'
 import ActivityBar from './shell/ActivityBar.vue'
 import StatusBar from './shell/StatusBar.vue'
 import Tabs from './shell/Tabs.vue'
+import SettingsModal from './shell/SettingsModal.vue'
 import { EMPTY_QUERY_CONTEXT, type QueryContext } from './queryContext'
 
 type OpenFile = { path: string; lang: string; source: string }
@@ -39,6 +40,9 @@ const queryCtx = ref<QueryContext>(EMPTY_QUERY_CONTEXT)
 // the code area until the user opens it from the status-bar 「💬 追问」 toggle
 // (S10b dock revision). Sticky across file switches; auto-hidden when no file.
 const queryPanelOpen = ref(false)
+
+// LLM backend settings modal (U5b, ADR-0018), opened from the activity-bar gear.
+const settingsOpen = ref(false)
 
 // Resizable explorer sidebar (U1). Width persisted to localStorage.
 const SIDEBAR_KEY = 'fluid:sidebarPx'
@@ -152,7 +156,7 @@ function closeTab(path: string) {
 <template>
   <div class="ide-shell">
     <div class="ide-body">
-      <ActivityBar />
+      <ActivityBar @open-settings="settingsOpen = true" />
       <aside class="sidebar" :style="{ width: sidebarWidth + 'px' }">
         <div class="sidebar-title">资源管理器</div>
         <button class="open-folder-pick" :disabled="switching" @click="chooseFolder">
@@ -216,5 +220,6 @@ function closeTab(path: string) {
       :query-open="queryPanelOpen"
       @toggle-query="queryPanelOpen = !queryPanelOpen"
     />
+    <SettingsModal v-if="settingsOpen" @close="settingsOpen = false" />
   </div>
 </template>
