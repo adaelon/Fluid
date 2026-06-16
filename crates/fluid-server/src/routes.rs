@@ -49,8 +49,11 @@ struct ProjectCtx {
 /// LLM backend swaps on a settings change (U5a, ADR-0018). `prompt_version` is a
 /// build constant feeding the cache key.
 pub struct AppState {
-    /// Swappable per-project context (reader + graph + cache).
-    project: RwLock<ProjectCtx>,
+    /// Swappable per-project context (reader + graph + cache). `None` when started
+    /// without a project — the user opens one from the UI (Open Folder), which sets
+    /// it via `/api/project/open`. Until then tree is empty and file/gen/query report
+    /// "no project open".
+    project: RwLock<Option<ProjectCtx>>,
     /// Runtime-editable LLM backend (U5a, ADR-0018): config (source of truth,
     /// holds the secret key in memory) + the derived proxy (`None` when no key).
     /// Behind a lock so the settings panel can hot-swap it; the proxy is `Arc`'d
@@ -78,9 +81,33 @@ impl AppState {
         env_path: PathBuf,
         prompt_version: &'static str,
     ) -> Self {
+        Self::with_project(
+            Some(ProjectCtx { reader, graph, cache }),
+            llm_config,
+            env_path,
+            prompt_version,
+        )
+    }
+
+    /// Start with no project loaded (`fluid` run without a path). The user opens one
+    /// from the UI; until then the project context is `None`.
+    pub fn new_no_project(
+        llm_config: LlmConfig,
+        env_path: PathBuf,
+        prompt_version: &'static str,
+    ) -> Self {
+        Self::with_project(None, llm_config, env_path, prompt_version)
+    }
+
+    fn with_project(
+        project: Option<ProjectCtx>,
+        llm_config: LlmConfig,
+        env_path: PathBuf,
+        prompt_version: &'static str,
+    ) -> Self {
         let proxy = LlmProxy::from_config(&llm_config).map(Arc::new);
         Self {
-            project: RwLock::new(ProjectCtx { reader, graph, cache }),
+            project: RwLock::new(project),
             llm: RwLock::new(LlmState { config: llm_config, proxy }),
             env_path,
             prompt_version,
@@ -124,9 +151,12 @@ struct TreeResponse {
 }
 
 async fn tree(State(state): State<Shared>) -> Json<TreeResponse> {
-    Json(TreeResponse {
-        files: state.project.read().unwrap().reader.list_files(),
-    })
+    // No project open → empty tree (the UI shows its Open Folder affordance).
+    let files = match state.project.read().unwrap().as_ref() {
+        Some(p) => p.reader.list_files(),
+        None => Vec::new(),
+    };
+    Json(TreeResponse { files })
 }
 
 #[derive(Deserialize)]
@@ -140,7 +170,11 @@ struct FileResponse {
 }
 
 async fn file(State(state): State<Shared>, Query(q): Query<FileQuery>) -> impl IntoResponse {
-    let result = state.project.read().unwrap().reader.read_file(&q.path);
+    let guard = state.project.read().unwrap();
+    let Some(proj) = guard.as_ref() else {
+        return (StatusCode::NOT_FOUND, "no project open").into_response();
+    };
+    let result = proj.reader.read_file(&q.path);
     match result {
         Ok(source) => (StatusCode::OK, Json(FileResponse { source })).into_response(),
         Err(ReadErr::NotFound) => (StatusCode::NOT_FOUND, "file not found").into_response(),
@@ -153,7 +187,14 @@ async fn file(State(state): State<Shared>, Query(q): Query<FileQuery>) -> impl I
 /// Returns the knowledge graph, or `null` when no `.understand-anything/` is
 /// present (ADR-0011: optional enhancement, never required).
 async fn graph(State(state): State<Shared>) -> Json<Option<KnowledgeGraph>> {
-    Json(state.project.read().unwrap().graph.graph().cloned())
+    Json(
+        state
+            .project
+            .read()
+            .unwrap()
+            .as_ref()
+            .and_then(|p| p.graph.graph().cloned()),
+    )
 }
 
 #[derive(Deserialize)]
@@ -181,7 +222,7 @@ async fn open_folder(State(state): State<Shared>, Json(req): Json<OpenRequest>) 
     let graph = GraphLoader::load(reader.root());
     let cache = CacheStore::new(reader.root(), state.model(), state.prompt_version);
     let root = reader.root().display().to_string();
-    *state.project.write().unwrap() = ProjectCtx { reader, graph, cache };
+    *state.project.write().unwrap() = Some(ProjectCtx { reader, graph, cache });
     eprintln!("[open] switched project root to {root}");
     (StatusCode::OK, Json(OpenResponse { root })).into_response()
 }
@@ -305,9 +346,13 @@ fn apply_llm_settings(
     // Model change → re-point the cache so new generations key under the new model
     // (old-model entries simply miss and regenerate, ADR-0003).
     if model_changed {
-        let root = state.project.read().unwrap().reader.root().to_path_buf();
-        let cache = CacheStore::new(&root, &cfg.model, state.prompt_version);
-        state.project.write().unwrap().cache = cache;
+        // Rebuild the cache pointer under one write lock (no read→write gap), and
+        // only when a project is actually open.
+        let mut guard = state.project.write().unwrap();
+        if let Some(proj) = guard.as_mut() {
+            let root = proj.reader.root().to_path_buf();
+            proj.cache = CacheStore::new(&root, &cfg.model, state.prompt_version);
+        }
     }
     cfg
 }
@@ -467,7 +512,10 @@ async fn run_generation(state: &AppState, req: GenerateRequest) -> Vec<GenFrame>
     // lock drop and the await below, and a concurrent settings swap can't tear it.
     let llm = state.llm_proxy();
     let step = {
-        let proj = state.project.read().unwrap();
+        let guard = state.project.read().unwrap();
+        let Some(proj) = guard.as_ref() else {
+            return vec![err("no project open")];
+        };
 
         // 1. Resolve the function source span (deterministic; the cache key derives from it).
         let source = match proj.reader.read_file(&req.file_path) {
@@ -523,8 +571,10 @@ async fn run_generation(state: &AppState, req: GenerateRequest) -> Vec<GenFrame>
         capsule: capsule.clone(),
         lines: lines.clone(),
     };
-    if let Err(e) = state.project.read().unwrap().cache.put(&fn_source, &entry) {
-        eprintln!("[generate] warning: cache put failed: {e}");
+    if let Some(proj) = state.project.read().unwrap().as_ref() {
+        if let Err(e) = proj.cache.put(&fn_source, &entry) {
+            eprintln!("[generate] warning: cache put failed: {e}");
+        }
     }
 
     build_frames(false, capsule, lines)
@@ -622,7 +672,10 @@ async fn run_explain_line(
     }
 
     let step = {
-        let proj = state.project.read().unwrap();
+        let guard = state.project.read().unwrap();
+        let Some(proj) = guard.as_ref() else {
+            return Err((StatusCode::NOT_FOUND, "no project open".into()));
+        };
 
         let source = match proj.reader.read_file(&req.file_path) {
             Ok(s) => s,
@@ -693,14 +746,10 @@ async fn run_explain_line(
 
     // Persist for the next open (best-effort; a write failure must not fail the
     // response). Re-acquire the lock briefly for the cache write.
-    if let Err(e) = state
-        .project
-        .read()
-        .unwrap()
-        .cache
-        .put_line(&fn_source, req.line_number, &line)
-    {
-        eprintln!("[explain-line] warning: cache put failed: {e}");
+    if let Some(proj) = state.project.read().unwrap().as_ref() {
+        if let Err(e) = proj.cache.put_line(&fn_source, req.line_number, &line) {
+            eprintln!("[explain-line] warning: cache put failed: {e}");
+        }
     }
 
     Ok(line)
@@ -813,7 +862,10 @@ struct DegradedPlan {
 /// functions to name-only AND we have spans to slice them, returns a two-phase plan;
 /// otherwise a direct single-call prompt.
 fn prepare_query(state: &AppState, req: &QueryRequest) -> QueryPlan {
-    let proj = state.project.read().unwrap();
+    let guard = state.project.read().unwrap();
+    let Some(proj) = guard.as_ref() else {
+        return QueryPlan::Err("no project open".into());
+    };
 
     let source = match proj.reader.read_file(&req.file_path) {
         Ok(s) => s,
@@ -1155,7 +1207,7 @@ mod tests {
         let reader = ProjectReader::new(root.to_path_buf()).unwrap();
         let graph = GraphLoader::load(root);
         let cache = CacheStore::new(root, state.model(), state.prompt_version);
-        *state.project.write().unwrap() = ProjectCtx { reader, graph, cache };
+        *state.project.write().unwrap() = Some(ProjectCtx { reader, graph, cache });
     }
 
     fn req(file_path: &str, line_range: [u32; 2]) -> GenerateRequest {
@@ -1212,6 +1264,8 @@ mod tests {
             .project
             .read()
             .unwrap()
+            .as_ref()
+            .unwrap()
             .cache
             .put(
                 fn_source,
@@ -1265,6 +1319,8 @@ mod tests {
             .project
             .read()
             .unwrap()
+            .as_ref()
+            .unwrap()
             .reader
             .list_files()
             .into_iter()
@@ -1274,7 +1330,8 @@ mod tests {
 
         swap_root(&state, two.path());
         // After swap: tree lists b.py only; a.py is now outside the (new) root.
-        let proj = state.project.read().unwrap();
+        let guard = state.project.read().unwrap();
+        let proj = guard.as_ref().unwrap();
         let names: Vec<String> = proj.reader.list_files().into_iter().map(|f| f.path).collect();
         assert_eq!(names, vec!["b.py"]);
         assert_eq!(proj.reader.read_file("b.py").unwrap(), "y = 2\n");
@@ -1291,7 +1348,8 @@ mod tests {
         let state = make_state(one.path(), "");
         swap_root(&state, two.path());
         // Traversal / absolute paths are still refused against the new root.
-        let proj = state.project.read().unwrap();
+        let guard = state.project.read().unwrap();
+        let proj = guard.as_ref().unwrap();
         assert!(matches!(proj.reader.read_file("../a.py"), Err(ReadErr::Forbidden)));
         assert!(matches!(
             proj.reader.read_file("b.py/../../etc"),
@@ -1325,6 +1383,8 @@ mod tests {
         state
             .project
             .read()
+            .unwrap()
+            .as_ref()
             .unwrap()
             .cache
             .put_line(fn_source, 2, &line("f#1", 2))
@@ -1498,14 +1558,14 @@ mod tests {
         let state = make_state(tmp.path(), "key123"); // model "test-model"
         let fn_source = "def f():\n    return 1\n";
         let entry = CapsuleEntry { capsule: cap("f#1"), lines: vec![line("f#1", 2)] };
-        state.project.read().unwrap().cache.put(fn_source, &entry).unwrap();
+        state.project.read().unwrap().as_ref().unwrap().cache.put(fn_source, &entry).unwrap();
         // Hit under the original model.
-        assert!(state.project.read().unwrap().cache.get(fn_source).is_some());
+        assert!(state.project.read().unwrap().as_ref().unwrap().cache.get(fn_source).is_some());
 
         apply_llm_settings(&state, "https://x/v1".into(), "different-model".into(), None);
 
         // Cache re-pointed under the new model → the old entry no longer matches.
-        assert!(state.project.read().unwrap().cache.get(fn_source).is_none());
+        assert!(state.project.read().unwrap().as_ref().unwrap().cache.get(fn_source).is_none());
     }
 
     #[test]
@@ -1514,10 +1574,10 @@ mod tests {
         let state = make_state(tmp.path(), "key123");
         let fn_source = "def f():\n    return 1\n";
         let entry = CapsuleEntry { capsule: cap("f#1"), lines: vec![line("f#1", 2)] };
-        state.project.read().unwrap().cache.put(fn_source, &entry).unwrap();
+        state.project.read().unwrap().as_ref().unwrap().cache.put(fn_source, &entry).unwrap();
 
         // Same model (only base_url changes) → cache untouched, entry still hits.
         apply_llm_settings(&state, "https://x/v1".into(), "test-model".into(), None);
-        assert!(state.project.read().unwrap().cache.get(fn_source).is_some());
+        assert!(state.project.read().unwrap().as_ref().unwrap().cache.get(fn_source).is_some());
     }
 }

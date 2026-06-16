@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onBeforeUnmount, ref } from 'vue'
-import { fetchFile, fetchTree, openFolder, pickFolder, type FileNode } from './api'
+import { fetchFile, fetchTree, openFolder, pickFolder, getLlmSettings, type FileNode } from './api'
 import FileTree from './FileTree.vue'
 import Editor from './Editor.vue'
 import QueryPanel from './QueryPanel.vue'
@@ -128,6 +128,14 @@ onMounted(async () => {
     files.value = await fetchTree()
   } catch (e) {
     loadError.value = String(e)
+  }
+  // First-launch nudge: if no LLM backend is configured yet, pop the settings
+  // panel so generation/queries don't silently fail later (best-effort probe).
+  try {
+    const s = await getLlmSettings()
+    if (s.keyStatus === 'unset') settingsOpen.value = true
+  } catch {
+    /* settings probe is best-effort — ignore */
   }
 })
 onBeforeUnmount(() => window.removeEventListener('keydown', onGlobalKey))

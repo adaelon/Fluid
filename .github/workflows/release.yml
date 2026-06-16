@@ -38,6 +38,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Linux: rfd's native folder dialog uses the XDG portal via ashpd, which pulls
+      # wayland-client — its build needs wayland-client.pc. Bare runners lack it.
+      - name: Install Linux build deps
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libwayland-dev pkg-config
+
       # 1) Build the frontend so build.rs/rust-embed can bake web/dist into the binary.
       - uses: actions/setup-node@v4
         with:
