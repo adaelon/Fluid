@@ -31,10 +31,46 @@
 
   /* monospace stack — mirrors theme.ts MONO; used by markdown answer code */
   --mono: 'JetBrains Mono', 'SFMono-Regular', ui-monospace, Consolas, monospace;
+
+  /* S11-d chrome detailing: a thin scrollbar + a faint depth shadow for the
+     chrome layers (tabs / status bar / sidebar / query panel). On the near-black
+     surface a soft dark shadow separates floating chrome without competing with
+     the §7.4 code-area glass (which stays shadow-free). */
+  --scrollbar-thumb: rgba(177, 186, 196, 0.18);
+  --scrollbar-thumb-hover: rgba(177, 186, 196, 0.32);
+  --shadow-chrome: rgba(0, 0, 0, 0.28);
 }
 
 * {
   box-sizing: border-box;
+}
+
+/* S11-d: thin custom scrollbars (Firefox + WebKit). The 2px transparent border
+   on the WebKit thumb (background-clip: padding-box) leaves a slim ~6px thumb
+   with breathing room; track is invisible so chrome stays quiet. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--scrollbar-thumb) transparent;
+}
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border: 2px solid transparent;
+  background-clip: padding-box;
+  border-radius: 5px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-thumb-hover);
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-corner {
+  background: transparent;
 }
 
 html,
@@ -113,6 +149,8 @@ body {
   flex: none;
   background: var(--panel);
   border-right: 1px solid var(--border);
+  /* S11-d: faint depth shadow so the sidebar reads as a layer above the editor. */
+  box-shadow: 2px 0 5px var(--shadow-chrome);
   overflow: auto;
   padding: 8px 0;
   min-height: 0;
@@ -163,6 +201,11 @@ body {
   color: var(--text);
   background: var(--bg);
   border: 1px solid var(--border);
+}
+.open-folder-input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-soft);
 }
 .open-folder-btn {
   flex: none;
@@ -246,6 +289,8 @@ body {
   background: var(--panel);
   color: var(--muted);
   border-top: 1px solid var(--border);
+  /* S11-d: faint upward shadow lifts the status bar off the editor. */
+  box-shadow: 0 -2px 5px var(--shadow-chrome);
 }
 .status-left,
 .status-right {
@@ -272,6 +317,9 @@ body {
    only the code-area glass notes). */
 .status-query-toggle {
   flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   background: transparent;
   border: none;
   color: var(--muted);
@@ -281,6 +329,9 @@ body {
   height: 18px;
   border-radius: 3px;
   opacity: 0.9;
+}
+.status-query-toggle svg {
+  flex: none;
 }
 .status-query-toggle:hover:not(:disabled) {
   opacity: 1;
@@ -304,7 +355,11 @@ body {
   flex: none;
   background: var(--bg);
   border-bottom: 1px solid var(--border);
+  /* S11-d: faint downward shadow separates the tab strip from the code below. */
+  box-shadow: 0 2px 5px var(--shadow-chrome);
   overflow-x: auto;
+  position: relative;
+  z-index: 1;
 }
 .tab {
   display: flex;
@@ -398,6 +453,8 @@ body {
   max-height: 240px;
   border-top: 1px solid var(--border);
   background: var(--panel);
+  /* S11-d: faint upward shadow lifts the docked panel above the editor. */
+  box-shadow: 0 -2px 6px var(--shadow-chrome);
 }
 
 .query-panel.disabled {
@@ -422,11 +479,21 @@ body {
 }
 
 .query-collapse {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
   background: none;
   border: none;
+  border-radius: 3px;
   color: var(--muted);
   cursor: pointer;
-  font-size: 12px;
+}
+.query-collapse:hover {
+  color: var(--text);
+  background: var(--hover);
 }
 
 .query-vacuum {
@@ -510,6 +577,12 @@ body {
   color: var(--text);
   font-family: inherit;
   font-size: 13px;
+}
+
+.query-input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-soft);
 }
 
 .query-input:disabled {

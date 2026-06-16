@@ -40,7 +40,20 @@ const progressText = computed(() => {
         :title="path ? '追问当前文件' : '打开文件以启用追问'"
         @click="emit('toggleQuery')"
       >
-        💬 追问
+        <svg
+          width="14"
+          height="14"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.8"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          aria-hidden="true"
+        >
+          <path d="M21 11.5a8.38 8.38 0 0 1-8.5 8.5 9.5 9.5 0 0 1-4-.9L3 20l1.4-4.5A8.5 8.5 0 1 1 21 11.5z" />
+        </svg>
+        追问
       </button>
       <span class="status-right" :class="{ done: progress.phase === 'done' }">{{ progressText }}</span>
     </span>

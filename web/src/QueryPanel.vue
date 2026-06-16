@@ -113,7 +113,20 @@ onBeforeUnmount(teardown)
   <section class="query-panel" :class="{ disabled: !path }">
     <header class="query-head">
       <span class="query-title">追问器{{ path ? '' : ' · 未激活' }}</span>
-      <button class="query-collapse" type="button" title="收起追问器" @click="emit('close')">✕</button>
+      <button class="query-collapse" type="button" title="收起追问器" aria-label="收起追问器" @click="emit('close')">
+        <svg
+          width="12"
+          height="12"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          stroke-linecap="round"
+          aria-hidden="true"
+        >
+          <path d="M6 6l12 12M18 6L6 18" />
+        </svg>
+      </button>
     </header>
     <div v-if="!path" class="query-vacuum">打开文件以启用追问</div>
       <template v-else>
