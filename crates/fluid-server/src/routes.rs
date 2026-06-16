@@ -33,6 +33,7 @@ use crate::context_assembler::{
 use crate::graph_loader::{GraphLoader, KnowledgeGraph};
 use crate::llm_proxy::{parse_fetch_plan, parse_generation, parse_line_annotation, LlmProxy, SseDecoder};
 use crate::project_reader::{FileNode, ProjectReader, ReadErr};
+use crate::settings::{mask_key, rewrite_env, LlmConfig};
 use futures_util::StreamExt;
 
 /// The root-bound trio: file reader + optional knowledge graph + bypass cache.
@@ -45,17 +46,27 @@ struct ProjectCtx {
 }
 
 /// Shared server state. The root-bound `project` swaps on Open Folder (U3); the
-/// LLM proxy and the model/prompt versions are root-independent (the latter two
-/// are kept so the cache can be rebuilt for a new root with the same key inputs).
+/// LLM backend swaps on a settings change (U5a, ADR-0018). `prompt_version` is a
+/// build constant feeding the cache key.
 pub struct AppState {
     /// Swappable per-project context (reader + graph + cache).
     project: RwLock<ProjectCtx>,
-    /// LLM proxy; `None` when `OPENCODE_API_KEY` is unset (generate → error frame).
-    llm: Option<LlmProxy>,
-    /// Model id — feeds the cache key; needed to rebuild the cache on root swap.
-    model: String,
+    /// Runtime-editable LLM backend (U5a, ADR-0018): config (source of truth,
+    /// holds the secret key in memory) + the derived proxy (`None` when no key).
+    /// Behind a lock so the settings panel can hot-swap it; the proxy is `Arc`'d
+    /// so handlers clone it out and use it across `.await` without holding the lock.
+    llm: RwLock<LlmState>,
+    /// Resolved `.env` path — where a settings change is persisted (U5a).
+    env_path: PathBuf,
     /// Prompt template version — feeds the cache key (ADR-0003).
     prompt_version: &'static str,
+}
+
+/// The runtime LLM state behind `AppState.llm`. `config.model` feeds the cache
+/// key, so it is kept in lock-step with `proxy`'s model on every swap.
+struct LlmState {
+    config: LlmConfig,
+    proxy: Option<Arc<LlmProxy>>,
 }
 
 impl AppState {
@@ -63,16 +74,28 @@ impl AppState {
         reader: ProjectReader,
         graph: GraphLoader,
         cache: CacheStore,
-        llm: Option<LlmProxy>,
-        model: String,
+        llm_config: LlmConfig,
+        env_path: PathBuf,
         prompt_version: &'static str,
     ) -> Self {
+        let proxy = LlmProxy::from_config(&llm_config).map(Arc::new);
         Self {
             project: RwLock::new(ProjectCtx { reader, graph, cache }),
-            llm,
-            model,
+            llm: RwLock::new(LlmState { config: llm_config, proxy }),
+            env_path,
             prompt_version,
         }
+    }
+
+    /// Snapshot the current proxy (cheap `Arc` clone), releasing the lock at once
+    /// so it can be used across `.await` without blocking a settings swap.
+    fn llm_proxy(&self) -> Option<Arc<LlmProxy>> {
+        self.llm.read().unwrap().proxy.clone()
+    }
+
+    /// The model id that feeds the cache key (kept in lock-step with the proxy).
+    fn model(&self) -> String {
+        self.llm.read().unwrap().config.model.clone()
     }
 }
 
@@ -85,6 +108,7 @@ pub fn router(state: Shared) -> Router {
         .route("/api/project/graph", get(graph))
         .route("/api/project/open", post(open_folder))
         .route("/api/project/pick", post(pick_folder))
+        .route("/api/settings/llm", get(get_llm_settings).post(put_llm_settings))
         .route("/api/explain-line", post(explain_line))
         .route("/api/generate", get(generate_ws))
         .route("/api/query", get(query_ws))
@@ -152,7 +176,7 @@ async fn open_folder(State(state): State<Shared>, Json(req): Json<OpenRequest>) 
         }
     };
     let graph = GraphLoader::load(reader.root());
-    let cache = CacheStore::new(reader.root(), &state.model, state.prompt_version);
+    let cache = CacheStore::new(reader.root(), state.model(), state.prompt_version);
     let root = reader.root().display().to_string();
     *state.project.write().unwrap() = ProjectCtx { reader, graph, cache };
     eprintln!("[open] switched project root to {root}");
@@ -181,6 +205,108 @@ async fn pick_folder() -> impl IntoResponse {
     .await
     .unwrap_or(None);
     Json(PickResponse { path: picked })
+}
+
+// — Settings: runtime LLM backend config (U5a, ADR-0018) —
+//
+// GET  returns the non-secret config + a *masked* key status (write-only key: the
+//      full key never leaves the backend).
+// POST applies new values: hot-rebuilds the in-memory proxy, rebuilds the cache
+//      pointer if the model changed (model feeds the cache key, ADR-0003), and
+//      writes the three lines back to `.env` so the change survives a restart. An
+//      omitted/empty `apiKey` keeps the existing key (so the UI never has to echo
+//      it back to overwrite the rest).
+
+#[derive(Serialize)]
+struct LlmSettingsResponse {
+    #[serde(rename = "baseUrl")]
+    base_url: String,
+    model: String,
+    /// "set" | "unset" — whether a key is configured.
+    #[serde(rename = "keyStatus")]
+    key_status: &'static str,
+    /// Masked tail (`···last4`) or null — the only key derivative sent to the UI.
+    #[serde(rename = "keyHint")]
+    key_hint: Option<String>,
+}
+
+impl LlmSettingsResponse {
+    fn of(cfg: &LlmConfig) -> Self {
+        Self {
+            base_url: cfg.base_url.clone(),
+            model: cfg.model.clone(),
+            key_status: if cfg.key_set() { "set" } else { "unset" },
+            key_hint: mask_key(&cfg.api_key),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct LlmSettingsRequest {
+    #[serde(rename = "baseUrl")]
+    base_url: String,
+    model: String,
+    /// Omitted or empty → keep the current key (write-only).
+    #[serde(rename = "apiKey", default)]
+    api_key: Option<String>,
+}
+
+async fn get_llm_settings(State(state): State<Shared>) -> Json<LlmSettingsResponse> {
+    let s = state.llm.read().unwrap();
+    Json(LlmSettingsResponse::of(&s.config))
+}
+
+async fn put_llm_settings(
+    State(state): State<Shared>,
+    Json(req): Json<LlmSettingsRequest>,
+) -> impl IntoResponse {
+    if req.base_url.trim().is_empty() || req.model.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "baseUrl and model are required").into_response();
+    }
+    let cfg = apply_llm_settings(&state, req.base_url, req.model, req.api_key);
+
+    // Persist to `.env` (best-effort: a write failure must not fail the request —
+    // the change is already live in memory). Reads the current file so unrelated
+    // lines/comments survive; absent file → write just the three lines.
+    let existing = std::fs::read_to_string(&state.env_path).unwrap_or_default();
+    if let Err(e) = std::fs::write(&state.env_path, rewrite_env(&existing, &cfg)) {
+        eprintln!("[settings] warning: .env write-back failed ({}): {e}", state.env_path.display());
+    }
+
+    (StatusCode::OK, Json(LlmSettingsResponse::of(&cfg))).into_response()
+}
+
+/// Core of `put_llm_settings`, factored out for deterministic testing (no axum /
+/// no file IO): swap the in-memory config + proxy, and rebuild the cache pointer
+/// when the model changed (model feeds the cache key, ADR-0003 — mirrors the root
+/// swap in `open_folder`). An empty/omitted `api_key` keeps the existing key.
+/// Returns the applied config (with the resolved key) for the response/write-back.
+fn apply_llm_settings(
+    state: &AppState,
+    base_url: String,
+    model: String,
+    api_key: Option<String>,
+) -> LlmConfig {
+    let (cfg, model_changed) = {
+        let mut s = state.llm.write().unwrap();
+        let old_model = s.config.model.clone();
+        let key = match api_key {
+            Some(k) if !k.trim().is_empty() => k,
+            _ => s.config.api_key.clone(), // keep existing (write-only)
+        };
+        s.config = LlmConfig { base_url, model, api_key: key };
+        s.proxy = LlmProxy::from_config(&s.config).map(Arc::new);
+        (s.config.clone(), s.config.model != old_model)
+    }; // llm lock dropped before touching the project lock (no nested ordering).
+
+    // Model change → re-point the cache so new generations key under the new model
+    // (old-model entries simply miss and regenerate, ADR-0003).
+    if model_changed {
+        let root = state.project.read().unwrap().reader.root().to_path_buf();
+        let cache = CacheStore::new(&root, &cfg.model, state.prompt_version);
+        state.project.write().unwrap().cache = cache;
+    }
+    cfg
 }
 
 // — WS /api/generate — per-function streaming generation (S7a) —
@@ -263,6 +389,9 @@ enum GenStep {
 /// the synchronous read/cache/assemble phase and is dropped before the LLM await
 /// (so the future stays Send and a concurrent Open Folder can't deadlock).
 async fn run_generation(state: &AppState, req: GenerateRequest) -> Vec<GenFrame> {
+    // Snapshot the proxy once (Arc clone, lock released) so it survives the project
+    // lock drop and the await below, and a concurrent settings swap can't tear it.
+    let llm = state.llm_proxy();
     let step = {
         let proj = state.project.read().unwrap();
 
@@ -280,7 +409,7 @@ async fn run_generation(state: &AppState, req: GenerateRequest) -> Vec<GenFrame>
         if let Some(entry) = proj.cache.get(&fn_source) {
             eprintln!("[generate] cache HIT {}#{} — zero token", req.file_path, req.func.name);
             GenStep::Ready(build_frames(true, entry.capsule, entry.lines))
-        } else if state.llm.is_none() {
+        } else if llm.is_none() {
             // 3a. Miss but no LLM configured.
             GenStep::Ready(vec![err("LLM not configured: set OPENCODE_API_KEY")])
         } else {
@@ -297,7 +426,7 @@ async fn run_generation(state: &AppState, req: GenerateRequest) -> Vec<GenFrame>
         GenStep::NeedLlm { system, user, fn_source } => (system, user, fn_source),
     };
 
-    let llm = state.llm.as_ref().expect("NeedLlm implies llm is Some");
+    let llm = llm.as_ref().expect("NeedLlm implies llm is Some");
     eprintln!("[generate] cache MISS {}#{} — calling LLM ({})", req.file_path, req.func.name, llm.model);
     let content = match llm.complete(&system, &user).await {
         Ok(c) => c,
@@ -407,6 +536,8 @@ async fn run_explain_line(
     state: &AppState,
     req: ExplainLineRequest,
 ) -> Result<LineAnnotation, (StatusCode, String)> {
+    // Snapshot the proxy once (see run_generation) so it survives the lock drop.
+    let llm = state.llm_proxy();
     enum Step {
         Ready(LineAnnotation),
         NeedLlm {
@@ -441,7 +572,7 @@ async fn run_explain_line(
                 req.file_path, req.func.name, req.line_number
             );
             Step::Ready(line)
-        } else if state.llm.is_none() {
+        } else if llm.is_none() {
             return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
                 "LLM not configured: set OPENCODE_API_KEY".into(),
@@ -460,7 +591,7 @@ async fn run_explain_line(
         Step::NeedLlm { system, user, fn_source } => (system, user, fn_source),
     };
 
-    let llm = state.llm.as_ref().expect("NeedLlm implies llm is Some");
+    let llm = llm.as_ref().expect("NeedLlm implies llm is Some");
     eprintln!(
         "[explain-line] cache MISS {}#{} L{} — calling LLM ({})",
         req.file_path, req.func.name, req.line_number, llm.model
@@ -626,7 +757,7 @@ fn prepare_query(state: &AppState, req: &QueryRequest) -> QueryPlan {
         None => None,
     };
 
-    if state.llm.is_none() {
+    if state.llm_proxy().is_none() {
         return QueryPlan::Err("LLM not configured: set OPENCODE_API_KEY".into());
     }
 
@@ -710,6 +841,9 @@ async fn run_query(
     socket: &mut WebSocket,
     req_id: &str,
 ) -> Result<(), ()> {
+    // Snapshot the proxy once (Arc clone, lock released) and reuse it for both the
+    // planning and streaming awaits, so a settings swap mid-query can't tear it.
+    let llm_proxy = state.llm_proxy();
     let (system, user) = match prepare_query(state, &req) {
         QueryPlan::Err(msg) => {
             return send_query_frame(socket, req_id, &QueryFrame::Error { message: msg })
@@ -732,7 +866,7 @@ async fn run_query(
             // Phase 1: planning (non-streaming). A failed call or unparseable plan
             // degrades to answering with no extra source — the fetch must never fail
             // the query (ADR-0017). One round only: no recursion.
-            let llm = state.llm.as_ref().expect("Degraded implies llm is Some");
+            let llm = llm_proxy.as_ref().expect("Degraded implies llm is Some");
             eprintln!(
                 "[query] {} — planning fetch ({} same-file, {} cross-file)",
                 req.file_path,
@@ -780,7 +914,7 @@ async fn run_query(
         }
     };
 
-    let llm = state.llm.as_ref().expect("a non-Err plan implies llm is Some");
+    let llm = llm_proxy.as_ref().expect("a non-Err plan implies llm is Some");
     eprintln!("[query] {} — streaming ({})", req.file_path, llm.model);
     let resp = match llm.open_chat_stream(&system, &user).await {
         Ok(r) => r,
@@ -923,13 +1057,21 @@ mod tests {
         }
     }
 
-    fn make_state(root: &Path, llm: Option<LlmProxy>) -> AppState {
+    /// Build a test state. `api_key` empty → proxy `None` (no-LLM paths); a
+    /// non-empty key → proxy `Some` (without ever calling out, since tests assert
+    /// cache/settings behaviour, not network).
+    fn make_state(root: &Path, api_key: &str) -> AppState {
+        let cfg = LlmConfig {
+            base_url: "https://test/v1".into(),
+            model: "test-model".into(),
+            api_key: api_key.into(),
+        };
         AppState::new(
             ProjectReader::new(root.to_path_buf()).unwrap(),
             GraphLoader::load(root),
-            CacheStore::new(root, "test-model", "p1"),
-            llm,
-            "test-model".to_string(),
+            CacheStore::new(root, &cfg.model, "p1"),
+            cfg,
+            root.join(".env"),
             "p1",
         )
     }
@@ -938,7 +1080,7 @@ mod tests {
     fn swap_root(state: &AppState, root: &Path) {
         let reader = ProjectReader::new(root.to_path_buf()).unwrap();
         let graph = GraphLoader::load(root);
-        let cache = CacheStore::new(root, &state.model, state.prompt_version);
+        let cache = CacheStore::new(root, state.model(), state.prompt_version);
         *state.project.write().unwrap() = ProjectCtx { reader, graph, cache };
     }
 
@@ -990,7 +1132,7 @@ mod tests {
         let tmp = TmpDir::new();
         std::fs::write(tmp.path().join("a.py"), "def f():\n    return 1\n").unwrap();
         // llm: None — yet a pre-populated cache must still succeed (zero token).
-        let state = make_state(tmp.path(), None);
+        let state = make_state(tmp.path(), "");
         let fn_source = "def f():\n    return 1";
         state
             .project
@@ -1016,7 +1158,7 @@ mod tests {
     async fn invalid_line_range_yields_single_error_frame() {
         let tmp = TmpDir::new();
         std::fs::write(tmp.path().join("a.py"), "def f():\n    return 1\n").unwrap();
-        let state = make_state(tmp.path(), None);
+        let state = make_state(tmp.path(), "");
         let frames = run_generation(&state, req("a.py", [5, 9])).await;
         assert_eq!(frames.len(), 1);
         assert!(matches!(frames[0], GenFrame::Error { .. }));
@@ -1026,7 +1168,7 @@ mod tests {
     async fn cache_miss_without_llm_yields_error_frame() {
         let tmp = TmpDir::new();
         std::fs::write(tmp.path().join("a.py"), "def f():\n    return 1\n").unwrap();
-        let state = make_state(tmp.path(), None);
+        let state = make_state(tmp.path(), "");
         let frames = run_generation(&state, req("a.py", [1, 2])).await;
         assert_eq!(frames.len(), 1);
         match &frames[0] {
@@ -1043,7 +1185,7 @@ mod tests {
         let two = TmpDir::new();
         std::fs::write(two.path().join("b.py"), "y = 2\n").unwrap();
 
-        let state = make_state(one.path(), None);
+        let state = make_state(one.path(), "");
         // Before swap: tree lists a.py, b.py is unreadable (outside root).
         let names: Vec<String> = state
             .project
@@ -1072,7 +1214,7 @@ mod tests {
         let two = TmpDir::new();
         std::fs::write(two.path().join("b.py"), "y = 2\n").unwrap();
 
-        let state = make_state(one.path(), None);
+        let state = make_state(one.path(), "");
         swap_root(&state, two.path());
         // Traversal / absolute paths are still refused against the new root.
         let proj = state.project.read().unwrap();
@@ -1104,7 +1246,7 @@ mod tests {
         let tmp = TmpDir::new();
         std::fs::write(tmp.path().join("a.py"), "def f():\n    return 1\n").unwrap();
         // llm: None — yet a pre-populated line cache must still succeed (zero token).
-        let state = make_state(tmp.path(), None);
+        let state = make_state(tmp.path(), "");
         let fn_source = "def f():\n    return 1";
         state
             .project
@@ -1122,7 +1264,7 @@ mod tests {
     async fn explain_line_invalid_line_range_is_bad_request() {
         let tmp = TmpDir::new();
         std::fs::write(tmp.path().join("a.py"), "def f():\n    return 1\n").unwrap();
-        let state = make_state(tmp.path(), None);
+        let state = make_state(tmp.path(), "");
         let err = run_explain_line(&state, explain_req("a.py", [5, 9], 5)).await.unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
@@ -1131,7 +1273,7 @@ mod tests {
     async fn explain_line_outside_function_is_bad_request() {
         let tmp = TmpDir::new();
         std::fs::write(tmp.path().join("a.py"), "def f():\n    return 1\n").unwrap();
-        let state = make_state(tmp.path(), None);
+        let state = make_state(tmp.path(), "");
         // Line 9 is outside the function span [1, 2].
         let err = run_explain_line(&state, explain_req("a.py", [1, 2], 9)).await.unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
@@ -1142,7 +1284,7 @@ mod tests {
     async fn explain_line_miss_without_llm_is_service_unavailable() {
         let tmp = TmpDir::new();
         std::fs::write(tmp.path().join("a.py"), "def f():\n    return 1\n").unwrap();
-        let state = make_state(tmp.path(), None);
+        let state = make_state(tmp.path(), "");
         let err = run_explain_line(&state, explain_req("a.py", [1, 2], 2)).await.unwrap_err();
         assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
         assert!(err.1.contains("LLM not configured"));
@@ -1151,7 +1293,7 @@ mod tests {
     #[tokio::test]
     async fn explain_line_missing_file_is_not_found() {
         let tmp = TmpDir::new();
-        let state = make_state(tmp.path(), None);
+        let state = make_state(tmp.path(), "");
         let err = run_explain_line(&state, explain_req("nope.py", [1, 2], 1)).await.unwrap_err();
         assert_eq!(err.0, StatusCode::NOT_FOUND);
     }
@@ -1191,7 +1333,7 @@ mod tests {
     fn prepare_query_without_llm_is_an_error() {
         let tmp = TmpDir::new();
         std::fs::write(tmp.path().join("a.py"), "def f():\n    return 1\n").unwrap();
-        let state = make_state(tmp.path(), None);
+        let state = make_state(tmp.path(), "");
         match prepare_query(&state, &query_req("a.py", Some([1, 2]))) {
             QueryPlan::Err(msg) => assert!(msg.contains("LLM not configured")),
             _ => panic!("expected Err without llm"),
@@ -1202,7 +1344,7 @@ mod tests {
     fn prepare_query_rejects_invalid_focus_range() {
         let tmp = TmpDir::new();
         std::fs::write(tmp.path().join("a.py"), "def f():\n    return 1\n").unwrap();
-        let state = make_state(tmp.path(), None);
+        let state = make_state(tmp.path(), "");
         // Line 9 is out of bounds for the 2-line file → focus slice fails *before* the
         // llm check, so this reports the focus error rather than "LLM not configured".
         match prepare_query(&state, &query_req("a.py", Some([1, 9]))) {
@@ -1214,10 +1356,81 @@ mod tests {
     #[test]
     fn prepare_query_missing_file_is_an_error() {
         let tmp = TmpDir::new();
-        let state = make_state(tmp.path(), None);
+        let state = make_state(tmp.path(), "");
         match prepare_query(&state, &query_req("nope.py", None)) {
             QueryPlan::Err(msg) => assert!(msg.contains("file not found")),
             _ => panic!("expected Err for missing file"),
         }
+    }
+
+    // — U5a settings (ADR-0018) —
+
+    #[test]
+    fn settings_response_masks_the_key() {
+        let set = LlmConfig { base_url: "b".into(), model: "m".into(), api_key: "sk-xyz9999".into() };
+        let r = LlmSettingsResponse::of(&set);
+        assert_eq!(r.key_status, "set");
+        assert_eq!(r.key_hint.as_deref(), Some("···9999"));
+
+        let unset = LlmConfig { base_url: "b".into(), model: "m".into(), api_key: "".into() };
+        let r2 = LlmSettingsResponse::of(&unset);
+        assert_eq!(r2.key_status, "unset");
+        assert_eq!(r2.key_hint, None);
+    }
+
+    #[test]
+    fn empty_api_key_keeps_existing_key_and_updates_the_rest() {
+        let tmp = TmpDir::new();
+        let state = make_state(tmp.path(), "secret-key"); // key set → proxy Some
+        assert!(state.llm_proxy().is_some());
+
+        // No apiKey in the request → key preserved, base_url/model updated, proxy live.
+        let cfg = apply_llm_settings(&state, "https://new/v1".into(), "m2".into(), None);
+        assert_eq!(cfg.api_key, "secret-key");
+        assert_eq!(cfg.base_url, "https://new/v1");
+        assert_eq!(cfg.model, "m2");
+        assert!(state.llm_proxy().is_some());
+        assert_eq!(state.model(), "m2");
+        // The masked response never reveals the kept key beyond its tail.
+        assert_eq!(LlmSettingsResponse::of(&cfg).key_hint.as_deref(), Some("···-key"));
+    }
+
+    #[test]
+    fn setting_a_key_enables_the_proxy() {
+        let tmp = TmpDir::new();
+        let state = make_state(tmp.path(), ""); // unset → proxy None
+        assert!(state.llm_proxy().is_none());
+
+        apply_llm_settings(&state, "https://x/v1".into(), "m".into(), Some("new-key".into()));
+        assert!(state.llm_proxy().is_some());
+    }
+
+    #[test]
+    fn changing_model_via_settings_repoints_the_cache() {
+        let tmp = TmpDir::new();
+        let state = make_state(tmp.path(), "key123"); // model "test-model"
+        let fn_source = "def f():\n    return 1\n";
+        let entry = CapsuleEntry { capsule: cap("f#1"), lines: vec![line("f#1", 2)] };
+        state.project.read().unwrap().cache.put(fn_source, &entry).unwrap();
+        // Hit under the original model.
+        assert!(state.project.read().unwrap().cache.get(fn_source).is_some());
+
+        apply_llm_settings(&state, "https://x/v1".into(), "different-model".into(), None);
+
+        // Cache re-pointed under the new model → the old entry no longer matches.
+        assert!(state.project.read().unwrap().cache.get(fn_source).is_none());
+    }
+
+    #[test]
+    fn keeping_the_model_leaves_the_cache_intact() {
+        let tmp = TmpDir::new();
+        let state = make_state(tmp.path(), "key123");
+        let fn_source = "def f():\n    return 1\n";
+        let entry = CapsuleEntry { capsule: cap("f#1"), lines: vec![line("f#1", 2)] };
+        state.project.read().unwrap().cache.put(fn_source, &entry).unwrap();
+
+        // Same model (only base_url changes) → cache untouched, entry still hits.
+        apply_llm_settings(&state, "https://x/v1".into(), "test-model".into(), None);
+        assert!(state.project.read().unwrap().cache.get(fn_source).is_some());
     }
 }

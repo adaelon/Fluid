@@ -27,20 +27,19 @@ pub struct LlmProxy {
 }
 
 impl LlmProxy {
-    /// Build from environment. Returns `None` when `OPENCODE_API_KEY` is unset/
-    /// empty — the server still runs, but `/api/generate` answers 503 on a cache
-    /// miss instead of leaking a hard requirement into S1–S5 paths.
-    pub fn from_env(model: impl Into<String>) -> Option<Self> {
-        let api_key = std::env::var("OPENCODE_API_KEY")
-            .ok()
-            .filter(|s| !s.is_empty())?;
-        let base_url =
-            std::env::var("OPENCODE_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
+    /// Build from an `LlmConfig` (U5a, ADR-0018). Returns `None` when the key is
+    /// unset/empty — the server still runs, but `/api/generate` answers 503 on a
+    /// cache miss instead of leaking a hard requirement into S1–S5 paths. This is
+    /// the single construction path, used at startup and on every settings change.
+    pub fn from_config(cfg: &crate::settings::LlmConfig) -> Option<Self> {
+        if !cfg.key_set() {
+            return None;
+        }
         Some(Self {
             client: reqwest::Client::new(),
-            base_url,
-            api_key,
-            model: model.into(),
+            base_url: cfg.base_url.clone(),
+            api_key: cfg.api_key.clone(),
+            model: cfg.model.clone(),
         })
     }
 

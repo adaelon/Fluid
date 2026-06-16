@@ -9,6 +9,7 @@ mod graph_loader;
 mod llm_proxy;
 mod project_reader;
 mod routes;
+mod settings;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -18,9 +19,9 @@ use clap::Parser;
 
 use cache_store::CacheStore;
 use graph_loader::GraphLoader;
-use llm_proxy::{LlmProxy, DEFAULT_MODEL};
 use project_reader::ProjectReader;
 use routes::AppState;
+use settings::LlmConfig;
 
 /// Prompt template version — bump when the generation prompt changes (invalidates
 /// cache, ADR-0003). The model version is now the real model id (S6); both feed the
@@ -44,11 +45,19 @@ async fn main() -> anyhow::Result<()> {
     // any env read. Real environment variables take precedence (dotenvy default).
     // Run fluid from its own repo root, not from inside a served project that has
     // its own .env. Absent .env is fine (env vars alone still work).
-    match dotenvy::dotenv() {
-        Ok(path) => println!("Loaded .env: {}", path.display()),
-        Err(e) if e.not_found() => {}
-        Err(e) => eprintln!("warning: .env present but unreadable: {e}"),
-    }
+    // Capture the resolved `.env` path so the settings panel (U5a) can write
+    // changes back to the same file. When absent, default to `.env` in the CWD.
+    let env_path = match dotenvy::dotenv() {
+        Ok(path) => {
+            println!("Loaded .env: {}", path.display());
+            path
+        }
+        Err(e) if e.not_found() => PathBuf::from(".env"),
+        Err(e) => {
+            eprintln!("warning: .env present but unreadable: {e}");
+            PathBuf::from(".env")
+        }
+    };
 
     let args = Args::parse();
 
@@ -66,24 +75,25 @@ async fn main() -> anyhow::Result<()> {
         None => println!("No knowledge graph (.understand-anything/ absent) — running self-contained"),
     }
 
-    // Model id drives both the LLM call and the cache key, so they stay in
-    // lock-step (a model switch invalidates the cache). env-overridable; default
+    // The model id drives both the LLM call and the cache key, so they stay in
+    // lock-step (a model switch invalidates the cache). All three values now live
+    // in a runtime-editable LlmConfig (U5a, ADR-0018); env-overridable, default
     // glm-5.1 via the opencode zen gateway (S6 decision, see docs/代码链路.md).
-    let model = std::env::var("FLUID_LLM_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
-    let cache = CacheStore::new(reader.root(), &model, PROMPT_VERSION);
+    let llm_config = LlmConfig::from_env();
+    let cache = CacheStore::new(reader.root(), &llm_config.model, PROMPT_VERSION);
 
-    let llm = LlmProxy::from_env(&model);
-    match &llm {
-        Some(p) => println!("LLM proxy ready: model {}", p.model),
-        None => println!("LLM proxy disabled (OPENCODE_API_KEY unset) — /api/generate will 503 on cache miss"),
+    if llm_config.key_set() {
+        println!("LLM proxy ready: model {}", llm_config.model);
+    } else {
+        println!("LLM proxy disabled (OPENCODE_API_KEY unset) — /api/generate will 503 on cache miss");
     }
 
     let app = routes::router(Arc::new(AppState::new(
         reader,
         graph,
         cache,
-        llm,
-        model,
+        llm_config,
+        env_path,
         PROMPT_VERSION,
     )));
 
