@@ -332,8 +332,8 @@ pub fn build_query_planning_prompt(
     ctx: &GenContext,
     fetchable: &[String],
 ) -> (String, String) {
-    let system = "你是 Fluid 的代码理解助手。下面给出【当前文件上下文】与一份【仅有名字的函数清单】\
-（这些函数因上下文超长被省略了摘要与源码）。判断:要准确回答用户的追问，你还需要其中哪些函数的源码？\
+    let system = "你是 Fluid 的代码理解助手。下面给出【当前文件上下文】与一份【可按需索取源码的函数清单】\
+（这些函数你目前只有名字——或因上下文超长被省略了摘要源码、或定义在其他文件）。判断:要准确回答用户的追问，你还需要其中哪些函数的源码？\
 只输出一个 JSON 对象 {\"need\":[\"函数名\", ...]}，不需要任何源码就返回 {\"need\":[]}；\
 禁止任何额外文字或 markdown 代码围栏。";
 
@@ -465,6 +465,112 @@ pub fn slice_requested_sources(
         }
         used += cost;
         out.push((name.clone(), numbered));
+    }
+    out
+}
+
+/// A cross-file callee the current file calls whose definition the graph can
+/// locate (S10c, ADR-0007 修订). The model points at it by `name` during the
+/// planning phase; the backend slices `line_range` out of `file_path`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CrossFileTarget {
+    /// Callee function name — what the model names in `{"need":[...]}`.
+    pub name: String,
+    /// Project-relative path of the file that defines it.
+    pub file_path: String,
+    /// 1-based inclusive `[start, end]` span of the function in that file.
+    pub line_range: [u32; 2],
+}
+
+/// Cross-file callees of `file_path` the graph can locate (S10c, ADR-0007 修订):
+/// `calls` edges whose source node lives in `file_path` and whose target is a
+/// `function` node in *another* file carrying a `line_range`. Excludes any name
+/// already in the local `roster` (local precedence — keeps the model's plan
+/// unambiguous: a named function resolves to exactly one pool, same-file or
+/// cross-file). Deduplicated by name (first wins) so each fetchable name maps to a
+/// single target. Empty without a graph, or when nodes are too sparse to locate
+/// (no `line_range`) — the natural bound that keeps this from "opening everything".
+pub fn cross_file_targets(
+    graph: Option<&KnowledgeGraph>,
+    file_path: &str,
+    roster: &[String],
+) -> Vec<CrossFileTarget> {
+    let Some(g) = graph else { return Vec::new() };
+    let local_ids: HashSet<&str> = g
+        .nodes
+        .iter()
+        .filter(|n| n.file_path == file_path)
+        .map(|n| n.id.as_str())
+        .collect();
+
+    let mut out: Vec<CrossFileTarget> = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    for e in &g.edges {
+        if e.edge_type != "calls" || !local_ids.contains(e.source.as_str()) {
+            continue;
+        }
+        let Some(t) = g.nodes.iter().find(|n| n.id == e.target) else {
+            continue; // dangling edge target
+        };
+        if t.node_type != "function" || t.file_path == file_path {
+            continue; // only cross-file function definitions
+        }
+        let Some(line_range) = t.line_range else {
+            continue; // sparse node with no span — can't slice, leave name-only
+        };
+        if roster.iter().any(|r| r == &t.name) {
+            continue; // name collides with a local function — local wins
+        }
+        if !seen.insert(t.name.as_str()) {
+            continue; // dedup by name so the model's plan resolves to one target
+        }
+        out.push(CrossFileTarget {
+            name: t.name.clone(),
+            file_path: t.file_path.clone(),
+            line_range,
+        });
+    }
+    out
+}
+
+/// Slice the cross-file sources the model asked for (S10c phase-2). `sources` maps a
+/// target's `file_path` → that file's full source (read by the caller, under the
+/// lock — this stays IO-free). Only names present in `targets` are honored
+/// (hallucination / non-cross-file guard); each is sliced, numbered with absolute
+/// lines, and labeled `name @ path` so the model sees it came from another file.
+/// Deduplicated, and capped at `budget` chars total (shared with same-file fetch so
+/// the phase-2 prompt stays bounded). Returns `(label, numbered source)` in request
+/// order.
+pub fn slice_cross_file_sources(
+    targets: &[CrossFileTarget],
+    sources: &BTreeMap<String, String>,
+    need: &[String],
+    budget: usize,
+) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut used = 0usize;
+    for name in need {
+        let Some(t) = targets.iter().find(|t| &t.name == name) else {
+            continue; // not a fetchable cross-file callee
+        };
+        if !seen.insert(name.as_str()) {
+            continue; // dedup
+        }
+        let Some(src) = sources.get(&t.file_path) else {
+            continue; // caller didn't read this file (shouldn't happen)
+        };
+        let Some(sliced) = slice_span(src, t.line_range) else {
+            continue; // stale / out-of-bounds line range
+        };
+        let numbered = number_lines(&sliced, t.line_range[0]);
+        let label = format!("{} @ {}", t.name, t.file_path);
+        let cost = numbered.chars().count() + label.chars().count() + 4;
+        if used + cost > budget {
+            continue; // over the shared budget — skip; a smaller later one may fit
+        }
+        used += cost;
+        out.push((label, numbered));
     }
     out
 }
@@ -796,5 +902,113 @@ mod tests {
         let (_, user) = build_query_prompt("?", &[], None, &ctx, &extra);
         assert!(user.contains("【按需追加的函数源码: save(带绝对行号)】"));
         assert!(user.contains("   3 | def save():"));
+    }
+
+    // --- S10c: cross-file ephemeral fetch (ADR-0007 修订) ---
+
+    fn fn_node(id: &str, name: &str, file: &str, lr: [u32; 2]) -> GraphNode {
+        GraphNode {
+            id: id.to_string(),
+            node_type: "function".to_string(),
+            name: name.to_string(),
+            file_path: file.to_string(),
+            summary: String::new(),
+            tags: vec![],
+            complexity: None,
+            line_range: Some(lr),
+            language_notes: None,
+        }
+    }
+
+    #[test]
+    fn cross_file_targets_locates_cross_file_function_callees_with_spans() {
+        let g = KnowledgeGraph {
+            nodes: vec![
+                node("file:a.py", "file", "a.py", ""),
+                node("function:a.py:caller", "function", "a.py", ""),
+                node("function:a.py:local2", "function", "a.py", ""),
+                fn_node("function:b.py:encrypt", "encrypt", "b.py", [10, 20]),
+                fn_node("function:b.py:sign", "sign", "b.py", [30, 40]),
+                node("function:c.py:nolines", "function", "c.py", ""), // no line_range
+            ],
+            edges: vec![
+                edge("function:a.py:caller", "function:b.py:encrypt", "calls"), // cross-file ✓
+                edge("function:a.py:caller", "function:b.py:sign", "calls"),    // cross-file ✓
+                edge("function:a.py:caller", "function:c.py:nolines", "calls"), // no span → drop
+                edge("function:a.py:caller", "function:a.py:local2", "calls"),  // same-file → drop
+                edge("function:b.py:x", "function:b.py:encrypt", "calls"),      // foreign src → drop
+                edge("function:a.py:caller", "function:b.py:encrypt", "contains"), // wrong type
+            ],
+        };
+        let targets = cross_file_targets(Some(&g), "a.py", &[]);
+        let names: Vec<&str> = targets.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["encrypt", "sign"]);
+        let enc = targets.iter().find(|t| t.name == "encrypt").unwrap();
+        assert_eq!(enc.file_path, "b.py");
+        assert_eq!(enc.line_range, [10, 20]);
+    }
+
+    #[test]
+    fn cross_file_targets_excludes_roster_collisions_and_dedups_by_name() {
+        let g = KnowledgeGraph {
+            nodes: vec![
+                node("function:a.py:caller", "function", "a.py", ""),
+                fn_node("function:b.py:encrypt", "encrypt", "b.py", [1, 5]),
+                fn_node("function:c.py:encrypt", "encrypt", "c.py", [2, 6]), // same name, other file
+                fn_node("function:b.py:helper", "helper", "b.py", [9, 12]),
+            ],
+            edges: vec![
+                edge("function:a.py:caller", "function:b.py:encrypt", "calls"),
+                edge("function:a.py:caller", "function:c.py:encrypt", "calls"),
+                edge("function:a.py:caller", "function:b.py:helper", "calls"),
+            ],
+        };
+        // Local function also named "helper" (roster) → cross-file helper excluded;
+        // "encrypt" deduped to the first target (b.py).
+        let targets = cross_file_targets(Some(&g), "a.py", &["helper".to_string()]);
+        let names: Vec<&str> = targets.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["encrypt"]);
+        assert_eq!(targets[0].file_path, "b.py");
+    }
+
+    #[test]
+    fn cross_file_targets_empty_without_graph() {
+        assert!(cross_file_targets(None, "a.py", &[]).is_empty());
+    }
+
+    #[test]
+    fn slice_cross_file_sources_labels_with_path_and_numbers_absolute() {
+        let targets = vec![CrossFileTarget {
+            name: "encrypt".into(),
+            file_path: "b.py".into(),
+            line_range: [2, 3],
+        }];
+        let mut sources: BTreeMap<String, String> = BTreeMap::new();
+        sources.insert("b.py".into(), "x=0\ndef encrypt():\n    return 1\n".into());
+        let got = slice_cross_file_sources(&targets, &sources, &["encrypt".into()], 10_000);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, "encrypt @ b.py"); // label tells the model it's cross-file
+        assert!(got[0].1.contains("   2 | def encrypt():"));
+        assert!(got[0].1.contains("   3 |     return 1"));
+    }
+
+    #[test]
+    fn slice_cross_file_sources_guards_hallucination_dedup_and_budget() {
+        let targets = vec![
+            CrossFileTarget { name: "encrypt".into(), file_path: "b.py".into(), line_range: [1, 2] },
+            CrossFileTarget { name: "missing".into(), file_path: "z.py".into(), line_range: [1, 2] },
+        ];
+        let mut sources: BTreeMap<String, String> = BTreeMap::new();
+        sources.insert("b.py".into(), "def encrypt():\n    return 1\n".into());
+        // "ghost" not a target (hallucination) → skip; "missing" has no read source → skip;
+        // "encrypt" requested twice → dedup.
+        let need = vec!["ghost".into(), "missing".into(), "encrypt".into(), "encrypt".into()];
+        let got = slice_cross_file_sources(&targets, &sources, &need, 10_000);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, "encrypt @ b.py");
+
+        // Budget too small for even one numbered function → nothing fits.
+        let tight = slice_cross_file_sources(&targets, &sources, &["encrypt".into()], 3);
+        assert!(tight.is_empty());
     }
 }

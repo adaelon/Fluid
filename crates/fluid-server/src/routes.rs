@@ -7,6 +7,7 @@
 //!
 //! All handlers share an `Arc<AppState>` as axum state.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
@@ -25,8 +26,9 @@ use serde::{Deserialize, Serialize};
 use crate::cache_store::{Capsule, CacheStore, CapsuleEntry, LineAnnotation};
 use crate::context_assembler::{
     assemble_gen_context, build_explain_line_prompt, build_gen_prompt, build_query_planning_prompt,
-    build_query_prompt, query_degraded_names, slice_requested_sources, slice_span, FunctionSpan,
-    GenContext, QueryFocus, SharedContext, QUERY_FETCH_BUDGET_CHARS,
+    build_query_prompt, cross_file_targets, query_degraded_names, slice_cross_file_sources,
+    slice_requested_sources, slice_span, CrossFileTarget, FunctionSpan, GenContext, QueryFocus,
+    SharedContext, QUERY_FETCH_BUDGET_CHARS,
 };
 use crate::graph_loader::{GraphLoader, KnowledgeGraph};
 use crate::llm_proxy::{parse_fetch_plan, parse_generation, parse_line_annotation, LlmProxy, SseDecoder};
@@ -577,15 +579,27 @@ enum QueryPlan {
         system: String,
         user: String,
     },
-    Degraded {
-        planning_system: String,
-        planning_user: String,
-        file_source: String,
-        ctx: GenContext,
-        capsules: Vec<(String, String)>,
-        focus: Option<(String, u32, String)>,
-        fetchable: Vec<String>,
-    },
+    /// Boxed so the (rare) two-phase variant doesn't bloat every `QueryPlan` value
+    /// (`clippy::large_enum_variant`) — the common path is `Direct`.
+    Degraded(Box<DegradedPlan>),
+}
+
+/// Everything `run_query` needs to run the two-phase fetch after the lock drops —
+/// all owned so it survives the lock drop and the planning await.
+struct DegradedPlan {
+    planning_system: String,
+    planning_user: String,
+    file_source: String,
+    ctx: GenContext,
+    capsules: Vec<(String, String)>,
+    focus: Option<(String, u32, String)>,
+    /// Same-file name-only functions the model may fetch (S10a-追源).
+    fetchable: Vec<String>,
+    /// Cross-file callees the model may fetch (S10c, ADR-0007 修订).
+    cross_targets: Vec<CrossFileTarget>,
+    /// `file_path` → full source for every distinct cross-file target file,
+    /// read under the lock so `run_query` can slice after the lock drops.
+    cross_sources: BTreeMap<String, String>,
 }
 
 /// Assemble the query plan while holding the project lock, then hand it back so the
@@ -628,13 +642,43 @@ fn prepare_query(state: &AppState, req: &QueryRequest) -> QueryPlan {
         name: name.as_str(),
     });
 
-    // Functions degraded to name-only that we can actually slice (have a span) form
-    // the fetchable set. Empty → nothing to fetch → single streaming call.
+    // Same-file functions degraded to name-only that we can actually slice (have a
+    // span) form the same-file fetchable set (S10a-追源).
     let degraded = query_degraded_names(&req.question, &capsules, focus_ref.as_ref(), &ctx);
-    let fetchable: Vec<String> = degraded
+    let same_file_fetchable: Vec<String> = degraded
         .into_iter()
         .filter(|name| req.roster_spans.iter().any(|s| &s.name == name))
         .collect();
+
+    // Cross-file callees the graph can locate (S10c, ADR-0007 修订). Read each
+    // distinct target file's source now, under the lock, so run_query can slice
+    // after the lock drops (mirroring `file_source` — no lock across await). A
+    // target whose file can't be read is dropped (never offer a name we can't
+    // honor). Pure read: no cache write, no activation — 目标文件事后仍真空.
+    let cross_all = cross_file_targets(proj.graph.graph(), &req.file_path, &req.roster);
+    let mut cross_sources: BTreeMap<String, String> = BTreeMap::new();
+    let mut cross_targets: Vec<CrossFileTarget> = Vec::new();
+    for t in cross_all {
+        let have = cross_sources.contains_key(&t.file_path)
+            || match proj.reader.read_file(&t.file_path) {
+                Ok(s) => {
+                    cross_sources.insert(t.file_path.clone(), s);
+                    true
+                }
+                Err(_) => false,
+            };
+        if have {
+            cross_targets.push(t);
+        }
+    }
+
+    // fetchable for the planning prompt = same-file degraded ∪ cross-file callees.
+    // The two name pools are disjoint (cross excludes roster names), so the model's
+    // `{"need":[...]}` resolves each name to exactly one pool in run_query.
+    // Non-empty (either pool) → two-phase fetch; empty → single streaming call
+    // (ADR-0017 修订: 门控由「仅降级时」扩为「fetchable 非空即触发」).
+    let mut fetchable = same_file_fetchable.clone();
+    fetchable.extend(cross_targets.iter().map(|t| t.name.clone()));
 
     if fetchable.is_empty() {
         let (system, user) = build_query_prompt(&req.question, &capsules, focus_ref, &ctx, &[]);
@@ -643,15 +687,17 @@ fn prepare_query(state: &AppState, req: &QueryRequest) -> QueryPlan {
 
     let (planning_system, planning_user) =
         build_query_planning_prompt(&req.question, &capsules, focus_ref, &ctx, &fetchable);
-    QueryPlan::Degraded {
+    QueryPlan::Degraded(Box::new(DegradedPlan {
         planning_system,
         planning_user,
         file_source: source,
         ctx,
         capsules,
         focus,
-        fetchable,
-    }
+        fetchable: same_file_fetchable,
+        cross_targets,
+        cross_sources,
+    }))
 }
 
 /// Run one query request, streaming `delta` frames to the socket then `done`. On a
@@ -671,23 +717,27 @@ async fn run_query(
                 .map_err(|_| ());
         }
         QueryPlan::Direct { system, user } => (system, user),
-        QueryPlan::Degraded {
-            planning_system,
-            planning_user,
-            file_source,
-            ctx,
-            capsules,
-            focus,
-            fetchable,
-        } => {
+        QueryPlan::Degraded(plan) => {
+            let DegradedPlan {
+                planning_system,
+                planning_user,
+                file_source,
+                ctx,
+                capsules,
+                focus,
+                fetchable,
+                cross_targets,
+                cross_sources,
+            } = *plan;
             // Phase 1: planning (non-streaming). A failed call or unparseable plan
             // degrades to answering with no extra source — the fetch must never fail
             // the query (ADR-0017). One round only: no recursion.
             let llm = state.llm.as_ref().expect("Degraded implies llm is Some");
             eprintln!(
-                "[query] {} — degraded, planning fetch ({} fetchable)",
+                "[query] {} — planning fetch ({} same-file, {} cross-file)",
                 req.file_path,
-                fetchable.len()
+                fetchable.len(),
+                cross_targets.len()
             );
             let need = match llm.complete(&planning_system, &planning_user).await {
                 Ok(c) => parse_fetch_plan(&c),
@@ -696,13 +746,27 @@ async fn run_query(
                     Vec::new()
                 }
             };
-            let extra = slice_requested_sources(
+            // Same-file fetch first, then cross-file (S10c) with the *remaining* shared
+            // budget, so the appended sources of both kinds stay within one bound
+            // (ADR-0017 修订: 共享 QUERY_FETCH_BUDGET_CHARS).
+            let mut extra = slice_requested_sources(
                 &file_source,
                 &req.roster_spans,
                 &need,
                 &fetchable,
                 QUERY_FETCH_BUDGET_CHARS,
             );
+            let used: usize = extra
+                .iter()
+                .map(|(n, s)| n.chars().count() + s.chars().count() + 4)
+                .sum();
+            let cross = slice_cross_file_sources(
+                &cross_targets,
+                &cross_sources,
+                &need,
+                QUERY_FETCH_BUDGET_CHARS.saturating_sub(used),
+            );
+            extra.extend(cross);
             if !extra.is_empty() {
                 let got: Vec<&str> = extra.iter().map(|(n, _)| n.as_str()).collect();
                 eprintln!("[query] {} — fetched sources: {}", req.file_path, got.join(", "));
