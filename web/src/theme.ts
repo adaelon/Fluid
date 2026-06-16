@@ -11,7 +11,9 @@ import { HighlightStyle, syntaxHighlighting } from '@codemirror/language'
 import { tags as t } from '@lezer/highlight'
 import type { Extension } from '@codemirror/state'
 
-const BG = '#0d1117'
+// Mirrors styles.css :root (S11-c identity: deeper near-black surfaces). CM6
+// theming is JS, so these track the CSS tokens by hand.
+const BG = '#0b0e14'
 const FG = '#c9d1d9'
 const MUTED = '#8b949e'
 const MONO = "'JetBrains Mono', 'SFMono-Regular', ui-monospace, Consolas, monospace"
@@ -26,7 +28,7 @@ const editorChrome = EditorView.theme(
     '.cm-activeLine': { backgroundColor: 'rgba(177, 186, 196, 0.05)' },
     '.cm-activeLineGutter': { backgroundColor: 'transparent', color: MUTED },
     '&.cm-focused .cm-selectionBackground, .cm-selectionBackground, .cm-content ::selection': {
-      backgroundColor: 'rgba(56, 139, 253, 0.25)',
+      backgroundColor: 'rgba(88, 166, 255, 0.25)', // accent-tinted, tracks --accent
     },
   },
   { dark: true },
