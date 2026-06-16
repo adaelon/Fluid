@@ -5,12 +5,12 @@
 // token by token over WS /api/query (S10a). Context is the whole current file
 // (CONTEXT 追问器); switching files vacuums the in-flight Q&A.
 import { ref, watch, nextTick, onBeforeUnmount } from 'vue'
-import DOMPurify from 'dompurify'
-import renderMathInElement from 'katex/contrib/auto-render'
-import 'katex/dist/katex.min.css'
 import { streamQuery, type QueryStream } from './api'
-import { renderMarkdown } from './render/markdown'
 import { EMPTY_QUERY_CONTEXT, type QueryContext } from './queryContext'
+// S11-lazy: markdown-it / DOMPurify / KaTeX (+ its CSS) are heavy and only needed
+// once an answer finishes streaming, so they are dynamically import()ed inside
+// renderAnswer() rather than at module top — Rollup splits them into async chunks
+// kept out of the first-paint bundle. Behavior is unchanged from ADR-0008.
 
 const props = withDefaults(
   defineProps<{ path: string | null; ctx?: QueryContext }>(),
@@ -47,6 +47,15 @@ watch(
 // On `done`, render the full Markdown answer (ADR-0008): markdown-it escapes raw
 // HTML, DOMPurify is defense-in-depth, then KaTeX transforms $…$/$$…$$ in the DOM.
 async function renderAnswer() {
+  // Pull the render libs on demand (S11-lazy). The CSS import is a side effect
+  // (injects KaTeX styles) — its module value is unused.
+  const [{ renderMarkdown }, { default: DOMPurify }, { default: renderMathInElement }] =
+    await Promise.all([
+      import('./render/markdown'),
+      import('dompurify'),
+      import('katex/contrib/auto-render'),
+      import('katex/dist/katex.min.css'),
+    ])
   answerHtml.value = DOMPurify.sanitize(renderMarkdown(answer.value))
   await nextTick()
   if (!renderedEl.value) return
