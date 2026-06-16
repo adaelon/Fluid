@@ -215,8 +215,11 @@ body {
   justify-content: space-between;
   padding: 0 12px;
   font-size: 12px;
-  background: var(--accent);
-  color: #0d1117;
+  /* S11-b 降噪: 满饱和 accent 蓝是全页最吵元素 → 与 panel 同底、muted 字,
+     accent 只点在 active/done 上,重心回到代码区。 */
+  background: var(--panel);
+  color: var(--muted);
+  border-top: 1px solid var(--border);
 }
 .status-left,
 .status-right {
@@ -228,6 +231,7 @@ body {
   opacity: 0.8;
 }
 .status-right.done {
+  color: var(--accent);
   font-weight: 600;
 }
 /* Right cluster: the 「追问」 toggle + the generation progress text. */
@@ -244,20 +248,22 @@ body {
   flex: none;
   background: transparent;
   border: none;
-  color: #0d1117;
+  color: var(--muted);
   font: inherit;
   cursor: pointer;
   padding: 0 6px;
   height: 18px;
   border-radius: 3px;
-  opacity: 0.85;
+  opacity: 0.9;
 }
 .status-query-toggle:hover:not(:disabled) {
   opacity: 1;
-  background: rgba(13, 17, 23, 0.12);
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.08);
 }
 .status-query-toggle.active {
-  background: rgba(13, 17, 23, 0.2);
+  background: rgba(88, 166, 255, 0.15);
+  color: var(--accent);
   opacity: 1;
   font-weight: 600;
 }
@@ -518,7 +524,12 @@ body {
 .fluid-capsule {
   margin: 2px 0 0;
   padding: 3px 10px 3px 12px;
-  background: rgba(22, 27, 34, 0.6);
+  /* S11-b 玻璃管线(统一): 半透明 + backdrop blur = 真·磨砂玻璃浮于代码上;
+     顶部高光用 gradient 顶端浅停做(非 box-shadow → 守 §7.4 无阴影/无圆角)。
+     胶囊 / 行注释 / 占位三者共用同一材质。 */
+  background: linear-gradient(rgba(255, 255, 255, 0.05), rgba(22, 27, 34, 0.55));
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
   border-left: 2px solid var(--c, #58a6ff);
   cursor: pointer;
   white-space: normal;
@@ -554,8 +565,13 @@ body {
   vertical-align: top;
   max-width: 460px;
   margin-left: 28px;
-  padding-left: 10px;
+  padding: 0 10px;
   border-left: 2px solid var(--c, #58a6ff);
+  /* same glass material as the capsule (§7.4 continuity) — a frosted chip
+     trailing the code line. */
+  background: linear-gradient(rgba(255, 255, 255, 0.05), rgba(22, 27, 34, 0.55));
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
   white-space: normal;
   line-height: 1.45;
   color: var(--text);
@@ -588,7 +604,10 @@ body {
   gap: 8px;
   margin: 2px 0 0;
   padding: 3px 10px 3px 12px;
-  background: rgba(22, 27, 34, 0.6);
+  /* same glass material as the capsule it stands in for (§7.4 pipeline unity). */
+  background: linear-gradient(rgba(255, 255, 255, 0.05), rgba(22, 27, 34, 0.55));
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
   border-left: 2px solid #484f58;
   animation: none; /* transient state, not a settled card */
 }
