@@ -16,13 +16,16 @@ const props = withDefaults(
   defineProps<{ path: string | null; ctx?: QueryContext }>(),
   { ctx: () => EMPTY_QUERY_CONTEXT },
 )
+// Visibility is owned by the parent (App) via the status-bar toggle — default
+// hidden so the bottom space goes back to the code area; the panel only asks to
+// close itself, it never decides whether it is mounted.
+const emit = defineEmits<{ close: [] }>()
 
 const question = ref('')
 const answer = ref('') // plain token-by-token text shown while streaming
 const answerHtml = ref('') // sanitized Markdown HTML, set once on `done`
 const streaming = ref(false)
 const errorMsg = ref('')
-const collapsed = ref(false)
 const renderedEl = ref<HTMLElement | null>(null)
 let stream: QueryStream | null = null
 
@@ -107,15 +110,12 @@ onBeforeUnmount(teardown)
 </script>
 
 <template>
-  <section class="query-panel" :class="{ disabled: !path, collapsed }">
+  <section class="query-panel" :class="{ disabled: !path }">
     <header class="query-head">
       <span class="query-title">追问器{{ path ? '' : ' · 未激活' }}</span>
-      <button v-if="path" class="query-collapse" type="button" @click="collapsed = !collapsed">
-        {{ collapsed ? '▴' : '▾' }}
-      </button>
+      <button class="query-collapse" type="button" title="收起追问器" @click="emit('close')">✕</button>
     </header>
-    <template v-if="!collapsed">
-      <div v-if="!path" class="query-vacuum">打开文件以启用追问</div>
+    <div v-if="!path" class="query-vacuum">打开文件以启用追问</div>
       <template v-else>
         <div class="query-answer">
           <span v-if="errorMsg" class="query-error">{{ errorMsg }}</span>
@@ -136,6 +136,5 @@ onBeforeUnmount(teardown)
           </button>
         </form>
       </template>
-    </template>
   </section>
 </template>

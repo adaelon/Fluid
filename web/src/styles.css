@@ -230,6 +230,41 @@ body {
 .status-right.done {
   font-weight: 600;
 }
+/* Right cluster: the 「追问」 toggle + the generation progress text. */
+.status-right-group {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+/* Query-panel toggle (S10b dock revision): the only affordance to open the
+   hidden follow-up terminal. Status-bar chrome, so radius is fine (§7.4 governs
+   only the code-area glass notes). */
+.status-query-toggle {
+  flex: none;
+  background: transparent;
+  border: none;
+  color: #0d1117;
+  font: inherit;
+  cursor: pointer;
+  padding: 0 6px;
+  height: 18px;
+  border-radius: 3px;
+  opacity: 0.85;
+}
+.status-query-toggle:hover:not(:disabled) {
+  opacity: 1;
+  background: rgba(13, 17, 23, 0.12);
+}
+.status-query-toggle.active {
+  background: rgba(13, 17, 23, 0.2);
+  opacity: 1;
+  font-weight: 600;
+}
+.status-query-toggle:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
 
 /* — Tab strip (U2): one tab per open file; active is highlighted. — */
 .tabs {

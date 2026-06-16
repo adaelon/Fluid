@@ -9,7 +9,13 @@ const props = defineProps<{
   path: string | null
   lang: string | null
   progress: { phase: 'idle' | 'running' | 'done'; completed: number; total: number }
+  /** Whether the follow-up query panel is currently open (toggle reflects it). */
+  queryOpen: boolean
 }>()
+
+// The query terminal is hidden by default; this bar carries the only affordance
+// to open it, handing the bottom space back to the code area until asked for.
+const emit = defineEmits<{ toggleQuery: [] }>()
 
 const progressText = computed(() => {
   const p = props.progress
@@ -25,6 +31,18 @@ const progressText = computed(() => {
       <template v-if="path">{{ path }}<span v-if="lang" class="status-lang"> · {{ lang }}</span></template>
       <template v-else>就绪</template>
     </span>
-    <span class="status-right" :class="{ done: progress.phase === 'done' }">{{ progressText }}</span>
+    <span class="status-right-group">
+      <button
+        class="status-query-toggle"
+        :class="{ active: queryOpen }"
+        type="button"
+        :disabled="!path"
+        :title="path ? '追问当前文件' : '打开文件以启用追问'"
+        @click="emit('toggleQuery')"
+      >
+        💬 追问
+      </button>
+      <span class="status-right" :class="{ done: progress.phase === 'done' }">{{ progressText }}</span>
+    </span>
   </footer>
 </template>

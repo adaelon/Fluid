@@ -35,6 +35,11 @@ const genProgress = ref<{ phase: 'idle' | 'running' | 'done'; completed: number;
 // open (Editor is v-if'd away then and can't emit).
 const queryCtx = ref<QueryContext>(EMPTY_QUERY_CONTEXT)
 
+// The follow-up query panel is hidden by default — the bottom space goes back to
+// the code area until the user opens it from the status-bar 「💬 追问」 toggle
+// (S10b dock revision). Sticky across file switches; auto-hidden when no file.
+const queryPanelOpen = ref(false)
+
 // Resizable explorer sidebar (U1). Width persisted to localStorage.
 const SIDEBAR_KEY = 'fluid:sidebarPx'
 const SIDEBAR_MIN = 160
@@ -198,7 +203,18 @@ function closeTab(path: string) {
         <div v-else class="empty">从左侧选择一个文件以只读查看源码</div>
       </main>
     </div>
-    <QueryPanel :path="current?.path ?? null" :ctx="current ? queryCtx : EMPTY_QUERY_CONTEXT" />
-    <StatusBar :path="current?.path ?? null" :lang="current?.lang ?? null" :progress="genProgress" />
+    <QueryPanel
+      v-if="queryPanelOpen && current"
+      :path="current.path"
+      :ctx="queryCtx"
+      @close="queryPanelOpen = false"
+    />
+    <StatusBar
+      :path="current?.path ?? null"
+      :lang="current?.lang ?? null"
+      :progress="genProgress"
+      :query-open="queryPanelOpen"
+      @toggle-query="queryPanelOpen = !queryPanelOpen"
+    />
   </div>
 </template>
