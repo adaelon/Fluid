@@ -1,6 +1,6 @@
 # Fluid
 
-面向**零代码基础用户**的**只读**代码理解环境。在不修改源码任何字节的前提下,用 LLM 为你打开的每个文件生成人类可读的语义投影——函数摘要、逐行解释、可追问——帮你看懂代码每一行在做什么。
+Fluid提供**只读**代码理解环境。在不修改源码任何字节的前提下,用 LLM 为你打开的每个文件生成人类可读的语义投影——函数摘要、逐行解释、可追问——帮你看懂代码每一行在做什么。
 
 > 状态:MVP 功能闭环,全部规划切片已完成(见 `docs/切片计划.md`)。
 
@@ -20,7 +20,7 @@
 - **追问器**:针对当前文件的流式问答(Markdown + LaTeX 渲染);上下文超窗自动分层降级,可按需追源,支持**跨文件**取被调函数/类实现(经知识图谱定位)。
 - **手动单行补注**:非重点行 hover → 「解释这一行」按需生成。
 - **类 VSCode 壳**:活动栏 / 资源管理器 / 多 tab + 面包屑 / 状态栏 / Open Folder 换根 / 命令面板 / LLM 设置面板。
-- **可选知识图谱**:存在 `.understand-anything/knowledge-graph.json` 时作为上下文增强(缺失不影响运行)。
+- **知识图谱增强(推荐)**:存在 `.understand-anything/knowledge-graph.json` 时作为上下文增强——文件摘要、调用关系、跨文件取源;缺失不影响运行,但**最佳体验是先跑 understand-anything**(见「快速开始」)。
 
 ## 架构
 
@@ -42,24 +42,40 @@
 
 设计取舍见 [`docs/adr/`](docs/adr/);整体方案见 `docs/技术方案.md`。
 
-## 快速开始
+## 安装(预编译二进制,推荐)
+
+无需 Rust / Node,一行装好(前端已打包进二进制,单进程即整个 app):
+
+```bash
+curl -fsSL https://github.com/adaelon/Fluid/releases/latest/download/install.sh | sh
+```
+
+Windows:从 [Releases](https://github.com/adaelon/Fluid/releases) 下载 `fluid-windows-x86_64.exe`。安装后:
+
+```bash
+fluid /path/to/your/project        # 后端+前端同端口启动,默认自动打开 http://127.0.0.1:7878
+#   可选:--port 7878
+```
+
+> **最佳体验:先对目标项目跑一遍 [understand-anything](https://github.com/Understand-Anything)**,在项目根生成 `.understand-anything/knowledge-graph.json`。Fluid 没有它也能跑(纯只读浏览 + 单文件生成/追问),但有了图谱才解锁:文件级摘要、调用/导入关系上下文,以及追问时**跨文件取被调函数/类的实现**(S10c 依赖图谱定位)。
+>
+> 别在被服务项目自带 `.env` 的目录里启动 fluid(会读错 LLM 配置);从其他目录启动即可。
+
+## 从源码运行 / 开发
 
 需要 Rust(stable)与 Node(建议 ≥ 20;校验脚本用 Node 24 原生跑 TS)。
 
 ```bash
-# 1) 起后端(默认端口 7878),指向要阅读的项目目录
-cargo run -p fluid-server -- /path/to/your/project
-#   可选: --port 7878
+# 单二进制(同发行版形态:前端打包进后端,一条命令起整个 app)
+npm --prefix web ci && npm --prefix web run build   # 构建前端 → web/dist(被后端嵌入)
+cargo run -p fluid-server -- /path/to/your/project  # 浏览器自动开 http://127.0.0.1:7878
 
-# 2) 起前端(Vite 5173,/api 已代理到 127.0.0.1:7878)
-cd web
-npm install
-npm run dev
+# 开发热重载(前端改动即时生效,两进程)
+cargo run -p fluid-server -- /path/to/your/project  # 后端 7878
+cd web && npm install && npm run dev                # Vite 5173,/api 代理到 7878 → 开 127.0.0.1:5173
 ```
 
-浏览器打开 **http://127.0.0.1:5173**(用 `127.0.0.1`,不要用 `localhost`——后端只绑 IPv4)。
-
-> 注意:从 **Fluid 仓库根**或一个干净目录启动,别在被服务项目自带 `.env` 的目录里启动(会读错配置)。
+> 用 `127.0.0.1`,不要用 `localhost`——后端只绑 IPv4。
 
 ## 配置 LLM 后端
 

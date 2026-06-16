@@ -10,6 +10,7 @@ mod llm_proxy;
 mod project_reader;
 mod routes;
 mod settings;
+mod static_assets;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -99,7 +100,12 @@ async fn main() -> anyhow::Result<()> {
 
     let addr = SocketAddr::from(([127, 0, 0, 1], args.port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    println!("Listening on http://{addr}");
+    let url = format!("http://{addr}");
+    println!("\n  Fluid 已启动 → {url}\n  (后端 + 前端同端口;Ctrl+C 退出)\n");
+
+    // Best-effort: open the default browser. Ignored on headless/unsupported hosts —
+    // the URL is printed above regardless.
+    let _ = open::that(&url);
 
     axum::serve(listener, app).await?;
     Ok(())

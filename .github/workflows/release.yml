@@ -1,0 +1,82 @@
+# Release pipeline (packaging): on a `v*` tag, build the frontend, embed it into a
+# release `fluid` binary per platform, and publish them + install.sh to a GitHub
+# Release. End users then install with one line via scripts/install.sh.
+#
+# Cut a release:  git tag v0.1.0 && git push origin v0.1.0
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write # create the release + upload assets
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset: fluid-linux-x86_64
+            bin: fluid
+          - os: macos-14
+            target: aarch64-apple-darwin
+            asset: fluid-macos-arm64
+            bin: fluid
+          - os: macos-13
+            target: x86_64-apple-darwin
+            asset: fluid-macos-x86_64
+            bin: fluid
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: fluid-windows-x86_64.exe
+            bin: fluid.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # 1) Build the frontend so build.rs/rust-embed can bake web/dist into the binary.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Build frontend
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      # 2) Build the release binary for this platform (embeds web/dist).
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build backend
+        run: cargo build --release -p fluid-server --target ${{ matrix.target }}
+
+      # 3) Stage the binary under its public asset name.
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${{ matrix.asset }}"
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/${{ matrix.asset }}
+
+  # Publish the installer alongside the binaries so `.../latest/download/install.sh`
+  # resolves (the URL in the README).
+  publish-installer:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Upload install.sh
+        uses: softprops/action-gh-release@v2
+        with:
+          files: scripts/install.sh

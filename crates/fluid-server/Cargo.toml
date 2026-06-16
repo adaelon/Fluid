@@ -27,3 +27,10 @@ dotenvy = "0.15"
 # Native OS folder picker for Open Folder (U3 revision). The local backend pops
 # the dialog (browser can't hand a server-side absolute path to the backend).
 rfd = "0.15"
+# Embed the built frontend (web/dist) into the binary so one `fluid` binary is the
+# whole app — no Vite/Node at runtime (packaging). Debug reads from disk; release bakes in.
+rust-embed = "8"
+# Content-Type for embedded assets (js/css/wasm/html) served via the SPA fallback.
+mime_guess = "2"
+# Best-effort: open the default browser at the served URL on startup.
+open = "5"

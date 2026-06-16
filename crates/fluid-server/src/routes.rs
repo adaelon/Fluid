@@ -113,6 +113,8 @@ pub fn router(state: Shared) -> Router {
         .route("/api/explain-line", post(explain_line))
         .route("/api/generate", get(generate_ws))
         .route("/api/query", get(query_ws))
+        // Anything else → the embedded frontend SPA (packaging: one binary = whole app).
+        .fallback(crate::static_assets::static_handler)
         .with_state(state)
 }
 
