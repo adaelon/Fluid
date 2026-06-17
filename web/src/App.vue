@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { computed, onMounted, onBeforeUnmount, ref } from 'vue'
+import { computed, onMounted, onBeforeUnmount, ref, watch } from 'vue'
 import { fetchFile, fetchTree, openFolder, pickFolder, getLlmSettings, type FileNode } from './api'
 import FileTree from './FileTree.vue'
 import Editor from './Editor.vue'
+import MarkdownView from './MarkdownView.vue'
 import QueryPanel from './QueryPanel.vue'
 import ActivityBar from './shell/ActivityBar.vue'
 import StatusBar from './shell/StatusBar.vue'
@@ -36,6 +37,17 @@ const genProgress = ref<{ phase: 'idle' | 'running' | 'done'; completed: number;
 // fresh snapshot on switch/capsule arrival; we still null it out when no file is
 // open (Editor is v-if'd away then and can't emit).
 const queryCtx = ref<QueryContext>(EMPTY_QUERY_CONTEXT)
+
+// Markdown files render as a document (MarkdownView), not in the CM6 Editor, so
+// they never emit a query context. Vacuum the stale one when the active file is a
+// doc (or none), so opening the query panel can't carry the last code file's
+// roster. Code files are left alone — Editor emits its own fresh context on mount.
+watch(
+  () => current.value,
+  (c) => {
+    if (!c || c.lang === 'md') queryCtx.value = EMPTY_QUERY_CONTEXT
+  },
+)
 
 // The follow-up query panel is hidden by default — the bottom space goes back to
 // the code area until the user opens it from the status-bar 「💬 追问」 toggle
@@ -254,8 +266,13 @@ function closeTab(path: string) {
             <span v-if="i < crumbs.length - 1" class="crumb-sep">›</span>
           </span>
         </div>
+        <MarkdownView
+          v-if="current && current.lang === 'md'"
+          :source="current.source"
+          :path="current.path"
+        />
         <Editor
-          v-if="current"
+          v-else-if="current"
           :source="current.source"
           :lang="current.lang"
           :path="current.path"

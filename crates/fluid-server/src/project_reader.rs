@@ -35,7 +35,7 @@ pub struct FileNode {
     pub path: String,
     /// Bare file name.
     pub name: String,
-    /// Coarse language tag for the frontend: "py" | "rs" | "other".
+    /// Coarse language tag for the frontend: "py" | "rs" | "md" | "other".
     pub lang: &'static str,
 }
 
@@ -160,6 +160,10 @@ fn lang_of(path: &Path) -> &'static str {
     match path.extension().and_then(|e| e.to_str()) {
         Some("py") => "py",
         Some("rs") => "rs",
+        // Markdown gets its own tag so the frontend renders it as a formatted
+        // document (Document Render View) instead of plain source. Not a
+        // generation language — md never enters the capsule/ghost pipeline.
+        Some("md") | Some("markdown") => "md",
         _ => "other",
     }
 }
@@ -212,6 +216,16 @@ mod tests {
     fn missing_file_is_not_found() {
         let (_dir, reader) = temp_reader();
         assert!(matches!(reader.read_file("src/nope.py"), Err(ReadErr::NotFound)));
+    }
+
+    #[test]
+    fn tags_markdown_as_md() {
+        // .md / .markdown get the "md" tag (Document Render View); other
+        // extensions stay "other"; code langs unchanged.
+        assert_eq!(lang_of(Path::new("README.md")), "md");
+        assert_eq!(lang_of(Path::new("docs/guide.markdown")), "md");
+        assert_eq!(lang_of(Path::new("a.py")), "py");
+        assert_eq!(lang_of(Path::new("notes.txt")), "other");
     }
 
     #[test]
