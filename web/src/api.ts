@@ -5,7 +5,7 @@ import type { FunctionSpan } from './parser/types.ts'
 import type { LineAnnotation, QueryFrame } from './ghostTypes'
 import type { CapsuleSummary } from './queryContext'
 
-export type Lang = 'py' | 'rs' | 'other'
+export type Lang = 'py' | 'rs' | 'md' | 'other'
 
 export interface FileNode {
   path: string
@@ -117,6 +117,95 @@ export async function explainLine(req: {
   })
   if (!res.ok) throw new Error((await res.text()) || `/api/explain-line -> ${res.status}`)
   return (await res.json()) as LineAnnotation
+}
+
+/** Callbacks for a streaming document translation (文档翻译). A cache hit fires
+ *  `onCached` (whole doc) then `onDone`; a miss fires `onTotal` then `onChunk` per
+ *  chunk in order (code already restored; `ok=false` means that block kept its
+ *  English original) then `onDone`. `onError` is terminal (no project / unconfigured
+ *  LLM / all chunks failed). */
+export interface TranslateHandlers {
+  onCached: (text: string) => void
+  onTotal: (total: number) => void
+  onChunk: (index: number, text: string, ok: boolean) => void
+  onDone: () => void
+  onError: (message: string) => void
+}
+
+/** Handle to an in-flight translation; `cancel` tears the socket down silently. */
+export interface TranslateStream {
+  cancel: () => void
+}
+
+type TranslateFrame =
+  | { kind: 'cached'; text: string }
+  | { kind: 'total'; total: number }
+  | { kind: 'chunk'; index: number; text: string; ok: boolean }
+  | { kind: 'done' }
+  | { kind: 'error'; message: string }
+
+/** Open `WS /api/translate`, request a file's translation, and stream the result
+ *  back chunk by chunk for live progress + incremental rendering (文档翻译). One
+ *  socket per request; closed on the terminal frame or on `cancel` (file switch /
+ *  unmount). Reopening an unchanged file hits the .fluid/ cache (single `cached`). */
+export function streamTranslate(filePath: string, h: TranslateHandlers): TranslateStream {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws'
+  const sock = new WebSocket(`${proto}://${location.host}/api/translate`)
+  let settled = false
+  const close = () => {
+    try {
+      sock.close()
+    } catch {
+      /* already closing */
+    }
+  }
+  sock.onopen = () => sock.send(JSON.stringify({ filePath }))
+  sock.onmessage = (ev) => {
+    let f: TranslateFrame
+    try {
+      f = JSON.parse(ev.data as string) as TranslateFrame
+    } catch {
+      return
+    }
+    switch (f.kind) {
+      case 'cached':
+        h.onCached(f.text)
+        break
+      case 'total':
+        h.onTotal(f.total)
+        break
+      case 'chunk':
+        h.onChunk(f.index, f.text, f.ok)
+        break
+      case 'done':
+        settled = true
+        h.onDone()
+        close()
+        break
+      case 'error':
+        settled = true
+        h.onError(f.message)
+        close()
+        break
+    }
+  }
+  sock.onerror = () => {
+    if (settled) return
+    settled = true
+    h.onError('连接失败')
+    close()
+  }
+  sock.onclose = () => {
+    if (settled) return
+    settled = true
+    h.onError('连接已关闭')
+  }
+  return {
+    cancel: () => {
+      settled = true
+      close()
+    },
+  }
 }
 
 /** Callbacks for a streaming follow-up query (S10b). */

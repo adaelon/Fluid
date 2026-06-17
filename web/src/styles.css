@@ -567,6 +567,56 @@ body {
   overflow-y: auto;
   background: var(--bg);
 }
+
+/* 文档翻译: [原文 | 译中文] toggle, sticky at the top of the scroll so it stays
+   reachable while reading a long doc. Chrome layer — not §7.4-constrained. */
+.fluid-doc-head {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 40px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+}
+.fluid-doc-toggle {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  overflow: hidden;
+}
+.fluid-doc-tab {
+  padding: 3px 12px;
+  font-size: 12px;
+  color: var(--muted);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+}
+.fluid-doc-tab + .fluid-doc-tab {
+  border-left: 1px solid var(--border);
+}
+.fluid-doc-tab:hover:not(:disabled) {
+  background: var(--hover);
+}
+.fluid-doc-tab.active {
+  color: var(--text);
+  background: var(--active);
+}
+.fluid-doc-tab:disabled {
+  cursor: default;
+  opacity: 0.7;
+}
+.fluid-doc-progress {
+  font-size: 12px;
+  color: var(--accent);
+}
+.fluid-doc-err {
+  font-size: 12px;
+  color: var(--c-error);
+}
 .fluid-doc {
   max-width: 860px;
   margin: 0 auto;

@@ -54,6 +54,13 @@ pub struct CapsuleEntry {
     pub lines: Vec<LineAnnotation>,
 }
 
+/// A cached whole-document translation (文档翻译): the Simplified-Chinese Markdown
+/// produced from an English doc, code blocks preserved verbatim.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Translation {
+    pub text: String,
+}
+
 /// On-disk bypass cache rooted at `<project>/.fluid/capsules/`.
 pub struct CacheStore {
     dir: PathBuf,
@@ -154,6 +161,43 @@ impl CacheStore {
 
     fn line_path_for(&self, fn_source: &str, line_number: u32) -> PathBuf {
         self.dir.join(format!("{}.json", self.line_key(fn_source, line_number)))
+    }
+
+    /// Cache key for a whole-document translation (文档翻译). Folds the full file
+    /// source + a "translate" discriminant into the model/prompt versions, so a
+    /// translation entry never aliases a capsule/line entry, and editing the doc or
+    /// switching the model invalidates it (same ADR-0003 semantics as capsules).
+    pub fn translate_key(&self, source: &str) -> String {
+        let mut hash = FNV_OFFSET;
+        for part in [
+            self.model_version.as_str(),
+            self.prompt_version.as_str(),
+            "translate",
+            source,
+        ] {
+            // NUL separator so concatenation can't alias across fields.
+            hash = fnv1a_step(hash, part.as_bytes());
+            hash = fnv1a_step(hash, &[0]);
+        }
+        format!("{hash:016x}")
+    }
+
+    /// Look up a cached translation. Same miss/corrupt semantics as `get`: a missing
+    /// or unreadable entry reads as absent → re-translate (reopen unchanged doc =
+    /// zero token).
+    pub fn get_translation(&self, source: &str) -> Option<Translation> {
+        let path = self.dir.join(format!("{}.json", self.translate_key(source)));
+        let bytes = std::fs::read(&path).ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    /// Persist a translation under `.fluid/capsules/<translate_key>.json`. Creates the
+    /// cache dir on demand. Never writes into the source tree (zero byte contamination).
+    pub fn put_translation(&self, source: &str, t: &Translation) -> std::io::Result<()> {
+        std::fs::create_dir_all(&self.dir)?;
+        let json = serde_json::to_vec_pretty(t)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(self.dir.join(format!("{}.json", self.translate_key(source))), json)
     }
 }
 
@@ -321,6 +365,29 @@ mod tests {
         // Bumped model version → miss (same invalidation as capsules, ADR-0003).
         let bumped = CacheStore::new(dir.path(), "model-v2", "prompt-v1");
         assert!(bumped.get_line(src, 2).is_none());
+    }
+
+    #[test]
+    fn translation_round_trips_and_misses_on_change() {
+        let dir = tempdir_guard::TempDir::new();
+        let cache = store(dir.path());
+        let src = "# Title\n\nHello world.\n";
+        let t = Translation { text: "# 标题\n\n你好世界。\n".to_string() };
+
+        assert!(cache.get_translation(src).is_none(), "cold translation cache must miss");
+        cache.put_translation(src, &t).unwrap();
+        assert_eq!(cache.get_translation(src), Some(t));
+
+        // Edited doc → different key → miss.
+        let edited = "# Title\n\nHello, world!\n";
+        assert_ne!(cache.translate_key(src), cache.translate_key(edited));
+        assert!(cache.get_translation(edited).is_none());
+
+        // Bumped model version → miss (ADR-0003), and a translate key never aliases
+        // the capsule key for the same bytes.
+        let bumped = CacheStore::new(dir.path(), "model-v2", "prompt-v1");
+        assert!(bumped.get_translation(src).is_none());
+        assert_ne!(cache.translate_key(src), cache.key(src));
     }
 
     /// Minimal self-cleaning temp dir (same pattern as project_reader's S1 tests;

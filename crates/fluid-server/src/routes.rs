@@ -10,6 +10,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use axum::{
     extract::{
@@ -23,7 +24,8 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::cache_store::{Capsule, CacheStore, CapsuleEntry, LineAnnotation};
+use crate::cache_store::{Capsule, CacheStore, CapsuleEntry, LineAnnotation, Translation};
+use crate::translate::{build_translate_prompt, protect_code, restore_code, split_chunks};
 use crate::context_assembler::{
     assemble_gen_context, build_explain_line_prompt, build_gen_prompt, build_query_planning_prompt,
     build_query_prompt, cross_file_targets, query_degraded_names, slice_cross_file_sources,
@@ -34,7 +36,7 @@ use crate::graph_loader::{GraphLoader, KnowledgeGraph};
 use crate::llm_proxy::{parse_fetch_plan, parse_generation, parse_line_annotation, LlmProxy, SseDecoder};
 use crate::project_reader::{FileNode, ProjectReader, ReadErr};
 use crate::settings::{mask_key, rewrite_env, LlmConfig};
-use futures_util::StreamExt;
+use futures_util::stream::{self, StreamExt};
 
 /// The root-bound trio: file reader + optional knowledge graph + bypass cache.
 /// All three are rebuilt together when the project root changes (U3 Open Folder),
@@ -138,6 +140,7 @@ pub fn router(state: Shared) -> Router {
         .route("/api/settings/llm", get(get_llm_settings).post(put_llm_settings))
         .route("/api/settings/llm/test", post(test_llm_settings))
         .route("/api/explain-line", post(explain_line))
+        .route("/api/translate", get(translate_ws))
         .route("/api/generate", get(generate_ws))
         .route("/api/query", get(query_ws))
         // Anything else → the embedded frontend SPA (packaging: one binary = whole app).
@@ -764,6 +767,242 @@ async fn explain_line(
     match run_explain_line(&state, req).await {
         Ok(line) => (StatusCode::OK, Json(line)).into_response(),
         Err((code, msg)) => (code, msg).into_response(),
+    }
+}
+
+// — POST /api/translate — whole-document English→Chinese translation (文档翻译) —
+//
+// Reads a Markdown file, protects its fenced code blocks deterministically, sends
+// only the masked prose to the model in one call, restores the code verbatim, and
+// caches the result under `.fluid/` (zero byte contamination: the source file is
+// never written). A cache hit returns before the LLM is consulted (zero token, like
+// run_explain_line). Mirrors that handler's lock discipline: the project lock is
+// held only for the synchronous read/cache/mask phase, then dropped before the await.
+
+#[derive(Deserialize)]
+struct TranslateRequest {
+    #[serde(rename = "filePath")]
+    file_path: String,
+}
+
+/// Whole-document translation is split into chunks of at most this many characters.
+/// A single giant request overruns the model's output limit / times out (gateway
+/// 500). Per-call latency has a large fixed floor (~30-40s even for tiny chunks,
+/// measured), so fewer/larger chunks beat many tiny ones — 3500 keeps each call well
+/// under the 500 ceiling while cutting the call count. No tokenizer dependency —
+/// char count is a stable proxy (cf. S10a-降级).
+const TRANSLATE_CHUNK_CHARS: usize = 3500;
+/// How many chunks translate in parallel (cf. S8's bounded generation pool). Measured:
+/// the gateway DOES parallelize (two concurrent chunks finish together, not serially),
+/// so concurrency cuts wall-clock for long docs. 4 with the 240s per-chunk timeout
+/// (slowest measured chunk ~122s) leaves headroom. Lower it if a run shows timeouts.
+const TRANSLATE_CONCURRENCY: usize = 4;
+/// Extra attempts per chunk on a transient failure before keeping the original.
+const TRANSLATE_RETRIES: u32 = 2;
+/// Per-chunk wall-clock cap. reqwest has no global timeout (PENDING) and a global one
+/// would cut the long `/api/query` stream, so the bound is applied here only, via
+/// `tokio::time::timeout`, so one stuck chunk can't hang the whole document. Generous
+/// so a slow (but working) model isn't cut off.
+const TRANSLATE_CHUNK_TIMEOUT_SECS: u64 = 240;
+
+/// Translate one masked chunk, retrying transient failures (with a per-attempt
+/// timeout). `None` when every attempt is exhausted — the caller then keeps the
+/// original chunk (that block stays English, the rest is still translated; the
+/// chosen failure policy). Logs each chunk's wall-clock time so a real run shows
+/// whether the gateway is slow per-call or just queueing (B2 — measure, don't guess).
+async fn translate_one_chunk(llm: &LlmProxy, idx: usize, chunk: &str) -> Option<String> {
+    let (system, user) = build_translate_prompt(chunk);
+    for attempt in 0..=TRANSLATE_RETRIES {
+        let started = std::time::Instant::now();
+        match tokio::time::timeout(
+            Duration::from_secs(TRANSLATE_CHUNK_TIMEOUT_SECS),
+            llm.complete(&system, &user),
+        )
+        .await
+        {
+            Ok(Ok(t)) => {
+                eprintln!(
+                    "[translate] chunk {idx} ok in {:.1}s ({} chars)",
+                    started.elapsed().as_secs_f32(),
+                    chunk.len()
+                );
+                return Some(t);
+            }
+            Ok(Err(e)) => eprintln!(
+                "[translate] chunk {idx} attempt {attempt} LLM error in {:.1}s: {e}",
+                started.elapsed().as_secs_f32()
+            ),
+            Err(_) => eprintln!(
+                "[translate] chunk {idx} attempt {attempt} timed out after {TRANSLATE_CHUNK_TIMEOUT_SECS}s"
+            ),
+        }
+    }
+    None
+}
+
+/// One outbound frame on the `/api/translate` socket (文档翻译, streamed so the client
+/// shows progress and renders incrementally). A cache hit sends the whole doc as one
+/// `cached` frame; a miss sends `total` (the chunk count) then the chunks in order
+/// (each restored, for live append-render) then `done`. The `error` frame is terminal.
+#[derive(Debug, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+enum TranslateFrame {
+    Cached { text: String },
+    Total { total: usize },
+    Chunk { index: usize, text: String, ok: bool },
+    Done,
+    Error { message: String },
+}
+
+/// Serialize + send one translate frame. Err if the peer is gone.
+async fn send_translate_frame(
+    socket: &mut WebSocket,
+    frame: &TranslateFrame,
+) -> Result<(), axum::Error> {
+    let v = serde_json::to_value(frame).unwrap_or_else(|_| {
+        serde_json::json!({ "kind": "error", "message": "frame serialize failed" })
+    });
+    socket.send(Message::Text(v.to_string())).await
+}
+
+/// Drive one translation over the socket: cache hit → `cached` + `done`; miss →
+/// `total`, then ordered `chunk` frames (each with code restored), then `done`; fatal
+/// → `error`. Mirrors run_explain_line's lock discipline (the project lock is held
+/// only for the sync read/cache/mask phase, dropped before the awaits). Each chunk is
+/// streamed the moment it completes so the client can show progress + render
+/// incrementally. Returns Err if the peer drops mid-stream.
+async fn run_translate_stream(
+    state: &AppState,
+    file_path: &str,
+    socket: &mut WebSocket,
+) -> Result<(), axum::Error> {
+    let llm = state.llm_proxy();
+    enum Step {
+        Cached(String),
+        NeedLlm { masked: String, blocks: Vec<String>, source: String },
+        Err(String),
+    }
+
+    let step = {
+        let guard = state.project.read().unwrap();
+        match guard.as_ref() {
+            None => Step::Err("no project open".into()),
+            Some(proj) => match proj.reader.read_file(file_path) {
+                Err(ReadErr::NotFound) => Step::Err("file not found".into()),
+                Err(ReadErr::Forbidden) => Step::Err("path outside project root".into()),
+                Ok(source) => {
+                    if let Some(t) = proj.cache.get_translation(&source) {
+                        eprintln!("[translate] cache HIT {file_path} — zero token");
+                        Step::Cached(t.text)
+                    } else if llm.is_none() {
+                        Step::Err("LLM not configured: set OPENCODE_API_KEY".into())
+                    } else {
+                        // Deterministic: pull code blocks out before the model sees them.
+                        let (masked, blocks) = protect_code(&source);
+                        Step::NeedLlm { masked, blocks, source }
+                    }
+                }
+            },
+        }
+    }; // project lock dropped here — before any await.
+
+    let (masked, blocks, source) = match step {
+        Step::Cached(text) => {
+            send_translate_frame(socket, &TranslateFrame::Cached { text }).await?;
+            return send_translate_frame(socket, &TranslateFrame::Done).await;
+        }
+        Step::Err(message) => {
+            return send_translate_frame(socket, &TranslateFrame::Error { message }).await;
+        }
+        Step::NeedLlm { masked, blocks, source } => (masked, blocks, source),
+    };
+
+    let llm = llm.as_ref().expect("NeedLlm implies llm is Some");
+    let chunks = split_chunks(&masked, TRANSLATE_CHUNK_CHARS);
+    let total = chunks.len();
+    eprintln!(
+        "[translate] cache MISS {file_path} — {total} chunk(s) @ concurrency {TRANSLATE_CONCURRENCY} ({})",
+        llm.model
+    );
+    send_translate_frame(socket, &TranslateFrame::Total { total }).await?;
+
+    // Bounded-parallel, order-preserving: `buffered` yields chunks in submission order
+    // so the client appends them in order. Each completed chunk is restored (code back)
+    // and streamed at once for live progress + incremental render. A failed chunk keeps
+    // its English original (failure policy).
+    let mut stream = stream::iter(chunks.into_iter().enumerate())
+        .map(|(i, chunk)| {
+            let llm = Arc::clone(llm);
+            async move {
+                match translate_one_chunk(&llm, i, &chunk).await {
+                    Some(t) => (i, t, true),
+                    None => {
+                        eprintln!("[translate] chunk {i} failed after retries — keeping original (English)");
+                        (i, chunk, false)
+                    }
+                }
+            }
+        })
+        .buffered(TRANSLATE_CONCURRENCY);
+
+    let mut restored_parts: Vec<String> = Vec::with_capacity(total);
+    let mut any_ok = false;
+    while let Some((index, text, ok)) = stream.next().await {
+        any_ok |= ok;
+        let restored = restore_code(&text, &blocks);
+        restored_parts.push(restored.clone());
+        send_translate_frame(socket, &TranslateFrame::Chunk { index, text: restored, ok }).await?;
+    }
+
+    // No chunk translated → real failure (don't cache an all-English "translation").
+    if !any_ok {
+        eprintln!("[translate] all chunks failed {file_path}");
+        return send_translate_frame(
+            socket,
+            &TranslateFrame::Error { message: "全部分块翻译失败".into() },
+        )
+        .await;
+    }
+
+    // Persist the full doc for the next open (best-effort). Keyed by the original
+    // source so an edit invalidates it.
+    let full = restored_parts.concat();
+    if let Some(proj) = state.project.read().unwrap().as_ref() {
+        if let Err(e) = proj.cache.put_translation(&source, &Translation { text: full }) {
+            eprintln!("[translate] warning: cache put failed: {e}");
+        }
+    }
+
+    send_translate_frame(socket, &TranslateFrame::Done).await
+}
+
+async fn translate_ws(ws: WebSocketUpgrade, State(state): State<Shared>) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_translate_socket(socket, state))
+}
+
+/// Drive one `/api/translate` socket: each text message is `{ filePath }`; the
+/// translation streams back as total/chunk/done (or cached/error) frames (文档翻译).
+async fn handle_translate_socket(mut socket: WebSocket, state: Shared) {
+    while let Some(Ok(msg)) = socket.recv().await {
+        let text = match msg {
+            Message::Text(t) => t,
+            Message::Close(_) => break,
+            _ => continue,
+        };
+        let req: TranslateRequest = match serde_json::from_str(&text) {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = send_translate_frame(
+                    &mut socket,
+                    &TranslateFrame::Error { message: format!("bad request: {e}") },
+                )
+                .await;
+                continue;
+            }
+        };
+        if run_translate_stream(&state, &req.file_path, &mut socket).await.is_err() {
+            return; // peer gone
+        }
     }
 }
 
@@ -1461,6 +1700,27 @@ mod tests {
         let v = serde_json::to_value(QueryFrame::Error { message: "x".into() }).unwrap();
         assert_eq!(v["kind"], "error");
         assert_eq!(v["message"], "x");
+    }
+
+    #[test]
+    fn translate_frame_serializes_with_kebab_kind() {
+        let v = serde_json::to_value(TranslateFrame::Total { total: 17 }).unwrap();
+        assert_eq!(v["kind"], "total");
+        assert_eq!(v["total"], 17);
+        let v = serde_json::to_value(TranslateFrame::Chunk {
+            index: 3,
+            text: "中文".into(),
+            ok: false,
+        })
+        .unwrap();
+        assert_eq!(v["kind"], "chunk");
+        assert_eq!(v["index"], 3);
+        assert_eq!(v["text"], "中文");
+        assert_eq!(v["ok"], false);
+        let v = serde_json::to_value(TranslateFrame::Cached { text: "t".into() }).unwrap();
+        assert_eq!(v["kind"], "cached");
+        let v = serde_json::to_value(TranslateFrame::Done).unwrap();
+        assert_eq!(v["kind"], "done");
     }
 
     #[test]

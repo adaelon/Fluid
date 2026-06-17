@@ -11,6 +11,7 @@ mod project_reader;
 mod routes;
 mod settings;
 mod static_assets;
+mod translate;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
