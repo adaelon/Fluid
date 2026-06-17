@@ -1,39 +1,33 @@
-# SESSION_CHECKPOINT — 2026-06-16 (易用性三修复 · 待 commit)
+# SESSION_CHECKPOINT — 2026-06-17 (Markdown 渲染 + 翻译三刀完成,准备发 v0.1.1)
 
 ## 新鲜度自检
 - git 仓库,远程 `https://github.com/adaelon/Fluid.git`,分支 `main`(逐刀直提主干,无 PR)。
-- 写入时最新 commit:`131f636` 打包(已 push);tag `v0.1.0` 已推(触发 release CI)。
-- **本会话「易用性三修复」已写完 + 测试绿,尚未 commit**(见下「未提交」)。
-- 读入时对比 `git log --oneline -3`;不一致以 git 为准。
+- 写入时最新 commit:`fe55fcb`(Markdown 文档翻译:分块并发 + 流式进度/增量渲染);前序 `f033517`(Markdown 文档渲染视图,已 push)。
+- **提交不加 Co-Authored-By 尾注**(用户要求,见 memory)。
+- 读入时对比 `git log --oneline -3`;不一致以 git 为准。唯一应未提交项 = 本 checkpoint。
 
 ## 当前在做什么
-**易用性三修复 + Linux CI 构建修复**(源自用户实跑反馈 + v0.1.0 发版 Linux job 失败)。
-
-- **Linux release 构建修复**:v0.1.0 的 Linux job 因 `wayland-client.pc` 缺失失败(rfd→ashpd 硬带 wayland 特性)。`release.yml` Linux 项加 `apt-get install libwayland-dev pkg-config`。
-
-**三个易用性修复完成**(源自用户实跑 exe 反馈):
-1. **#2 project 可选**(后端):`AppState.project` → `RwLock<Option<ProjectCtx>>`;CLI `project` 改 `Option`;无项目时 tree→[]、file→404、graph→null、gen/explain/query→「no project open」;`open_folder` 设 Some;`main` 无参=`new_no_project`。→ `fluid` 免参启动,UI 里 Open Folder 再选。顺带把 apply_llm_settings 的 cache 重建收进单写锁(消化 PENDING㉑)。
-2. **#3 首启 LLM 提示**(前端):`App.vue:onMounted` GET settings,`keyStatus==='unset'` → 自动弹 `SettingsModal`。
-3. **#1 README**:安装段拆 macOS/Linux 与 Windows,讲清「exe 是 CLI 勿双击」+ 形态 `文件夹\fluid-windows-x86_64.exe E:\path\to\project` + 可免参。
+**Markdown 文档渲染 + 翻译**全部完成,准备打 `v0.1.1` tag 发版(带全部修复 + 新功能的二进制)。
+MVP 早已闭环(见 `docs/切片计划.md` 全 ✅);本轮新增 S-MD(渲染视图)+ S-MD-T/T2/T3(翻译)。
 
 ## 下一步(可直接接手)
-1. **commit + push 三修复**:`git add -u`(无新增未跟踪文件,`-u` 足够;排除根 0 字节 `defaults`)`&& commit && push`。建议信息「修复: 免参数启动 + 首启 LLM 提示 + README 运行说明」。
-2. **发新版让二进制带上这些修复**:当前 release `v0.1.0` 是旧二进制(双击仍报错)。修复 push 后 `git tag v0.1.1 && git push origin v0.1.1` 触发 CI 出新二进制。
-3. **眼验**(留用户):新二进制 `fluid`(无参)→ 空界面 + 自动弹设置 → Open Folder 选项目 → 正常用。
-4. **或收尾**:`docs/架构.md`(C3)、PENDING(⑥ reqwest timeout、⑦ 代码块语法高亮)。
+1. **打 tag 发版**:`git tag v0.1.1 && git push origin v0.1.1` → 触发 `.github/workflows/release.yml` 出全平台二进制。CI 结果须在 GitHub 端眼验(沙箱看不到);若 Actions 因权限失败→ Settings→Actions→Workflow permissions 改 Read and write 后 Re-run。
+2. **眼验翻译**(留用户,沙箱禁网跑不了真 LLM):打开长 `.md` → 点「译中文」→ 看进度「翻译中 N/total 段」+ 逐段增量显影 + 每块耗时日志;重开未改零 token。
+3. **清理**:仓库根 0 字节 `defaults`(未跟踪垃圾)可删,勿入 commit。
+4. **或收尾 PENDING**:`docs/架构.md`(C3 一直欠)、翻译换更快模型(单次延迟是模型瓶颈,非代码)。
 
 ## 未提交 / 未完成
-- **三修复 + Linux CI 修复未 commit**:`crates/fluid-server/src/{routes,main}.rs`、`web/src/App.vue`、`.github/workflows/release.yml`、`README.md`、`docs/代码链路.md`、本 checkpoint。后端 `cargo test` **90/90**、clippy 净;前端 `npm run build` 绿;`release.yml` YAML 通过。
-- **release v0.1.0**:首个 tag 已推,CI 结果需用户在 GitHub 确认(沙箱看不到);若 Actions 因 Workflow 写权限失败,Settings→Actions→Workflow permissions 改 Read and write 后 Re-run。
-- **杂项**:仓库根 0 字节 `defaults`(未跟踪)——可删,勿入 commit。
-- PENDING(均非阻塞):⑥ reqwest 无 timeout;⑦ 代码块语法高亮;⑨ `docs/架构.md` 待起;⑮ 追问开关态不持久化;⑱ theme.ts 手工跟 token;⑲ Tabs `×` 未换 SVG;㉒ 仅 OpenAI 兼容;㉓ 不持久化最近 provider;㉔ S10c 受图谱稀疏性限;㉕ 命令无独立快捷键;㉖ linux/arm64 无预编译;㉗ CI/install.sh 真实跑留发版眼验;㉘(新)无项目时直接调 gen/query 返错误(正常流程不触发);㉙(新)Windows 仍需命令行(无 GUI 启动器)。
+- 仅本 checkpoint 待提交;`defaults` 0 字节未跟踪(勿提交)。
+- 后端 `cargo test` **101/101**、clippy 净;前端 `npm run build` 绿。
+- 翻译 PENDING(非阻塞):单次延迟=glm-5.1/网关物理下限(治本换模型);无 token 级进度;整篇单缓存键(非分块缓存);单超长无空行段仍可能慢;行内 code 靠 LLM 指令保留;相对路径图片/内嵌 HTML 不渲染;`buffered` 保序(后块快于前块仍等)。
 
 ## 冷启动读序
-1. `README.md` — 总览 + 安装/运行(macOS/Linux + Windows + 源码)
-2. `docs/切片计划.md` 全部 ✅;`docs/代码链路.md` 末「打包」「易用性三修复」条
-3. 打包+启动:`crates/fluid-server/{build.rs,src/static_assets.rs,src/main.rs,src/routes.rs(AppState/router/各 handler 的 Option 降级)}` + `.github/workflows/release.yml` + `scripts/install.sh`
-4. 后端核:`crates/fluid-server/src/{routes,context_assembler,settings,llm_proxy,cache_store}.rs`
-5. 前端:`web/src/App.vue`(onMounted 首启 LLM 提示 + palette)+ `shell/*` + `Editor.vue` + `api.ts`;`CONTEXT.md` 术语表
+1. `README.md` — 总览 + 安装/运行
+2. `docs/切片计划.md`(全 ✅,末 S-MD/T/T2/T3)+ `docs/代码链路.md` 末四条(S-MD、S-MD-T、S-MD-T2、S-MD-T3)
+3. 翻译链:`crates/fluid-server/src/translate.rs`(protect/restore/split_chunks)+ `routes.rs`(`run_translate_stream`/`TranslateFrame`/`translate_one_chunk` + 常量 chunk3500/并发4/timeout240)+ `cache_store.rs`(translate 键)
+4. 渲染/前端:`web/src/MarkdownView.vue`(原文/译中文切换 + 流式进度 + 增量渲染)+ `render/markdownDoc.ts` + `api.ts`(`streamTranslate`)+ `CONTEXT.md`(术语「文档渲染视图」「文档翻译」)
+5. 后端核(如需):`routes.rs` AppState/router、`llm_proxy.rs`、`project_reader.rs:lang_of`(md 标签)
 
 ## 本会话决策摘要
-- **三修复均沿既有架构无新抽象**:project 可选用 `Option<ProjectCtx>` + handler 降级(复用 U3 Open Folder 选目录);首启提示复用 U5b 设置模态;README 讲清 CLI 用法。已落档 `代码链路.md`「易用性三修复」。
+- **S-MD**:`.md` 直接渲染取代源码(用户选),复用 markdown-it→DOMPurify→KaTeX 链,不进生成管线。已落 `代码链路.md` S-MD。
+- **S-MD-T/T2/T3 翻译**:英译中、旁路 `.fluid/`、按钮原地切换、代码块占位符保护不译;长文档分块并发(修整篇一次 500);据实跑调参(并发4/chunk3500)+ 流式 WS 进度/增量渲染。失败策略=坏块保留原文。已落 `代码链路.md` S-MD-T/T2/T3。
