@@ -1,38 +1,34 @@
-# SESSION_CHECKPOINT — 2026-06-18 (TS 支持两刀完成:高亮 + 生成,待 commit)
+# SESSION_CHECKPOINT — 2026-06-18 (v0.1.3 已发:TS 支持 + start.bat 单端口)
 
 ## 新鲜度自检
-- 写入时最新 commit:`9faa975`(刷新 SESSION_CHECKPOINT,渲染+翻译完成)。
-- **本会话两刀(S-TS-1 / S-TS-2)已改完但未 commit**;读入时对比 `git log --oneline -1`,若 HEAD 已前进说明已提交。
+- 写入时最新 commit:`65d48a3`(start.bat 单端口);其前 `b78875f`(TS 支持)。
+- 已 push main + tag **v0.1.3**(触发 release.yml);读入时对比 `git log --oneline -3`。
 - 提交不加 Co-Authored-By 尾注(用户要求,见 memory)。
 
 ## 当前在做什么
-给 `.ts` 文件加支持(用户问"为什么没有 ts 注释/高亮")。已拆两刀**全部完成**:
-- **S-TS-1 高亮**:`.ts/.tsx/.js/.jsx` 经 `@codemirror/lang-javascript` 语法高亮。
-- **S-TS-2 生成**:`.ts` 生成函数胶囊 + 重点行(纯前端 AST 接线,后端零改)。
+本会话已闭环并发版 **v0.1.3**。两件事:
+- **TS 支持(两刀)**:S-TS-1 `.ts/.tsx/.js/.jsx` 语法高亮;S-TS-2 `.ts` 幽灵注释生成(tree-sitter-typescript + typescript.scm)。
+- **start.bat 单端口化**:对齐单二进制发版形态(npm build + 单进程 cargo run 起 7878),cargo run 后加 pause 防"窗口一闪而关"。
 
 ## 下一步(可直接接手)
-1. **commit 两刀**:先 `git checkout -b` 一个分支(当前在 main),再提交。改动集见下「未提交」。建议两个 commit(S-TS-1 高亮 / S-TS-2 生成)或合一。
-2. **眼验**(留用户,沙箱无浏览器):`fluid <某TS项目>` → 点 `.ts` 看彩色高亮 + 函数横头 + 重点行幽灵注释流式显影;点 `.tsx` 应只高亮不生成。
-3. **或收尾 PENDING**:tsx/jsx 生成(JSX 重点行 query);`docs/架构.md`(C3 长期欠账)。
+1. **眼验 v0.1.3 CI**:GitHub→Actions 看 release.yml 是否出全平台二进制(沙箱看不到)。若因权限失败→ Settings→Actions→Workflow permissions 改 Read and write 后 Re-run。
+2. **眼验 TS**:`start.bat` 起 → 开 `.ts` 看高亮 + 函数胶囊 + 重点行注释;`.tsx/.js/.jsx` 应只高亮不生成。
+3. **或收尾 PENDING**:tsx/jsx **生成**(JSX 重点行 query,另一刀);`docs/架构.md`(C3 长期欠账)。
 
 ## 未提交 / 未完成
-- 已改未提交(10 改 + 2 新):
-  - 后端:`project_reader.rs:lang_of`(ts/tsx/js/jsx 标签 + 测试)。
-  - 前端:`Editor.vue`(langExtension + isParserLang)、`parser/{types,parse,browser}.ts`、`parser/keyline-queries/typescript.scm`(新)、`scripts/parse-check.ts`(TS 断言)、`package.json`(+lang-javascript)。
-  - 文档:`代码链路.md`(+S-TS-1/2)、`切片计划.md`(+S-TS-1/2)、`adr/0005`(TS 补记)。
-- 验证状态全绿:`cargo test` **102/102**、clippy 净、`npm run build` 绿、`node scripts/parse-check.ts` TS 断言全过。
+- 无(本 checkpoint 即最后一项,随附 commit)。
 - `defaults`(仓库根)0 字节未跟踪垃圾,勿提交。
-- v1 已知局限:箭头/函数表达式 const 定义行有冗余 key line(tree-sitter 无 not 谓词);tsx/jsx 仅高亮不生成;对象方法/IIFE 未纳入 roster。
+- TS v1 已知局限:箭头/函数表达式 const 定义行有冗余 key line(tree-sitter 无 not 谓词);tsx/jsx 仅高亮不生成;对象方法/IIFE 未纳入 roster。
+- 运维坑(已修):旧发版 `clamp\fluid-windows-x86_64.exe` 会占 7878 致开发实例起不来——开发时别启动它。
 
 ## 冷启动读序
-按顺序读还原全局上下文:
-1. `README.md` — 总览;`CONTEXT.md` — 术语(幽灵注释/重点行/真空态)
-2. `docs/切片计划.md` 末两条 S-TS-1/S-TS-2 + `docs/代码链路.md` 末两条 S-TS-1/S-TS-2
-3. TS 解析链:`web/src/parser/parse.ts`(ROSTER_QUERY['ts'] + extractRoster/extractKeyLines/innermostHost)+ `keyline-queries/typescript.scm` + `browser.ts`(getParser 三语言)+ `types.ts`(ParserLang)
-4. 接线点:`web/src/Editor.vue`(langExtension 高亮 / isParserLang 生成门 / activate)+ `crates/fluid-server/src/project_reader.rs:lang_of`
-5. 验证:`web/scripts/parse-check.ts`(B2 确定性门禁,可直接 `node` 跑)
+1. `README.md` + `CONTEXT.md`(术语:幽灵注释/重点行/真空态)
+2. `docs/切片计划.md` 末 S-TS-1/S-TS-2 + `docs/代码链路.md` 末 S-TS-1/S-TS-2
+3. TS 解析链:`web/src/parser/parse.ts`(ROSTER_QUERY['ts'] + extractRoster/extractKeyLines/innermostHost)+ `keyline-queries/typescript.scm` + `browser.ts`(三语言)+ `types.ts`
+4. 接线点:`web/src/Editor.vue`(langExtension 高亮 / isParserLang 生成门)+ `crates/fluid-server/src/project_reader.rs:lang_of`
+5. 验证:`web/scripts/parse-check.ts`(B2 门禁,`node` 直跑);发布:`.github/workflows/release.yml`(v* tag 触发,版本取 tag 名,不依赖 Cargo.toml version)
 
 ## 本会话决策摘要
-- **TS 拆两刀**:高亮(装包+标签,小)与生成(S4 级 AST 适配器)是两量级,先高亮快赢再生成。已落 `代码链路.md` S-TS-1/2。
-- **后端生成语言无关** → 刀二纯前端;`lang_of` 标签(刀一)是后端唯一相关改动。
-- **roster 必含箭头函数赋值**:重点行靠 innermostHost 归属,赋值式函数不进 roster 则其函数体重点行全丢。已落 ADR-0005 后续记 + `代码链路.md` S-TS-2。
+- **TS 拆两刀**:高亮(装包)与生成(S4 级 AST 适配器)两量级,先高亮后生成。已落 `代码链路.md` S-TS-1/2 + ADR-0005 后续记。
+- **后端生成语言无关** → 加语言是纯前端切片;lang_of 标签是后端唯一相关改动。
+- **start.bat 单端口**:对齐发版形态(用户选),消除前后端版本割裂 + 端口占用一闪而关。
