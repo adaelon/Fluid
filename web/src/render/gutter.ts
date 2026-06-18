@@ -48,6 +48,9 @@ export class ExplainHotspotWidget extends WidgetType {
     readonly fnId: string,
     readonly lineNumber: number,
     readonly loading: boolean,
+    /** Decl kind (const/let/type/interface/enum) ⇒ a top-level declaration entry
+     *  (S-TS-3) with a "解释这个 {kind}" label; undefined ⇒ a function's non-key line. */
+    readonly declKind?: string,
   ) {
     super()
   }
@@ -56,7 +59,8 @@ export class ExplainHotspotWidget extends WidgetType {
     return (
       other.fnId === this.fnId &&
       other.lineNumber === this.lineNumber &&
-      other.loading === this.loading
+      other.loading === this.loading &&
+      other.declKind === this.declKind
     )
   }
 
@@ -67,7 +71,7 @@ export class ExplainHotspotWidget extends WidgetType {
       el.textContent = '解释中…'
     } else {
       el.className = 'fluid-explain-hotspot'
-      el.textContent = '解释这一行'
+      el.textContent = this.declKind ? `解释这个 ${this.declKind}` : '解释这一行'
       el.setAttribute('data-explain-fn', this.fnId)
       el.setAttribute('data-explain-line', String(this.lineNumber))
     }

@@ -5,7 +5,7 @@
 // the same core runs in the browser (S7) and in the Node validation script.
 
 import Parser from 'web-tree-sitter';
-import type { FileParse, FunctionSpan, ParserLang } from './types.ts';
+import type { DeclSpan, FileParse, FunctionSpan, ParserLang } from './types.ts';
 
 /** Structural function enumeration per language (the roster; not a heuristic). */
 const ROSTER_QUERY: Record<ParserLang, string> = {
@@ -24,6 +24,26 @@ const ROSTER_QUERY: Record<ParserLang, string> = {
   ].join('\n'),
 };
 
+/** Top-level declarations eligible for manual "explain this declaration" (S-TS-3).
+ *  TS only. Matches MODULE-LEVEL const/let/type/interface/enum (program direct
+ *  children + export-wrapped); function-bodies' decls are excluded (those are
+ *  already covered by 手动补行 on non-key lines). `@decl` is the declaration node
+ *  (sets the line range), `@name` its identifier. Function-valued consts also match
+ *  here but are filtered out downstream (they're roster functions, deduped by start
+ *  line). */
+const DECL_QUERY: Partial<Record<ParserLang, string>> = {
+  ts: [
+    '(program (lexical_declaration (variable_declarator name: (identifier) @name)) @decl)',
+    '(program (type_alias_declaration name: (type_identifier) @name) @decl)',
+    '(program (interface_declaration name: (type_identifier) @name) @decl)',
+    '(program (enum_declaration name: (identifier) @name) @decl)',
+    '(program (export_statement (lexical_declaration (variable_declarator name: (identifier) @name)) @decl))',
+    '(program (export_statement (type_alias_declaration name: (type_identifier) @name) @decl))',
+    '(program (export_statement (interface_declaration name: (type_identifier) @name) @decl))',
+    '(program (export_statement (enum_declaration name: (identifier) @name) @decl))',
+  ].join('\n'),
+};
+
 /** What a caller provides to enable one language. */
 export interface LangAsset {
   lang: ParserLang;
@@ -37,6 +57,8 @@ interface Compiled {
   language: Parser.Language;
   rosterQuery: Parser.Query;
   keyLineQuery: Parser.Query;
+  /** Present only for languages with top-level declaration support (TS). */
+  declQuery?: Parser.Query;
 }
 
 export class FluidParser {
@@ -55,10 +77,12 @@ export class FluidParser {
     const langs = new Map<ParserLang, Compiled>();
     for (const a of assets) {
       const language = await Parser.Language.load(a.grammarWasm);
+      const declSrc = DECL_QUERY[a.lang];
       langs.set(a.lang, {
         language,
         rosterQuery: language.query(ROSTER_QUERY[a.lang]),
         keyLineQuery: language.query(a.keyLineQuery),
+        declQuery: declSrc ? language.query(declSrc) : undefined,
       });
     }
     return new FluidParser(parser, langs);
@@ -76,7 +100,8 @@ export class FluidParser {
     const tree = this.parser.parse(source);
     const roster = extractRoster(compiled.rosterQuery, tree);
     const keyLines = extractKeyLines(compiled.keyLineQuery, tree, roster);
-    return { roster, keyLines };
+    const decls = compiled.declQuery ? extractDecls(compiled.declQuery, tree, roster) : [];
+    return { roster, keyLines, decls };
   }
 }
 
@@ -91,6 +116,50 @@ function extractRoster(query: Parser.Query, tree: Parser.Tree): FunctionSpan[] {
     out.push({ id: `${name.text}#${start}`, name: name.text, lineRange: [start, end] });
   }
   return out;
+}
+
+/** Coarse kind of a top-level declaration node (for the explain hotspot label). */
+function declKind(node: Parser.SyntaxNode): DeclSpan['kind'] {
+  switch (node.type) {
+    case 'type_alias_declaration':
+      return 'type';
+    case 'interface_declaration':
+      return 'interface';
+    case 'enum_declaration':
+      return 'enum';
+    case 'lexical_declaration':
+      return node.firstChild?.text === 'let' ? 'let' : 'const';
+    default:
+      return 'const';
+  }
+}
+
+/** Top-level declarations as manual-explain entries (S-TS-3). Skips any whose start
+ *  line coincides with a roster function — a top-level `const f = () => {}` is a
+ *  function capsule, not a plain declaration. Sorted by start line, deduped by id. */
+function extractDecls(
+  query: Parser.Query,
+  tree: Parser.Tree,
+  roster: FunctionSpan[],
+): DeclSpan[] {
+  const rosterStarts = new Set(roster.map((r) => r.lineRange[0]));
+  const byId = new Map<string, DeclSpan>();
+  for (const m of query.matches(tree.rootNode)) {
+    const decl = m.captures.find((c) => c.name === 'decl')?.node;
+    const name = m.captures.find((c) => c.name === 'name')?.node;
+    if (!decl || !name) continue;
+    const start = decl.startPosition.row + 1;
+    if (rosterStarts.has(start)) continue; // function-valued const: already a capsule
+    const id = `${name.text}#${start}`;
+    if (byId.has(id)) continue;
+    byId.set(id, {
+      id,
+      name: name.text,
+      kind: declKind(decl),
+      lineRange: [start, decl.endPosition.row + 1],
+    });
+  }
+  return [...byId.values()].sort((a, b) => a.lineRange[0] - b.lineRange[0]);
 }
 
 function extractKeyLines(

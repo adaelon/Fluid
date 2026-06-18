@@ -27,7 +27,8 @@ use serde::{Deserialize, Serialize};
 use crate::cache_store::{Capsule, CacheStore, CapsuleEntry, LineAnnotation, Translation};
 use crate::translate::{build_translate_prompt, protect_code, restore_code, split_chunks};
 use crate::context_assembler::{
-    assemble_gen_context, build_explain_line_prompt, build_gen_prompt, build_query_planning_prompt,
+    assemble_gen_context, build_explain_decl_prompt, build_explain_line_prompt, build_gen_prompt,
+    build_query_planning_prompt,
     build_query_prompt, cross_file_targets, query_degraded_names, slice_cross_file_sources,
     slice_requested_sources, slice_span, CrossFileTarget, FunctionSpan, GenContext, QueryFocus,
     SharedContext, QUERY_FETCH_BUDGET_CHARS,
@@ -653,6 +654,11 @@ struct ExplainLineRequest {
     roster: Vec<String>,
     #[serde(default)]
     shared: SharedContext,
+    /// Present ⇒ this is a module-level declaration (S-TS-3), not a line inside a
+    /// function: `func` carries the decl's name+span, and the decl-flavored prompt
+    /// is used. Absent ⇒ ordinary 手动补行 on a function's non-key line.
+    #[serde(rename = "declKind", default)]
+    decl_kind: Option<String>,
 }
 
 /// Resolve one manual-line annotation to either a finished line (cache hit / the
@@ -710,8 +716,17 @@ async fn run_explain_line(
         } else {
             let ctx =
                 assemble_gen_context(proj.graph.graph(), &req.file_path, &req.roster, &req.shared);
-            let (system, user) =
-                build_explain_line_prompt(&req.func, &fn_source, req.line_number, &ctx);
+            let (system, user) = match &req.decl_kind {
+                // Module-level declaration (S-TS-3): fn_source is the decl span.
+                Some(kind) => build_explain_decl_prompt(
+                    &req.func.name,
+                    kind,
+                    &fn_source,
+                    req.func.line_range[0],
+                    &ctx,
+                ),
+                None => build_explain_line_prompt(&req.func, &fn_source, req.line_number, &ctx),
+            };
             Step::NeedLlm { system, user, fn_source }
         }
     }; // project lock dropped here — before any await.
@@ -1609,6 +1624,7 @@ mod tests {
             line_number,
             roster: vec![],
             shared: SharedContext::default(),
+            decl_kind: None,
         }
     }
 

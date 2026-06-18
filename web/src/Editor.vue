@@ -14,7 +14,7 @@ import { getParser } from './parser/browser'
 import { fluidDarkTheme } from './theme'
 import { GenScheduler, viewportDistance } from './scheduler'
 import { buildQueryContext, type QueryContext } from './queryContext'
-import type { FunctionSpan, ParserLang } from './parser/types.ts'
+import type { DeclSpan, FunctionSpan, ParserLang } from './parser/types.ts'
 import type { GenFrame } from './ghostTypes'
 
 const props = defineProps<{ source: string; lang: string; path: string }>()
@@ -48,6 +48,8 @@ let scheduler: GenScheduler | null = null
 let activationToken = 0
 // Current file's roster + path — needed to resend a single function on retry (S7.6).
 let currentRoster: FunctionSpan[] = []
+// Top-level declarations (S-TS-3): targets for the manual "解释这个声明" hotspot.
+let currentDecls: DeclSpan[] = []
 let currentPath = ''
 
 // Generation progress (S7.5) — reactive; emitted up to the status bar (U1).
@@ -243,20 +245,33 @@ function retry(fnId: string): void {
 // POST /api/explain-line, then drop the returned annotation into the store. A
 // "解释中…" hotspot shows while in flight. Guarded by activationToken so a file
 // switch mid-request can't apply the result to the wrong file.
-async function explainLine(fnId: string, lineNumber: number): Promise<void> {
-  const fn = currentRoster.find((r) => r.id === fnId)
-  if (!fn || store.isExplaining(fnId, lineNumber)) return
+async function explainLine(id: string, lineNumber: number): Promise<void> {
+  // `id` is a function id (non-key line) or a decl id (top-level declaration,
+  // S-TS-3). For a decl, pass it as a degenerate fn (name+span) + its kind so the
+  // backend uses the decl-flavored prompt; the returned note anchors at its line.
+  const fn = currentRoster.find((r) => r.id === id)
+  const decl = fn ? undefined : currentDecls.find((d) => d.id === id)
+  const target = fn ?? (decl && { id: decl.id, name: decl.name, lineRange: decl.lineRange })
+  if (!target || store.isExplaining(id, lineNumber)) return
   const token = activationToken
-  store.markExplaining(fnId, lineNumber)
+  store.markExplaining(id, lineNumber)
   refresh()
   try {
-    const line = await fetchExplainLine({ filePath: currentPath, fn, lineNumber })
+    // Decl FIRST line → whole-declaration prompt (declKind); an inner line of a
+    // multi-line decl → ordinary line prompt (S-TS-4), so no declKind there.
+    const declKind = decl && lineNumber === decl.lineRange[0] ? decl.kind : undefined
+    const line = await fetchExplainLine({
+      filePath: currentPath,
+      fn: target,
+      lineNumber,
+      declKind,
+    })
     if (token !== activationToken) return // switched files mid-request
     store.putLine(line)
   } catch (e) {
-    console.warn('[explain-line]', fnId, lineNumber, e)
+    console.warn('[explain-line]', id, lineNumber, e)
   } finally {
-    store.clearExplaining(fnId, lineNumber)
+    store.clearExplaining(id, lineNumber)
     refresh()
   }
 }
@@ -266,6 +281,7 @@ async function activate(source: string, lang: string, path: string): Promise<voi
   scheduler?.stop()
   store.reset()
   currentRoster = []
+  currentDecls = []
   currentPath = path
   phase.value = 'idle'
   total.value = 0
@@ -293,7 +309,9 @@ async function activate(source: string, lang: string, path: string): Promise<voi
     return
   }
   store.setRoster(parsed.roster, parsed.keyLines)
+  store.setDecls(parsed.decls) // top-level decls → manual explain hotspots (S-TS-3)
   currentRoster = parsed.roster
+  currentDecls = parsed.decls
   emitContext() // roster known (capsules still streaming in)
   // Show "生成中" skeletons immediately (before the WS even opens) + arm progress.
   for (const fn of parsed.roster) store.markPending(fn.id)

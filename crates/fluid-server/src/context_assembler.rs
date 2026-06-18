@@ -203,6 +203,37 @@ JSON 形如：{\"text\":\"...\",\"color\":\"#7ee787\"}";
     (system.to_string(), user)
 }
 
+/// Prompt for explaining one MODULE-LEVEL declaration on demand (S-TS-3, 手动补行
+/// 的声明粒度泛化). Unlike the line prompt it isn't inside a function — `decl_source`
+/// is the declaration's own span, `kind` its coarse kind (const/let/type/interface/
+/// enum) and `name` its identifier. Same `LineAnnotation` shape so the frontend
+/// renders it as a trailing note on the declaration's first line.
+pub fn build_explain_decl_prompt(
+    name: &str,
+    kind: &str,
+    decl_source: &str,
+    start_line: u32,
+    ctx: &GenContext,
+) -> (String, String) {
+    let system = "你是 Fluid 的代码理解助手，面向零代码基础的读者。\
+用户指定了一个模块顶层的【声明】(const/let/type/interface/enum 之一)，\
+请用一句简体中文解释它是什么、用来做什么，避免逐字复述代码。\
+给一个语义色温的十六进制颜色(color，如 #7ee787 表数据/常量、#f0883e 表类型/接口、#ff7b72 表特殊)。\
+只输出一个 JSON 对象，禁止任何额外文字或 markdown 代码围栏。\
+JSON 形如：{\"text\":\"...\",\"color\":\"#7ee787\"}";
+
+    let mut user = String::new();
+    if let Some(fs) = &ctx.file_summary {
+        user.push_str(&format!("【文件摘要】{fs}\n"));
+    }
+    user.push_str(&format!("【声明种类】{kind}\n"));
+    user.push_str(&format!("【声明名称】{name}\n"));
+    user.push_str("【源码(带绝对行号)】\n");
+    user.push_str(&number_lines(decl_source, start_line));
+
+    (system.to_string(), user)
+}
+
 /// A focused function for a query: its source (zoomed to source granularity), the
 /// 1-based start line for absolute numbering, and its name — the name lets the
 /// degradation ladder prioritize this function and its neighbors' capsule
@@ -707,6 +738,26 @@ mod tests {
         assert!(user.contains("【所在函数】f"));
         assert!(user.contains("【目标行号】11"));
         assert!(user.contains("  11 |     y = 1"));
+    }
+
+    #[test]
+    fn explain_decl_prompt_targets_the_declaration_not_a_line() {
+        let ctx = assemble_gen_context(None, "a.ts", &[], &SharedContext::default());
+        let (system, user) = build_explain_decl_prompt(
+            "API_URL",
+            "const",
+            "export const API_URL = 'https://x'",
+            4,
+            &ctx,
+        );
+        // Decl-flavored system prompt, same JSON shape as lines.
+        assert!(system.contains("模块顶层"));
+        assert!(system.contains("const/let/type/interface/enum"));
+        assert!(system.contains("{\"text\":"));
+        // User message carries kind + name + numbered source at the decl's line.
+        assert!(user.contains("【声明种类】const"));
+        assert!(user.contains("【声明名称】API_URL"));
+        assert!(user.contains("   4 | export const API_URL"));
     }
 
     #[test]

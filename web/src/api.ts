@@ -104,16 +104,24 @@ export async function testLlmSettings(req: {
 }
 
 /** POST /api/explain-line -> one LineAnnotation for a manually-picked non-key
- *  line (S9 手动补行). The line number must sit inside the function's range. */
+ *  line (S9 手动补行) or a top-level declaration (S-TS-3, when declKind is set). */
 export async function explainLine(req: {
   filePath: string
   fn: FunctionSpan
   lineNumber: number
+  /** Present ⇒ explain a module-level declaration (S-TS-3): `fn` carries the decl's
+   *  name+span; the backend uses the decl-flavored prompt. */
+  declKind?: string
 }): Promise<LineAnnotation> {
   const res = await fetch('/api/explain-line', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ filePath: req.filePath, fn: req.fn, lineNumber: req.lineNumber }),
+    body: JSON.stringify({
+      filePath: req.filePath,
+      fn: req.fn,
+      lineNumber: req.lineNumber,
+      declKind: req.declKind,
+    }),
   })
   if (!res.ok) throw new Error((await res.text()) || `/api/explain-line -> ${res.status}`)
   return (await res.json()) as LineAnnotation

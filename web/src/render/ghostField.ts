@@ -74,6 +74,37 @@ function build(store: GhostStore, state: EditorState): DecorationSet {
     }
   }
 
+  // Top-level declarations (S-TS-3 / S-TS-4): the first line offers a whole-decl
+  // "解释这个 {kind}" hotspot; each inner line of a multi-line decl offers a
+  // per-line "解释这一行" (like S9 inside functions). Already-generated notes render
+  // in place. Independent of generation — decls have no capsule, manual-only.
+  for (const d of store.decls) {
+    const start = d.lineRange[0]
+    if (start < 1 || start > docLines) continue
+    const end = Math.min(d.lineRange[1], docLines)
+    const annotated = new Set<number>()
+    for (const ln of store.lines(d.id)) {
+      if (ln.lineNumber < 1 || ln.lineNumber > docLines) continue
+      annotated.add(ln.lineNumber)
+      ranges.push(
+        Decoration.widget({ widget: new LineWidget(ln), side: 1 }).range(state.doc.line(ln.lineNumber).to),
+      )
+    }
+    // First line → whole-declaration explain (carries the kind label).
+    if (!annotated.has(start)) {
+      const widget = new ExplainHotspotWidget(d.id, start, store.isExplaining(d.id, start), d.kind)
+      ranges.push(Decoration.widget({ widget, side: 1 }).range(state.doc.line(start).to))
+    }
+    // Inner lines → per-line explain (no kind label → "解释这一行").
+    for (let l = start + 1; l <= end; l++) {
+      if (annotated.has(l)) continue
+      const lineObj = state.doc.line(l)
+      if (lineObj.text.trim() === '') continue
+      const widget = new ExplainHotspotWidget(d.id, l, store.isExplaining(d.id, l))
+      ranges.push(Decoration.widget({ widget, side: 1 }).range(lineObj.to))
+    }
+  }
+
   // Decoration.set sorts by position; block widgets at distinct lines don't collide.
   return Decoration.set(ranges, true)
 }

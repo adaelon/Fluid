@@ -42,6 +42,12 @@ for (const s of samples) {
 // re-assignment, value return, throw, if, statement call, awaited call).
 const TS_SAMPLE = `import { dep } from './dep'
 
+const MAX = 100
+export const API_URL = 'https://x'
+type Props = { a: number }
+export interface Opts { b: string }
+enum Color { Red, Green }
+
 export function alpha(n: number): number {
   const x = n * 2
   if (x > 10) {
@@ -112,6 +118,21 @@ expect(keyLinesOf('gamma').includes(lineOf('total += a')), 'gamma: compound assi
 expect(keyLinesOf('handle').includes(lineOf('await save()')), 'handle: awaited call');
 expect(keyLinesOf('handle').includes(lineOf('this.count += 1')), 'handle: compound assign');
 expect(keyLinesOf('render').includes(lineOf("throw new Error('x')")), 'render: throw');
+
+// Top-level declarations (S-TS-3): the manual-explain discovery list. Function-
+// valued consts (beta/gamma) and class members (handle/render) are NOT decls.
+console.log(`\n--- TS top-level decls (${tsParse.decls.length}) ---`);
+for (const d of tsParse.decls) console.log(`  ${d.kind} ${d.name}  L${d.lineRange[0]}-${d.lineRange[1]}`);
+const declSig = tsParse.decls.map((d) => `${d.kind}:${d.name}`).sort();
+expect(
+  JSON.stringify(declSig) ===
+    JSON.stringify(['const:API_URL', 'const:MAX', 'enum:Color', 'interface:Opts', 'type:Props']),
+  `decls = ${JSON.stringify(declSig)} (want MAX/API_URL const, Props type, Opts interface, Color enum)`,
+);
+expect(!tsParse.decls.some((d) => d.name === 'beta' || d.name === 'gamma'),
+  'function-valued top-level const must NOT be a decl (it is a roster capsule)');
+expect(!tsParse.decls.some((d) => d.name === 'handle' || d.name === 'render'),
+  'class members must NOT be top-level decls');
 
 if (failures.length) {
   console.error(`\n✗ TS assertions FAILED (${failures.length}):`);

@@ -5,7 +5,7 @@
 // Plain class (no Vue reactivity): held via the editor's imperative side and
 // mutated directly, then the view is asked to refresh (ADR-0014).
 
-import type { FunctionSpan } from './parser/types.ts'
+import type { DeclSpan, FunctionSpan } from './parser/types.ts'
 import type { Capsule, LineAnnotation } from './ghostTypes'
 
 /** Generation status of one function (S7.5): request in flight, finished, or failed. */
@@ -14,6 +14,8 @@ export type GhostStatus = 'pending' | 'settled' | 'error'
 export class GhostStore {
   /** Function roster for the open file (positions the capsules/lines). */
   roster: FunctionSpan[] = []
+  /** Top-level declarations (TS, S-TS-3): manual-explain entries, no auto-gen. */
+  decls: DeclSpan[] = []
   private capsules = new Map<string, Capsule>()
   private lineMap = new Map<string, LineAnnotation[]>()
   private keyLineMap = new Map<string, number[]>()
@@ -28,6 +30,7 @@ export class GhostStore {
   /** Drop everything — called on file close / switch (releases memory, §7 VACUUM). */
   reset(): void {
     this.roster = []
+    this.decls = []
     this.capsules.clear()
     this.lineMap.clear()
     this.keyLineMap.clear()
@@ -41,6 +44,11 @@ export class GhostStore {
   setRoster(roster: FunctionSpan[], keyLines: Map<string, number[]>): void {
     this.roster = roster
     this.keyLineMap = keyLines
+  }
+
+  /** Establish the top-level declarations offered for manual explain (S-TS-3). */
+  setDecls(decls: DeclSpan[]): void {
+    this.decls = decls
   }
 
   keyLinesOf(fnId: string): number[] {
