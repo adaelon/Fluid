@@ -11,6 +11,17 @@ import type { FileParse, FunctionSpan, ParserLang } from './types.ts';
 const ROSTER_QUERY: Record<ParserLang, string> = {
   py: '(function_definition name: (identifier) @name) @fn',
   rs: '(function_item name: (identifier) @name) @fn',
+  // TS has several "function" shapes; @fn must cover a body so its key lines have a
+  // host (innermostHost). Named function decls, class methods, and the very common
+  // `const f = () => {}` / `const f = function(){}` / class field arrow `f = () => {}`.
+  ts: [
+    '(function_declaration name: (identifier) @name) @fn',
+    '(generator_function_declaration name: (identifier) @name) @fn',
+    '(method_definition name: (property_identifier) @name) @fn',
+    '(variable_declarator name: (identifier) @name value: (arrow_function)) @fn',
+    '(variable_declarator name: (identifier) @name value: (function_expression)) @fn',
+    '(public_field_definition name: (property_identifier) @name value: (arrow_function)) @fn',
+  ].join('\n'),
 };
 
 /** What a caller provides to enable one language. */

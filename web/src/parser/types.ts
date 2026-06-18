@@ -1,5 +1,5 @@
-/** Languages Fluid's parser supports in phase 1 (ADR-0005). */
-export type ParserLang = 'py' | 'rs';
+/** Languages Fluid's parser supports (ADR-0005: py/rs phase 1; ts added S-TS-2). */
+export type ParserLang = 'py' | 'rs' | 'ts';
 
 /** One function in a file's roster: name + 1-indexed inclusive line range. */
 export interface FunctionSpan {

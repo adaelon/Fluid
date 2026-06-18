@@ -8,8 +8,10 @@
 import coreWasmUrl from 'web-tree-sitter/tree-sitter.wasm?url'
 import pyWasmUrl from 'tree-sitter-wasms/out/tree-sitter-python.wasm?url'
 import rsWasmUrl from 'tree-sitter-wasms/out/tree-sitter-rust.wasm?url'
+import tsWasmUrl from 'tree-sitter-wasms/out/tree-sitter-typescript.wasm?url'
 import pyQuery from './keyline-queries/python.scm?raw'
 import rsQuery from './keyline-queries/rust.scm?raw'
+import tsQuery from './keyline-queries/typescript.scm?raw'
 import { FluidParser, type LangAsset } from './index.ts'
 
 let singleton: Promise<FluidParser> | null = null
@@ -20,14 +22,19 @@ async function fetchBytes(url: string): Promise<Uint8Array> {
   return new Uint8Array(await res.arrayBuffer())
 }
 
-/** Initialize (once) and return the shared parser for Python + Rust. */
+/** Initialize (once) and return the shared parser for Python + Rust + TypeScript. */
 export function getParser(): Promise<FluidParser> {
   if (!singleton) {
     singleton = (async () => {
-      const [py, rs] = await Promise.all([fetchBytes(pyWasmUrl), fetchBytes(rsWasmUrl)])
+      const [py, rs, ts] = await Promise.all([
+        fetchBytes(pyWasmUrl),
+        fetchBytes(rsWasmUrl),
+        fetchBytes(tsWasmUrl),
+      ])
       const assets: LangAsset[] = [
         { lang: 'py', grammarWasm: py, keyLineQuery: pyQuery },
         { lang: 'rs', grammarWasm: rs, keyLineQuery: rsQuery },
+        { lang: 'ts', grammarWasm: ts, keyLineQuery: tsQuery },
       ]
       // locateFile points web-tree-sitter's Emscripten loader at the core wasm URL.
       return FluidParser.create(assets, { locateFile: () => coreWasmUrl })

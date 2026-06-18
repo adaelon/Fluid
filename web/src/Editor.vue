@@ -5,6 +5,7 @@ import { EditorView } from '@codemirror/view'
 import { basicSetup } from 'codemirror'
 import { python } from '@codemirror/lang-python'
 import { rust } from '@codemirror/lang-rust'
+import { javascript } from '@codemirror/lang-javascript'
 import { GhostStore } from './ghostStore'
 import { ghostField, foldClickHandler, retryClickHandler, refreshGhosts } from './render/ghostField'
 import { fnGutter, explainClickHandler } from './render/gutter'
@@ -108,6 +109,12 @@ function onFontKey(e: KeyboardEvent): void {
 function langExtension(lang: string): Extension {
   if (lang === 'py') return python()
   if (lang === 'rs') return rust()
+  // TS/JS family: one package, flavor toggled by the backend lang tag. These are
+  // highlight-only — generation stays gated to py/rs (isParserLang) for now.
+  if (lang === 'ts') return javascript({ typescript: true })
+  if (lang === 'tsx') return javascript({ typescript: true, jsx: true })
+  if (lang === 'js') return javascript()
+  if (lang === 'jsx') return javascript({ jsx: true })
   return []
 }
 
@@ -135,7 +142,9 @@ function buildState(source: string, lang: string): EditorState {
 }
 
 function isParserLang(l: string): l is ParserLang {
-  return l === 'py' || l === 'rs'
+  // 'ts' generates ghost annotations; 'tsx'/'js'/'jsx' are highlight-only for now
+  // (JSX key-line rules are a separate slice), so they stay out of generation.
+  return l === 'py' || l === 'rs' || l === 'ts'
 }
 
 function wsUrl(): string {

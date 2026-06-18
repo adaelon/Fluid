@@ -35,7 +35,8 @@ pub struct FileNode {
     pub path: String,
     /// Bare file name.
     pub name: String,
-    /// Coarse language tag for the frontend: "py" | "rs" | "md" | "other".
+    /// Coarse language tag for the frontend: "py" | "rs" | "ts" | "tsx" | "js" |
+    /// "jsx" | "md" | "other".
     pub lang: &'static str,
 }
 
@@ -160,6 +161,14 @@ fn lang_of(path: &Path) -> &'static str {
     match path.extension().and_then(|e| e.to_str()) {
         Some("py") => "py",
         Some("rs") => "rs",
+        // TS/JS family: distinct tags so the frontend can pick the right CM6
+        // highlighter (typescript / jsx flavor). These are presentation tags only
+        // — ghost-annotation generation stays gated to py/rs (isParserLang) until
+        // a TS key-line query lands, so a .ts file opens highlighted but read-only.
+        Some("ts") | Some("mts") | Some("cts") => "ts",
+        Some("tsx") => "tsx",
+        Some("js") | Some("mjs") | Some("cjs") => "js",
+        Some("jsx") => "jsx",
         // Markdown gets its own tag so the frontend renders it as a formatted
         // document (Document Render View) instead of plain source. Not a
         // generation language — md never enters the capsule/ghost pipeline.
@@ -225,6 +234,21 @@ mod tests {
         assert_eq!(lang_of(Path::new("README.md")), "md");
         assert_eq!(lang_of(Path::new("docs/guide.markdown")), "md");
         assert_eq!(lang_of(Path::new("a.py")), "py");
+        assert_eq!(lang_of(Path::new("notes.txt")), "other");
+    }
+
+    #[test]
+    fn tags_ts_js_family_for_highlighting() {
+        // TS/JS family map to flavor-specific tags (highlighting only — still
+        // gated out of generation by the frontend until a TS key-line query lands).
+        assert_eq!(lang_of(Path::new("src/app.ts")), "ts");
+        assert_eq!(lang_of(Path::new("a.mts")), "ts");
+        assert_eq!(lang_of(Path::new("ui/Button.tsx")), "tsx");
+        assert_eq!(lang_of(Path::new("legacy.js")), "js");
+        assert_eq!(lang_of(Path::new("esm.mjs")), "js");
+        assert_eq!(lang_of(Path::new("Widget.jsx")), "jsx");
+        // Unchanged neighbors.
+        assert_eq!(lang_of(Path::new("main.rs")), "rs");
         assert_eq!(lang_of(Path::new("notes.txt")), "other");
     }
 

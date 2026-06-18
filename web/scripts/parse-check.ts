@@ -17,6 +17,7 @@ const scm = (n: string) => readFileSync(join(web, 'src/parser/keyline-queries', 
 const assets: LangAsset[] = [
   { lang: 'py', grammarWasm: grammar('python'), keyLineQuery: scm('python') },
   { lang: 'rs', grammarWasm: grammar('rust'), keyLineQuery: scm('rust') },
+  { lang: 'ts', grammarWasm: grammar('typescript'), keyLineQuery: scm('typescript') },
 ];
 
 const samples: Array<{ label: string; lang: ParserLang; path: string }> = [
@@ -34,3 +35,87 @@ for (const s of samples) {
     console.log(`  ${fn.name}  L${fn.lineRange[0]}-${fn.lineRange[1]}  keyLines=[${ks.join(',')}]`);
   }
 }
+
+// --- TypeScript: synthetic sample with known constructs, asserted (B2 gate) ---
+// Covers every roster shape (function decl, const arrow, const function-expr, class
+// method, class-field arrow, nested arrow) and key-line kinds (lexical_declaration,
+// re-assignment, value return, throw, if, statement call, awaited call).
+const TS_SAMPLE = `import { dep } from './dep'
+
+export function alpha(n: number): number {
+  const x = n * 2
+  if (x > 10) {
+    return x
+  }
+  return 0
+}
+
+const beta = (s: string): string => {
+  doThing()
+  return s.trim()
+}
+
+const gamma = function (a: number) {
+  let total = 0
+  total += a
+  return total
+}
+
+class Widget {
+  count = 0
+  handle = async (): Promise<void> => {
+    await save()
+    this.count += 1
+  }
+  render(): string {
+    throw new Error('x')
+  }
+}
+`;
+
+const tsParse = parser.parse('ts', TS_SAMPLE);
+console.log(`\n===== TS synthetic =====  (${tsParse.roster.length} functions)`);
+for (const fn of tsParse.roster) {
+  const ks = tsParse.keyLines.get(fn.id) ?? [];
+  console.log(`  ${fn.name}  L${fn.lineRange[0]}-${fn.lineRange[1]}  keyLines=[${ks.join(',')}]`);
+}
+
+// 1-based line number of the first line containing `needle`.
+const lineOf = (needle: string): number =>
+  TS_SAMPLE.split('\n').findIndex((l) => l.includes(needle)) + 1;
+
+// Resolve a function's key-line set by name (roster ids are name#startLine).
+const keyLinesOf = (name: string): number[] => {
+  const fn = tsParse.roster.find((r) => r.name === name);
+  if (!fn) return [];
+  return tsParse.keyLines.get(fn.id) ?? [];
+};
+
+const failures: string[] = [];
+const expect = (cond: boolean, msg: string) => { if (!cond) failures.push(msg); };
+
+// Roster: exactly the six function shapes; class `Widget` and the plain `count`
+// field are NOT functions.
+const names = tsParse.roster.map((r) => r.name).sort();
+expect(
+  JSON.stringify(names) === JSON.stringify(['alpha', 'beta', 'gamma', 'handle', 'render']),
+  `roster names = ${JSON.stringify(names)} (want alpha,beta,gamma,handle,render)`,
+);
+
+// Key lines land in the right host (innermostHost), by content not raw numbers.
+expect(keyLinesOf('alpha').includes(lineOf('const x = n * 2')), 'alpha: const init');
+expect(keyLinesOf('alpha').includes(lineOf('if (x > 10)')), 'alpha: if head');
+expect(keyLinesOf('alpha').includes(lineOf('return x')), 'alpha: value return');
+expect(keyLinesOf('beta').includes(lineOf('doThing()')), 'beta: statement call');
+expect(keyLinesOf('beta').includes(lineOf('return s.trim()')), 'beta: value return');
+expect(keyLinesOf('gamma').includes(lineOf('total += a')), 'gamma: compound assign');
+expect(keyLinesOf('handle').includes(lineOf('await save()')), 'handle: awaited call');
+expect(keyLinesOf('handle').includes(lineOf('this.count += 1')), 'handle: compound assign');
+expect(keyLinesOf('render').includes(lineOf("throw new Error('x')")), 'render: throw');
+
+if (failures.length) {
+  console.error(`\n✗ TS assertions FAILED (${failures.length}):`);
+  for (const f of failures) console.error(`  - ${f}`);
+  process.exit(1);
+}
+console.log('\n✓ TS roster + key-line assertions passed');
