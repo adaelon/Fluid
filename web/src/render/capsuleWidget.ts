@@ -22,7 +22,6 @@ export class CapsuleWidget extends WidgetType {
     return (
       other.cap.fnId === this.cap.fnId &&
       other.folded === this.folded &&
-      other.cap.signature === this.cap.signature &&
       other.cap.summary === this.cap.summary &&
       other.cap.complexity === this.cap.complexity &&
       other.cap.io === this.cap.io
@@ -38,20 +37,16 @@ export class CapsuleWidget extends WidgetType {
 
     if (this.folded) return root
 
-    // Single-line header: signature · summary … complexity · io (§7.2, ADR-0016).
-    const sig = document.createElement('span')
-    sig.className = 'fluid-cap-sig'
-    sig.textContent = this.cap.signature || this.cap.fnId
-
+    // Single-line header: summary … complexity · io (§7.2, ADR-0016).
     const sum = document.createElement('span')
     sum.className = 'fluid-cap-sum'
-    sum.textContent = this.cap.summary ? '· ' + this.cap.summary : ''
+    sum.textContent = this.cap.summary || ''
 
     const meta = document.createElement('span')
     meta.className = 'fluid-cap-meta'
     meta.textContent = [this.cap.complexity, this.cap.io].filter(Boolean).join(' · ')
 
-    root.append(sig, sum, meta)
+    root.append(sum, meta)
     return root
   }
 

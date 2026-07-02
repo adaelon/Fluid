@@ -6,7 +6,7 @@ import type { TreeEntry } from './tree'
 defineProps<{ entry: TreeEntry; active: string | null }>()
 const emit = defineEmits<{ select: [node: FileNode] }>()
 
-const open = ref(true)
+const open = ref(false)
 
 function selectFile(path: string, name: string, lang: string) {
   emit('select', { path, name, lang: lang as Lang })
