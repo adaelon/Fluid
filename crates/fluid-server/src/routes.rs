@@ -24,19 +24,23 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::cache_store::{Capsule, CacheStore, CapsuleEntry, LineAnnotation, Translation};
-use crate::translate::{build_translate_prompt, protect_code, restore_code, split_chunks};
+use crate::cache_store::{CacheStore, Capsule, CapsuleEntry, LineAnnotation, Translation};
 use crate::context_assembler::{
-    assemble_gen_context, build_explain_decl_prompt, build_explain_line_prompt, build_gen_prompt,
-    build_query_planning_prompt,
-    build_query_prompt, cross_file_targets, query_degraded_names, slice_cross_file_sources,
-    slice_requested_sources, slice_span, CrossFileTarget, FunctionSpan, GenContext, QueryFocus,
-    SharedContext, QUERY_FETCH_BUDGET_CHARS,
+    assemble_file_set_context, assemble_gen_context, build_explain_decl_prompt,
+    build_explain_line_prompt, build_file_set_query_planning_prompt, build_file_set_query_prompt,
+    build_gen_prompt, build_query_planning_prompt, build_query_prompt, cross_file_targets,
+    file_set_fetchable_targets, query_degraded_names, slice_cross_file_sources,
+    slice_file_set_sources, slice_requested_sources, slice_span, CrossFileTarget, FileSetContext,
+    FileSetSourceTarget, FunctionSpan, GenContext, QueryFocus, SharedContext,
+    QUERY_FETCH_BUDGET_CHARS,
 };
 use crate::graph_loader::{GraphLoader, KnowledgeGraph};
-use crate::llm_proxy::{parse_fetch_plan, parse_generation, parse_line_annotation, LlmProxy, SseDecoder};
+use crate::llm_proxy::{
+    parse_fetch_plan, parse_generation, parse_line_annotation, LlmProxy, SseDecoder,
+};
 use crate::project_reader::{FileNode, ProjectReader, ReadErr};
 use crate::settings::{mask_key, rewrite_env, LlmConfig};
+use crate::translate::{build_translate_prompt, protect_code, restore_code, split_chunks};
 use futures_util::stream::{self, StreamExt};
 
 /// The root-bound trio: file reader + optional knowledge graph + bypass cache.
@@ -85,7 +89,11 @@ impl AppState {
         prompt_version: &'static str,
     ) -> Self {
         Self::with_project(
-            Some(ProjectCtx { reader, graph, cache }),
+            Some(ProjectCtx {
+                reader,
+                graph,
+                cache,
+            }),
             llm_config,
             env_path,
             prompt_version,
@@ -111,7 +119,10 @@ impl AppState {
         let proxy = LlmProxy::from_config(&llm_config).map(Arc::new);
         Self {
             project: RwLock::new(project),
-            llm: RwLock::new(LlmState { config: llm_config, proxy }),
+            llm: RwLock::new(LlmState {
+                config: llm_config,
+                proxy,
+            }),
             env_path,
             prompt_version,
         }
@@ -138,12 +149,16 @@ pub fn router(state: Shared) -> Router {
         .route("/api/project/graph", get(graph))
         .route("/api/project/open", post(open_folder))
         .route("/api/project/pick", post(pick_folder))
-        .route("/api/settings/llm", get(get_llm_settings).post(put_llm_settings))
+        .route(
+            "/api/settings/llm",
+            get(get_llm_settings).post(put_llm_settings),
+        )
         .route("/api/settings/llm/test", post(test_llm_settings))
         .route("/api/explain-line", post(explain_line))
         .route("/api/translate", get(translate_ws))
         .route("/api/generate", get(generate_ws))
         .route("/api/query", get(query_ws))
+        .route("/api/query-files", get(query_files_ws))
         // Anything else → the embedded frontend SPA (packaging: one binary = whole app).
         .fallback(crate::static_assets::static_handler)
         .with_state(state)
@@ -216,17 +231,28 @@ struct OpenResponse {
 /// in a fresh reader + graph + cache built for the new root (same model/prompt so
 /// the cache key inputs are unchanged). Traversal protection is per-reader, so the
 /// new reader enforces containment against the new root automatically.
-async fn open_folder(State(state): State<Shared>, Json(req): Json<OpenRequest>) -> impl IntoResponse {
+async fn open_folder(
+    State(state): State<Shared>,
+    Json(req): Json<OpenRequest>,
+) -> impl IntoResponse {
     let reader = match ProjectReader::new(PathBuf::from(&req.path)) {
         Ok(r) => r,
         Err(e) => {
-            return (StatusCode::BAD_REQUEST, format!("cannot open directory: {e}")).into_response()
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("cannot open directory: {e}"),
+            )
+                .into_response()
         }
     };
     let graph = GraphLoader::load(reader.root());
     let cache = CacheStore::new(reader.root(), state.model(), state.prompt_version);
     let root = reader.root().display().to_string();
-    *state.project.write().unwrap() = Some(ProjectCtx { reader, graph, cache });
+    *state.project.write().unwrap() = Some(ProjectCtx {
+        reader,
+        graph,
+        cache,
+    });
     eprintln!("[open] switched project root to {root}");
     (StatusCode::OK, Json(OpenResponse { root })).into_response()
 }
@@ -318,7 +344,10 @@ async fn put_llm_settings(
     // lines/comments survive; absent file → write just the three lines.
     let existing = std::fs::read_to_string(&state.env_path).unwrap_or_default();
     if let Err(e) = std::fs::write(&state.env_path, rewrite_env(&existing, &cfg)) {
-        eprintln!("[settings] warning: .env write-back failed ({}): {e}", state.env_path.display());
+        eprintln!(
+            "[settings] warning: .env write-back failed ({}): {e}",
+            state.env_path.display()
+        );
     }
 
     (StatusCode::OK, Json(LlmSettingsResponse::of(&cfg))).into_response()
@@ -342,7 +371,11 @@ fn apply_llm_settings(
             Some(k) if !k.trim().is_empty() => k,
             _ => s.config.api_key.clone(), // keep existing (write-only)
         };
-        s.config = LlmConfig { base_url, model, api_key: key };
+        s.config = LlmConfig {
+            base_url,
+            model,
+            api_key: key,
+        };
         s.proxy = LlmProxy::from_config(&s.config).map(Arc::new);
         (s.config.clone(), s.config.model != old_model)
     }; // llm lock dropped before touching the project lock (no nested ordering).
@@ -423,8 +456,14 @@ async fn test_llm_settings(
     };
     // Minimal probe: a one-token reply is enough to prove the endpoint + key +
     // model are reachable. We discard the content; only success/failure matters.
-    match proxy.complete("你是连接测试助手，只回复 ok。", "ping").await {
-        Ok(_) => Json(LlmTestResponse { ok: true, error: None }),
+    match proxy
+        .complete("你是连接测试助手，只回复 ok。", "ping")
+        .await
+    {
+        Ok(_) => Json(LlmTestResponse {
+            ok: true,
+            error: None,
+        }),
         Err(e) => Json(LlmTestResponse {
             ok: false,
             error: Some(e.to_string()),
@@ -533,7 +572,10 @@ async fn run_generation(state: &AppState, req: GenerateRequest) -> Vec<GenFrame>
 
         // 2. Cache: a hit returns the stored entry with zero token, no LLM (核心律).
         if let Some(entry) = proj.cache.get(&fn_source) {
-            eprintln!("[generate] cache HIT {}#{} — zero token", req.file_path, req.func.name);
+            eprintln!(
+                "[generate] cache HIT {}#{} — zero token",
+                req.file_path, req.func.name
+            );
             GenStep::Ready(build_frames(true, entry.capsule, entry.lines))
         } else if llm.is_none() {
             // 3a. Miss but no LLM configured.
@@ -543,28 +585,45 @@ async fn run_generation(state: &AppState, req: GenerateRequest) -> Vec<GenFrame>
             let ctx =
                 assemble_gen_context(proj.graph.graph(), &req.file_path, &req.roster, &req.shared);
             let (system, user) = build_gen_prompt(&req.func, &fn_source, &req.key_lines, &ctx);
-            GenStep::NeedLlm { system, user, fn_source }
+            GenStep::NeedLlm {
+                system,
+                user,
+                fn_source,
+            }
         }
     }; // project lock dropped here — before any await.
 
     let (system, user, fn_source) = match step {
         GenStep::Ready(frames) => return frames,
-        GenStep::NeedLlm { system, user, fn_source } => (system, user, fn_source),
+        GenStep::NeedLlm {
+            system,
+            user,
+            fn_source,
+        } => (system, user, fn_source),
     };
 
     let llm = llm.as_ref().expect("NeedLlm implies llm is Some");
-    eprintln!("[generate] cache MISS {}#{} — calling LLM ({})", req.file_path, req.func.name, llm.model);
+    eprintln!(
+        "[generate] cache MISS {}#{} — calling LLM ({})",
+        req.file_path, req.func.name, llm.model
+    );
     let content = match llm.complete(&system, &user).await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[generate] LLM error {}#{}: {e}", req.file_path, req.func.name);
+            eprintln!(
+                "[generate] LLM error {}#{}: {e}",
+                req.file_path, req.func.name
+            );
             return vec![err(format!("LLM error: {e}"))];
         }
     };
     let (capsule, lines) = match parse_generation(&content, &req.func.id) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("[generate] LLM parse error {}#{}: {e}", req.file_path, req.func.name);
+            eprintln!(
+                "[generate] LLM parse error {}#{}: {e}",
+                req.file_path, req.func.name
+            );
             return vec![err(format!("LLM parse error: {e}"))];
         }
     };
@@ -622,12 +681,19 @@ async fn handle_generate_socket(mut socket: WebSocket, state: Shared) {
 }
 
 /// Serialize a frame and inject `reqId` before sending it as a text message.
-async fn send_frame(socket: &mut WebSocket, req_id: &str, frame: &GenFrame) -> Result<(), axum::Error> {
-    let mut v = serde_json::to_value(frame).unwrap_or_else(|_| {
-        serde_json::json!({ "kind": "error", "message": "frame serialize failed" })
-    });
+async fn send_frame(
+    socket: &mut WebSocket,
+    req_id: &str,
+    frame: &GenFrame,
+) -> Result<(), axum::Error> {
+    let mut v = serde_json::to_value(frame).unwrap_or_else(
+        |_| serde_json::json!({ "kind": "error", "message": "frame serialize failed" }),
+    );
     if let serde_json::Value::Object(map) = &mut v {
-        map.insert("reqId".to_string(), serde_json::Value::String(req_id.to_string()));
+        map.insert(
+            "reqId".to_string(),
+            serde_json::Value::String(req_id.to_string()),
+        );
     }
     socket.send(Message::Text(v.to_string())).await
 }
@@ -699,7 +765,10 @@ async fn run_explain_line(
         // The target line must sit inside the enclosing function span.
         let [start, end] = req.func.line_range;
         if req.line_number < start || req.line_number > end {
-            return Err((StatusCode::BAD_REQUEST, "lineNumber outside function".into()));
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "lineNumber outside function".into(),
+            ));
         }
 
         if let Some(line) = proj.cache.get_line(&fn_source, req.line_number) {
@@ -727,13 +796,21 @@ async fn run_explain_line(
                 ),
                 None => build_explain_line_prompt(&req.func, &fn_source, req.line_number, &ctx),
             };
-            Step::NeedLlm { system, user, fn_source }
+            Step::NeedLlm {
+                system,
+                user,
+                fn_source,
+            }
         }
     }; // project lock dropped here — before any await.
 
     let (system, user, fn_source) = match step {
         Step::Ready(line) => return Ok(line),
-        Step::NeedLlm { system, user, fn_source } => (system, user, fn_source),
+        Step::NeedLlm {
+            system,
+            user,
+            fn_source,
+        } => (system, user, fn_source),
     };
 
     let llm = llm.as_ref().expect("NeedLlm implies llm is Some");
@@ -862,11 +939,21 @@ async fn translate_one_chunk(llm: &LlmProxy, idx: usize, chunk: &str) -> Option<
 #[derive(Debug, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 enum TranslateFrame {
-    Cached { text: String },
-    Total { total: usize },
-    Chunk { index: usize, text: String, ok: bool },
+    Cached {
+        text: String,
+    },
+    Total {
+        total: usize,
+    },
+    Chunk {
+        index: usize,
+        text: String,
+        ok: bool,
+    },
     Done,
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 /// Serialize + send one translate frame. Err if the peer is gone.
@@ -874,9 +961,9 @@ async fn send_translate_frame(
     socket: &mut WebSocket,
     frame: &TranslateFrame,
 ) -> Result<(), axum::Error> {
-    let v = serde_json::to_value(frame).unwrap_or_else(|_| {
-        serde_json::json!({ "kind": "error", "message": "frame serialize failed" })
-    });
+    let v = serde_json::to_value(frame).unwrap_or_else(
+        |_| serde_json::json!({ "kind": "error", "message": "frame serialize failed" }),
+    );
     socket.send(Message::Text(v.to_string())).await
 }
 
@@ -894,7 +981,11 @@ async fn run_translate_stream(
     let llm = state.llm_proxy();
     enum Step {
         Cached(String),
-        NeedLlm { masked: String, blocks: Vec<String>, source: String },
+        NeedLlm {
+            masked: String,
+            blocks: Vec<String>,
+            source: String,
+        },
         Err(String),
     }
 
@@ -914,7 +1005,11 @@ async fn run_translate_stream(
                     } else {
                         // Deterministic: pull code blocks out before the model sees them.
                         let (masked, blocks) = protect_code(&source);
-                        Step::NeedLlm { masked, blocks, source }
+                        Step::NeedLlm {
+                            masked,
+                            blocks,
+                            source,
+                        }
                     }
                 }
             },
@@ -929,7 +1024,11 @@ async fn run_translate_stream(
         Step::Err(message) => {
             return send_translate_frame(socket, &TranslateFrame::Error { message }).await;
         }
-        Step::NeedLlm { masked, blocks, source } => (masked, blocks, source),
+        Step::NeedLlm {
+            masked,
+            blocks,
+            source,
+        } => (masked, blocks, source),
     };
 
     let llm = llm.as_ref().expect("NeedLlm implies llm is Some");
@@ -966,7 +1065,15 @@ async fn run_translate_stream(
         any_ok |= ok;
         let restored = restore_code(&text, &blocks);
         restored_parts.push(restored.clone());
-        send_translate_frame(socket, &TranslateFrame::Chunk { index, text: restored, ok }).await?;
+        send_translate_frame(
+            socket,
+            &TranslateFrame::Chunk {
+                index,
+                text: restored,
+                ok,
+            },
+        )
+        .await?;
     }
 
     // No chunk translated → real failure (don't cache an all-English "translation").
@@ -974,7 +1081,9 @@ async fn run_translate_stream(
         eprintln!("[translate] all chunks failed {file_path}");
         return send_translate_frame(
             socket,
-            &TranslateFrame::Error { message: "全部分块翻译失败".into() },
+            &TranslateFrame::Error {
+                message: "全部分块翻译失败".into(),
+            },
         )
         .await;
     }
@@ -983,7 +1092,10 @@ async fn run_translate_stream(
     // source so an edit invalidates it.
     let full = restored_parts.concat();
     if let Some(proj) = state.project.read().unwrap().as_ref() {
-        if let Err(e) = proj.cache.put_translation(&source, &Translation { text: full }) {
+        if let Err(e) = proj
+            .cache
+            .put_translation(&source, &Translation { text: full })
+        {
             eprintln!("[translate] warning: cache put failed: {e}");
         }
     }
@@ -1009,13 +1121,18 @@ async fn handle_translate_socket(mut socket: WebSocket, state: Shared) {
             Err(e) => {
                 let _ = send_translate_frame(
                     &mut socket,
-                    &TranslateFrame::Error { message: format!("bad request: {e}") },
+                    &TranslateFrame::Error {
+                        message: format!("bad request: {e}"),
+                    },
                 )
                 .await;
                 continue;
             }
         };
-        if run_translate_stream(&state, &req.file_path, &mut socket).await.is_err() {
+        if run_translate_stream(&state, &req.file_path, &mut socket)
+            .await
+            .is_err()
+        {
             return; // peer gone
         }
     }
@@ -1066,6 +1183,15 @@ struct QueryRequest {
     shared: SharedContext,
 }
 
+#[derive(Deserialize)]
+struct QueryFilesRequest {
+    #[serde(rename = "reqId", default)]
+    req_id: String,
+    #[serde(rename = "filePaths")]
+    file_paths: Vec<String>,
+    question: String,
+}
+
 /// One outbound frame on the `/api/query` socket (kebab `kind`: `delta` / `done` /
 /// `error`); `reqId` injected by the sender.
 #[derive(Debug, PartialEq, Serialize)]
@@ -1090,6 +1216,20 @@ enum QueryPlan {
     /// Boxed so the (rare) two-phase variant doesn't bloat every `QueryPlan` value
     /// (`clippy::large_enum_variant`) — the common path is `Direct`.
     Degraded(Box<DegradedPlan>),
+}
+
+enum QueryFilesPlan {
+    Err(String),
+    Direct { system: String, user: String },
+    Degraded(Box<QueryFilesDegradedPlan>),
+}
+
+struct QueryFilesDegradedPlan {
+    planning_system: String,
+    planning_user: String,
+    ctx: FileSetContext,
+    fetchable: Vec<FileSetSourceTarget>,
+    sources: BTreeMap<String, String>,
 }
 
 /// Everything `run_query` needs to run the two-phase fetch after the lock drops —
@@ -1211,6 +1351,53 @@ fn prepare_query(state: &AppState, req: &QueryRequest) -> QueryPlan {
     }))
 }
 
+fn prepare_query_files(state: &AppState, req: &QueryFilesRequest) -> QueryFilesPlan {
+    let guard = state.project.read().unwrap();
+    let Some(proj) = guard.as_ref() else {
+        return QueryFilesPlan::Err("no project open".into());
+    };
+
+    let ctx = match assemble_file_set_context(proj.graph.graph(), &req.file_paths) {
+        Ok(ctx) => ctx,
+        Err(e) => return QueryFilesPlan::Err(e),
+    };
+
+    if state.llm_proxy().is_none() {
+        return QueryFilesPlan::Err("LLM not configured: set OPENCODE_API_KEY".into());
+    }
+
+    let mut sources: BTreeMap<String, String> = BTreeMap::new();
+    let mut fetchable = Vec::new();
+    for t in file_set_fetchable_targets(&ctx) {
+        let have = sources.contains_key(&t.file_path)
+            || match proj.reader.read_file(&t.file_path) {
+                Ok(s) => {
+                    sources.insert(t.file_path.clone(), s);
+                    true
+                }
+                Err(_) => false,
+            };
+        if have {
+            fetchable.push(t);
+        }
+    }
+
+    if !fetchable.is_empty() {
+        let (planning_system, planning_user) =
+            build_file_set_query_planning_prompt(&req.question, &ctx, &fetchable);
+        return QueryFilesPlan::Degraded(Box::new(QueryFilesDegradedPlan {
+            planning_system,
+            planning_user,
+            ctx,
+            fetchable,
+            sources,
+        }));
+    }
+
+    let (system, user) = build_file_set_query_prompt(&req.question, &ctx, &[]);
+    QueryFilesPlan::Direct { system, user }
+}
+
 /// Run one query request, streaming `delta` frames to the socket then `done`. On a
 /// pre-LLM error or an LLM/stream failure, a single terminal `error` frame is sent
 /// and the socket is left alive for the next question. `Err(())` means the peer is
@@ -1256,7 +1443,10 @@ async fn run_query(
             let need = match llm.complete(&planning_system, &planning_user).await {
                 Ok(c) => parse_fetch_plan(&c),
                 Err(e) => {
-                    eprintln!("[query] planning failed {}: {e} — answering without fetch", req.file_path);
+                    eprintln!(
+                        "[query] planning failed {}: {e} — answering without fetch",
+                        req.file_path
+                    );
                     Vec::new()
                 }
             };
@@ -1283,7 +1473,11 @@ async fn run_query(
             extra.extend(cross);
             if !extra.is_empty() {
                 let got: Vec<&str> = extra.iter().map(|(n, _)| n.as_str()).collect();
-                eprintln!("[query] {} — fetched sources: {}", req.file_path, got.join(", "));
+                eprintln!(
+                    "[query] {} — fetched sources: {}",
+                    req.file_path,
+                    got.join(", ")
+                );
             }
             let focus_ref = focus.as_ref().map(|(s, n, name)| QueryFocus {
                 source: s.as_str(),
@@ -1294,7 +1488,9 @@ async fn run_query(
         }
     };
 
-    let llm = llm_proxy.as_ref().expect("a non-Err plan implies llm is Some");
+    let llm = llm_proxy
+        .as_ref()
+        .expect("a non-Err plan implies llm is Some");
     eprintln!("[query] {} — streaming ({})", req.file_path, llm.model);
     let resp = match llm.open_chat_stream(&system, &user).await {
         Ok(r) => r,
@@ -1303,7 +1499,9 @@ async fn run_query(
             return send_query_frame(
                 socket,
                 req_id,
-                &QueryFrame::Error { message: format!("LLM error: {e}") },
+                &QueryFrame::Error {
+                    message: format!("LLM error: {e}"),
+                },
             )
             .await
             .map_err(|_| ());
@@ -1320,7 +1518,107 @@ async fn run_query(
                 return send_query_frame(
                     socket,
                     req_id,
-                    &QueryFrame::Error { message: format!("LLM stream error: {e}") },
+                    &QueryFrame::Error {
+                        message: format!("LLM stream error: {e}"),
+                    },
+                )
+                .await
+                .map_err(|_| ());
+            }
+        };
+        for delta in decoder.push(&String::from_utf8_lossy(&bytes)) {
+            send_query_frame(socket, req_id, &QueryFrame::Delta { text: delta })
+                .await
+                .map_err(|_| ())?;
+        }
+    }
+
+    send_query_frame(socket, req_id, &QueryFrame::Done)
+        .await
+        .map_err(|_| ())
+}
+
+async fn run_query_files(
+    state: &AppState,
+    req: QueryFilesRequest,
+    socket: &mut WebSocket,
+    req_id: &str,
+) -> Result<(), ()> {
+    let llm_proxy = state.llm_proxy();
+    let (system, user) = match prepare_query_files(state, &req) {
+        QueryFilesPlan::Err(msg) => {
+            return send_query_frame(socket, req_id, &QueryFrame::Error { message: msg })
+                .await
+                .map_err(|_| ());
+        }
+        QueryFilesPlan::Direct { system, user } => (system, user),
+        QueryFilesPlan::Degraded(plan) => {
+            let QueryFilesDegradedPlan {
+                planning_system,
+                planning_user,
+                ctx,
+                fetchable,
+                sources,
+            } = *plan;
+            let llm = llm_proxy.as_ref().expect("Degraded implies llm is Some");
+            eprintln!(
+                "[query-files] planning fetch ({} graph nodes)",
+                fetchable.len()
+            );
+            let need = match llm.complete(&planning_system, &planning_user).await {
+                Ok(c) => parse_fetch_plan(&c),
+                Err(e) => {
+                    eprintln!("[query-files] planning failed: {e} — answering without fetch");
+                    Vec::new()
+                }
+            };
+            let extra =
+                slice_file_set_sources(&fetchable, &sources, &need, QUERY_FETCH_BUDGET_CHARS);
+            if !extra.is_empty() {
+                let got: Vec<&str> = extra.iter().map(|(n, _)| n.as_str()).collect();
+                eprintln!("[query-files] fetched sources: {}", got.join(", "));
+            }
+            build_file_set_query_prompt(&req.question, &ctx, &extra)
+        }
+    };
+
+    let llm = llm_proxy
+        .as_ref()
+        .expect("a non-Err plan implies llm is Some");
+    eprintln!(
+        "[query-files] {} files — streaming ({})",
+        req.file_paths.len(),
+        llm.model
+    );
+    let resp = match llm.open_chat_stream(&system, &user).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[query-files] LLM error: {e}");
+            return send_query_frame(
+                socket,
+                req_id,
+                &QueryFrame::Error {
+                    message: format!("LLM error: {e}"),
+                },
+            )
+            .await
+            .map_err(|_| ());
+        }
+    };
+
+    let mut stream = resp.bytes_stream();
+    let mut decoder = SseDecoder::new();
+    while let Some(chunk) = stream.next().await {
+        let bytes = match chunk {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("[query-files] stream error: {e}");
+                return send_query_frame(
+                    socket,
+                    req_id,
+                    &QueryFrame::Error {
+                        message: format!("LLM stream error: {e}"),
+                    },
                 )
                 .await
                 .map_err(|_| ());
@@ -1342,6 +1640,10 @@ async fn query_ws(ws: WebSocketUpgrade, State(state): State<Shared>) -> impl Int
     ws.on_upgrade(move |socket| handle_query_socket(socket, state))
 }
 
+async fn query_files_ws(ws: WebSocketUpgrade, State(state): State<Shared>) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_query_files_socket(socket, state))
+}
+
 /// Drive one `/api/query` socket: read question frames, stream each answer back
 /// tagged with the request's `reqId`.
 async fn handle_query_socket(mut socket: WebSocket, state: Shared) {
@@ -1358,7 +1660,9 @@ async fn handle_query_socket(mut socket: WebSocket, state: Shared) {
                 let _ = send_query_frame(
                     &mut socket,
                     "",
-                    &QueryFrame::Error { message: format!("bad request: {e}") },
+                    &QueryFrame::Error {
+                        message: format!("bad request: {e}"),
+                    },
                 )
                 .await;
                 continue;
@@ -1371,17 +1675,53 @@ async fn handle_query_socket(mut socket: WebSocket, state: Shared) {
     }
 }
 
+/// Drive one `/api/query-files` socket: selected-file-set relationship questions.
+async fn handle_query_files_socket(mut socket: WebSocket, state: Shared) {
+    while let Some(Ok(msg)) = socket.recv().await {
+        let text = match msg {
+            Message::Text(t) => t,
+            Message::Close(_) => break,
+            _ => continue,
+        };
+
+        let req: QueryFilesRequest = match serde_json::from_str(&text) {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = send_query_frame(
+                    &mut socket,
+                    "",
+                    &QueryFrame::Error {
+                        message: format!("bad request: {e}"),
+                    },
+                )
+                .await;
+                continue;
+            }
+        };
+        let req_id = req.req_id.clone();
+        if run_query_files(&state, req, &mut socket, &req_id)
+            .await
+            .is_err()
+        {
+            return; // peer gone
+        }
+    }
+}
+
 /// Serialize a query frame and inject `reqId` before sending it as a text message.
 async fn send_query_frame(
     socket: &mut WebSocket,
     req_id: &str,
     frame: &QueryFrame,
 ) -> Result<(), axum::Error> {
-    let mut v = serde_json::to_value(frame).unwrap_or_else(|_| {
-        serde_json::json!({ "kind": "error", "message": "frame serialize failed" })
-    });
+    let mut v = serde_json::to_value(frame).unwrap_or_else(
+        |_| serde_json::json!({ "kind": "error", "message": "frame serialize failed" }),
+    );
     if let serde_json::Value::Object(map) = &mut v {
-        map.insert("reqId".to_string(), serde_json::Value::String(req_id.to_string()));
+        map.insert(
+            "reqId".to_string(),
+            serde_json::Value::String(req_id.to_string()),
+        );
     }
     socket.send(Message::Text(v.to_string())).await
 }
@@ -1461,7 +1801,11 @@ mod tests {
         let reader = ProjectReader::new(root.to_path_buf()).unwrap();
         let graph = GraphLoader::load(root);
         let cache = CacheStore::new(root, state.model(), state.prompt_version);
-        *state.project.write().unwrap() = Some(ProjectCtx { reader, graph, cache });
+        *state.project.write().unwrap() = Some(ProjectCtx {
+            reader,
+            graph,
+            cache,
+        });
     }
 
     fn req(file_path: &str, line_range: [u32; 2]) -> GenerateRequest {
@@ -1586,10 +1930,18 @@ mod tests {
         // After swap: tree lists b.py only; a.py is now outside the (new) root.
         let guard = state.project.read().unwrap();
         let proj = guard.as_ref().unwrap();
-        let names: Vec<String> = proj.reader.list_files().into_iter().map(|f| f.path).collect();
+        let names: Vec<String> = proj
+            .reader
+            .list_files()
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
         assert_eq!(names, vec!["b.py"]);
         assert_eq!(proj.reader.read_file("b.py").unwrap(), "y = 2\n");
-        assert!(matches!(proj.reader.read_file("a.py"), Err(ReadErr::NotFound)));
+        assert!(matches!(
+            proj.reader.read_file("a.py"),
+            Err(ReadErr::NotFound)
+        ));
     }
 
     #[test]
@@ -1604,7 +1956,10 @@ mod tests {
         // Traversal / absolute paths are still refused against the new root.
         let guard = state.project.read().unwrap();
         let proj = guard.as_ref().unwrap();
-        assert!(matches!(proj.reader.read_file("../a.py"), Err(ReadErr::Forbidden)));
+        assert!(matches!(
+            proj.reader.read_file("../a.py"),
+            Err(ReadErr::Forbidden)
+        ));
         assert!(matches!(
             proj.reader.read_file("b.py/../../etc"),
             Err(ReadErr::Forbidden)
@@ -1654,7 +2009,9 @@ mod tests {
         let tmp = TmpDir::new();
         std::fs::write(tmp.path().join("a.py"), "def f():\n    return 1\n").unwrap();
         let state = make_state(tmp.path(), "");
-        let err = run_explain_line(&state, explain_req("a.py", [5, 9], 5)).await.unwrap_err();
+        let err = run_explain_line(&state, explain_req("a.py", [5, 9], 5))
+            .await
+            .unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 
@@ -1664,7 +2021,9 @@ mod tests {
         std::fs::write(tmp.path().join("a.py"), "def f():\n    return 1\n").unwrap();
         let state = make_state(tmp.path(), "");
         // Line 9 is outside the function span [1, 2].
-        let err = run_explain_line(&state, explain_req("a.py", [1, 2], 9)).await.unwrap_err();
+        let err = run_explain_line(&state, explain_req("a.py", [1, 2], 9))
+            .await
+            .unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert!(err.1.contains("outside function"));
     }
@@ -1674,7 +2033,9 @@ mod tests {
         let tmp = TmpDir::new();
         std::fs::write(tmp.path().join("a.py"), "def f():\n    return 1\n").unwrap();
         let state = make_state(tmp.path(), "");
-        let err = run_explain_line(&state, explain_req("a.py", [1, 2], 2)).await.unwrap_err();
+        let err = run_explain_line(&state, explain_req("a.py", [1, 2], 2))
+            .await
+            .unwrap_err();
         assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
         assert!(err.1.contains("LLM not configured"));
     }
@@ -1683,7 +2044,9 @@ mod tests {
     async fn explain_line_missing_file_is_not_found() {
         let tmp = TmpDir::new();
         let state = make_state(tmp.path(), "");
-        let err = run_explain_line(&state, explain_req("nope.py", [1, 2], 1)).await.unwrap_err();
+        let err = run_explain_line(&state, explain_req("nope.py", [1, 2], 1))
+            .await
+            .unwrap_err();
         assert_eq!(err.0, StatusCode::NOT_FOUND);
     }
 
@@ -1706,14 +2069,50 @@ mod tests {
         }
     }
 
+    fn query_files_req(file_paths: &[&str]) -> QueryFilesRequest {
+        QueryFilesRequest {
+            req_id: "qf1".into(),
+            file_paths: file_paths.iter().map(|p| p.to_string()).collect(),
+            question: "这些文件怎么协作？".into(),
+        }
+    }
+
+    fn write_test_graph(root: &Path) {
+        let dir = root.join(".understand-anything");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("knowledge-graph.json"),
+            r#"{
+              "nodes": [
+                {"id":"file:a.py","type":"file","name":"a.py","filePath":"a.py","summary":"文件 A"},
+                {"id":"file:b.py","type":"file","name":"b.py","filePath":"b.py","summary":"文件 B"},
+                {"id":"function:a.py:fa","type":"function","name":"fa","filePath":"a.py","summary":"fa 摘要","lineRange":[1,3]},
+                {"id":"function:b.py:fb","type":"function","name":"fb","filePath":"b.py","summary":"fb 摘要","lineRange":[4,6]},
+                {"id":"function:c.py:fc","type":"function","name":"fc","filePath":"c.py","summary":"fc 摘要","lineRange":[7,9]}
+              ],
+              "edges": [
+                {"source":"function:a.py:fa","target":"function:b.py:fb","type":"calls"},
+                {"source":"function:a.py:fa","target":"function:c.py:fc","type":"imports"}
+              ]
+            }"#,
+        )
+        .unwrap();
+    }
+
     #[test]
     fn query_frame_serializes_with_kebab_kind() {
-        let v = serde_json::to_value(QueryFrame::Delta { text: "你好".into() }).unwrap();
+        let v = serde_json::to_value(QueryFrame::Delta {
+            text: "你好".into(),
+        })
+        .unwrap();
         assert_eq!(v["kind"], "delta");
         assert_eq!(v["text"], "你好");
         let v = serde_json::to_value(QueryFrame::Done).unwrap();
         assert_eq!(v["kind"], "done");
-        let v = serde_json::to_value(QueryFrame::Error { message: "x".into() }).unwrap();
+        let v = serde_json::to_value(QueryFrame::Error {
+            message: "x".into(),
+        })
+        .unwrap();
         assert_eq!(v["kind"], "error");
         assert_eq!(v["message"], "x");
     }
@@ -1773,16 +2172,120 @@ mod tests {
         }
     }
 
+    // — S-FSQ-2 /api/query-files —
+
+    #[test]
+    fn prepare_query_files_requires_at_least_two_files() {
+        let tmp = TmpDir::new();
+        let state = make_state(tmp.path(), "");
+        match prepare_query_files(&state, &query_files_req(&["a.py"])) {
+            QueryFilesPlan::Err(msg) => assert!(msg.contains("select at least 2 files")),
+            _ => panic!("expected Err for small selection"),
+        }
+    }
+
+    #[test]
+    fn prepare_query_files_without_graph_is_an_error() {
+        let tmp = TmpDir::new();
+        let state = make_state(tmp.path(), "");
+        match prepare_query_files(&state, &query_files_req(&["a.py", "b.py"])) {
+            QueryFilesPlan::Err(msg) => assert!(msg.contains("knowledge graph not found")),
+            _ => panic!("expected Err without graph"),
+        }
+    }
+
+    #[test]
+    fn prepare_query_files_rejects_selected_file_missing_from_graph() {
+        let tmp = TmpDir::new();
+        write_test_graph(tmp.path());
+        let state = make_state(tmp.path(), "");
+        match prepare_query_files(&state, &query_files_req(&["a.py", "missing.py"])) {
+            QueryFilesPlan::Err(msg) => {
+                assert!(msg.contains("selected file not found in graph: missing.py"))
+            }
+            _ => panic!("expected Err for missing graph file node"),
+        }
+    }
+
+    #[test]
+    fn prepare_query_files_with_graph_without_llm_is_an_error() {
+        let tmp = TmpDir::new();
+        write_test_graph(tmp.path());
+        let state = make_state(tmp.path(), "");
+        match prepare_query_files(&state, &query_files_req(&["a.py", "b.py"])) {
+            QueryFilesPlan::Err(msg) => assert!(msg.contains("LLM not configured")),
+            _ => panic!("expected Err without llm"),
+        }
+    }
+
+    #[test]
+    fn prepare_query_files_builds_direct_prompt_from_graph_context() {
+        let tmp = TmpDir::new();
+        write_test_graph(tmp.path());
+        let state = make_state(tmp.path(), "key");
+        match prepare_query_files(&state, &query_files_req(&["a.py", "b.py"])) {
+            QueryFilesPlan::Direct { system, user } => {
+                assert!(system.contains("已选文件集图谱上下文"));
+                assert!(user.contains("- a.py: 文件 A"));
+                assert!(user.contains("- b.py: 文件 B"));
+                assert!(user.contains("fa 摘要"));
+                assert!(user.contains("fb 摘要"));
+                assert!(user.contains("function:a.py:fa -calls-> function:b.py:fb"));
+                assert!(user.contains("function:a.py:fa -imports-> function:c.py:fc"));
+            }
+            _ => panic!("expected Direct plan"),
+        }
+    }
+
+    #[test]
+    fn prepare_query_files_with_readable_graph_spans_builds_degraded_plan() {
+        let tmp = TmpDir::new();
+        write_test_graph(tmp.path());
+        std::fs::write(
+            tmp.path().join("a.py"),
+            "def fa():\n    x = 1\n    return x\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("b.py"),
+            "skip\nskip\nskip\ndef fb():\n    y = 2\n    return y\n",
+        )
+        .unwrap();
+        let state = make_state(tmp.path(), "key");
+        match prepare_query_files(&state, &query_files_req(&["a.py", "b.py"])) {
+            QueryFilesPlan::Degraded(plan) => {
+                assert_eq!(plan.fetchable.len(), 2);
+                assert!(plan
+                    .planning_user
+                    .contains("function:a.py:fa | fa | function | a.py"));
+                assert!(plan
+                    .planning_user
+                    .contains("function:b.py:fb | fb | function | b.py"));
+                assert!(plan.sources.contains_key("a.py"));
+                assert!(plan.sources.contains_key("b.py"));
+            }
+            _ => panic!("expected Degraded plan"),
+        }
+    }
+
     // — U5a settings (ADR-0018) —
 
     #[test]
     fn settings_response_masks_the_key() {
-        let set = LlmConfig { base_url: "b".into(), model: "m".into(), api_key: "sk-xyz9999".into() };
+        let set = LlmConfig {
+            base_url: "b".into(),
+            model: "m".into(),
+            api_key: "sk-xyz9999".into(),
+        };
         let r = LlmSettingsResponse::of(&set);
         assert_eq!(r.key_status, "set");
         assert_eq!(r.key_hint.as_deref(), Some("···9999"));
 
-        let unset = LlmConfig { base_url: "b".into(), model: "m".into(), api_key: "".into() };
+        let unset = LlmConfig {
+            base_url: "b".into(),
+            model: "m".into(),
+            api_key: "".into(),
+        };
         let r2 = LlmSettingsResponse::of(&unset);
         assert_eq!(r2.key_status, "unset");
         assert_eq!(r2.key_hint, None);
@@ -1793,7 +2296,10 @@ mod tests {
     #[test]
     fn resolve_test_key_uses_typed_key_or_falls_back_to_current() {
         // A typed, non-empty key wins (testing a brand-new backend).
-        assert_eq!(resolve_test_key(Some("new-key".into()), "current"), "new-key");
+        assert_eq!(
+            resolve_test_key(Some("new-key".into()), "current"),
+            "new-key"
+        );
         // Blank or whitespace-only typed key → reuse the stored one (write-only).
         assert_eq!(resolve_test_key(Some("".into()), "current"), "current");
         assert_eq!(resolve_test_key(Some("   ".into()), "current"), "current");
@@ -1815,7 +2321,10 @@ mod tests {
         assert!(state.llm_proxy().is_some());
         assert_eq!(state.model(), "m2");
         // The masked response never reveals the kept key beyond its tail.
-        assert_eq!(LlmSettingsResponse::of(&cfg).key_hint.as_deref(), Some("···-key"));
+        assert_eq!(
+            LlmSettingsResponse::of(&cfg).key_hint.as_deref(),
+            Some("···-key")
+        );
     }
 
     #[test]
@@ -1824,7 +2333,12 @@ mod tests {
         let state = make_state(tmp.path(), ""); // unset → proxy None
         assert!(state.llm_proxy().is_none());
 
-        apply_llm_settings(&state, "https://x/v1".into(), "m".into(), Some("new-key".into()));
+        apply_llm_settings(
+            &state,
+            "https://x/v1".into(),
+            "m".into(),
+            Some("new-key".into()),
+        );
         assert!(state.llm_proxy().is_some());
     }
 
@@ -1833,15 +2347,47 @@ mod tests {
         let tmp = TmpDir::new();
         let state = make_state(tmp.path(), "key123"); // model "test-model"
         let fn_source = "def f():\n    return 1\n";
-        let entry = CapsuleEntry { capsule: cap("f#1"), lines: vec![line("f#1", 2)] };
-        state.project.read().unwrap().as_ref().unwrap().cache.put(fn_source, &entry).unwrap();
+        let entry = CapsuleEntry {
+            capsule: cap("f#1"),
+            lines: vec![line("f#1", 2)],
+        };
+        state
+            .project
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .cache
+            .put(fn_source, &entry)
+            .unwrap();
         // Hit under the original model.
-        assert!(state.project.read().unwrap().as_ref().unwrap().cache.get(fn_source).is_some());
+        assert!(state
+            .project
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .cache
+            .get(fn_source)
+            .is_some());
 
-        apply_llm_settings(&state, "https://x/v1".into(), "different-model".into(), None);
+        apply_llm_settings(
+            &state,
+            "https://x/v1".into(),
+            "different-model".into(),
+            None,
+        );
 
         // Cache re-pointed under the new model → the old entry no longer matches.
-        assert!(state.project.read().unwrap().as_ref().unwrap().cache.get(fn_source).is_none());
+        assert!(state
+            .project
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .cache
+            .get(fn_source)
+            .is_none());
     }
 
     #[test]
@@ -1849,11 +2395,30 @@ mod tests {
         let tmp = TmpDir::new();
         let state = make_state(tmp.path(), "key123");
         let fn_source = "def f():\n    return 1\n";
-        let entry = CapsuleEntry { capsule: cap("f#1"), lines: vec![line("f#1", 2)] };
-        state.project.read().unwrap().as_ref().unwrap().cache.put(fn_source, &entry).unwrap();
+        let entry = CapsuleEntry {
+            capsule: cap("f#1"),
+            lines: vec![line("f#1", 2)],
+        };
+        state
+            .project
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .cache
+            .put(fn_source, &entry)
+            .unwrap();
 
         // Same model (only base_url changes) → cache untouched, entry still hits.
         apply_llm_settings(&state, "https://x/v1".into(), "test-model".into(), None);
-        assert!(state.project.read().unwrap().as_ref().unwrap().cache.get(fn_source).is_some());
+        assert!(state
+            .project
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .cache
+            .get(fn_source)
+            .is_some());
     }
 }

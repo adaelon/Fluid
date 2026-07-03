@@ -260,6 +260,11 @@ body {
   color: var(--accent);
 }
 
+.node.file.selected {
+  color: var(--text);
+  background: rgba(126, 231, 135, 0.08);
+}
+
 .caret {
   width: 12px;
   color: var(--muted);
@@ -268,6 +273,18 @@ body {
 
 .node.file .label {
   padding-left: 16px;
+}
+
+.node.file.selectable .label {
+  padding-left: 0;
+}
+
+.file-select {
+  flex: none;
+  width: 13px;
+  height: 13px;
+  margin: 0;
+  accent-color: var(--accent);
 }
 
 /* — Editor pane — */
@@ -471,16 +488,81 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  height: 24px;
+  min-height: 30px;
+  gap: 10px;
   padding: 0 10px;
   background: var(--bg);
   border-bottom: 1px solid var(--border);
 }
 
+.query-head-left,
+.query-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.query-head-left {
+  flex: 1;
+}
+
+.query-head-actions {
+  flex: none;
+}
+
 .query-title {
+  flex: none;
   font-size: 11px;
   color: var(--muted);
   letter-spacing: 0.04em;
+}
+
+.query-scope {
+  display: inline-flex;
+  flex: none;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+.query-scope-btn,
+.query-tool {
+  height: 22px;
+  padding: 0 8px;
+  color: var(--muted);
+  background: transparent;
+  border: none;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.query-scope-btn + .query-scope-btn {
+  border-left: 1px solid var(--border);
+}
+
+.query-scope-btn:hover,
+.query-tool:hover:not(:disabled) {
+  color: var(--text);
+  background: var(--hover);
+}
+
+.query-scope-btn.active,
+.query-tool.active {
+  color: var(--accent);
+  background: var(--active);
+}
+
+.query-tool {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+.query-tool:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
 }
 
 .query-collapse {

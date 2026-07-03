@@ -1,15 +1,30 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import type { FileNode, Lang } from './api'
 import type { TreeEntry } from './tree'
 
-defineProps<{ entry: TreeEntry; active: string | null }>()
-const emit = defineEmits<{ select: [node: FileNode] }>()
+const props = defineProps<{
+  entry: TreeEntry
+  active: string | null
+  selectionMode: boolean
+  selectedPaths: string[]
+}>()
+const emit = defineEmits<{
+  select: [node: FileNode]
+  toggleSelected: [path: string]
+}>()
 
 const open = ref(false)
+const selected = computed(
+  () => props.entry.kind === 'file' && props.selectedPaths.includes(props.entry.path),
+)
 
 function selectFile(path: string, name: string, lang: string) {
   emit('select', { path, name, lang: lang as Lang })
+}
+
+function toggleSelectedFile(path: string) {
+  emit('toggleSelected', path)
 }
 </script>
 
@@ -25,16 +40,28 @@ function selectFile(path: string, name: string, lang: string) {
         :key="child.kind === 'dir' ? 'd:' + child.name : 'f:' + child.path"
         :entry="child"
         :active="active"
+        :selection-mode="selectionMode"
+        :selected-paths="selectedPaths"
         @select="(n: FileNode) => emit('select', n)"
+        @toggle-selected="(path: string) => emit('toggleSelected', path)"
       />
     </ul>
   </li>
   <li
     v-else
     class="node file"
-    :class="{ active: entry.path === active }"
+    :class="{ active: entry.path === active, selectable: selectionMode, selected }"
     @click="selectFile(entry.path, entry.name, entry.lang)"
   >
+    <input
+      v-if="selectionMode"
+      class="file-select"
+      type="checkbox"
+      :checked="selected"
+      :aria-label="`选择 ${entry.name}`"
+      @click.stop
+      @change="toggleSelectedFile(entry.path)"
+    />
     <span class="label">{{ entry.name }}</span>
   </li>
 </template>

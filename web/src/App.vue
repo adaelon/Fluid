@@ -38,6 +38,24 @@ const genProgress = ref<{ phase: 'idle' | 'running' | 'done'; completed: number;
 // open (Editor is v-if'd away then and can't emit).
 const queryCtx = ref<QueryContext>(EMPTY_QUERY_CONTEXT)
 
+// S-FSQ-1: selected file set is an explicit query scope, independent from open
+// tabs. Hiding checkbox mode must not clear this set; switching project root does.
+const fileSelectionMode = ref(false)
+const selectedFilePaths = ref<Set<string>>(new Set())
+const selectedFilePathList = computed(() => Array.from(selectedFilePaths.value))
+const selectedFileCount = computed(() => selectedFilePaths.value.size)
+
+function toggleSelectedFile(path: string) {
+  const next = new Set(selectedFilePaths.value)
+  if (next.has(path)) next.delete(path)
+  else next.add(path)
+  selectedFilePaths.value = next
+}
+
+function clearSelectedFiles() {
+  selectedFilePaths.value = new Set()
+}
+
 // Markdown files render as a document (MarkdownView), not in the CM6 Editor, so
 // they never emit a query context. Vacuum the stale one when the active file is a
 // doc (or none), so opening the query panel can't carry the last code file's
@@ -185,6 +203,8 @@ async function doSwitch(path: string) {
     await openFolder(path)
     openFiles.value = []
     activePath.value = null
+    fileSelectionMode.value = false
+    clearSelectedFiles()
     files.value = await fetchTree()
     folderInput.value = ''
   } catch (e) {
@@ -244,7 +264,14 @@ function closeTab(path: string) {
           </button>
         </form>
         <p v-if="loadError" class="error">{{ loadError }}</p>
-        <FileTree :files="files" :active="current?.path ?? null" @select="open" />
+        <FileTree
+          :files="files"
+          :active="current?.path ?? null"
+          :selection-mode="fileSelectionMode"
+          :selected-paths="selectedFilePathList"
+          @select="open"
+          @toggle-selected="toggleSelectedFile"
+        />
       </aside>
       <div
         class="resizer"
@@ -286,7 +313,12 @@ function closeTab(path: string) {
       v-if="queryPanelOpen && current"
       :path="current.path"
       :ctx="queryCtx"
+      :selection-mode="fileSelectionMode"
+      :selected-count="selectedFileCount"
+      :selected-paths="selectedFilePathList"
       @close="queryPanelOpen = false"
+      @toggle-selection-mode="fileSelectionMode = !fileSelectionMode"
+      @clear-selected="clearSelectedFiles"
     />
     <StatusBar
       :path="current?.path ?? null"

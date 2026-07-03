@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::graph_loader::{GraphEdge, KnowledgeGraph};
+use crate::graph_loader::{GraphEdge, GraphNode, KnowledgeGraph};
 
 /// A function as located by the frontend's tree-sitter pass (技术方案 §3).
 /// `lineRange` is 1-based inclusive `[start, end]`.
@@ -47,6 +47,43 @@ pub struct GenContext {
     pub callee_summaries: BTreeMap<String, String>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileSetFile {
+    pub path: String,
+    pub name: String,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileSetSymbol {
+    pub id: String,
+    pub node_type: String,
+    pub name: String,
+    pub file_path: String,
+    pub summary: String,
+    pub line_range: Option<[u32; 2]>,
+}
+
+/// Graph-only context for selected-file-set relationship queries (S-FSQ).
+/// Source is intentionally absent here; S-FSQ-3 may append small, model-named
+/// graph node slices as `extra_sources`, but S-FSQ-2 stays summary/edge-only.
+#[derive(Debug, Clone)]
+pub struct FileSetContext {
+    pub files: Vec<FileSetFile>,
+    pub symbols: Vec<FileSetSymbol>,
+    pub internal_edges: Vec<GraphEdge>,
+    pub boundary_edges: Vec<GraphEdge>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileSetSourceTarget {
+    pub id: String,
+    pub name: String,
+    pub node_type: String,
+    pub file_path: String,
+    pub line_range: [u32; 2],
+}
+
 /// Assemble generation context: request value wins, else graph, else empty/omitted
 /// (技术方案 §5, S6 minimal — no extra LLM calls).
 pub fn assemble_gen_context(
@@ -60,10 +97,11 @@ pub fn assemble_gen_context(
         .clone()
         .or_else(|| graph.and_then(|g| file_summary_from_graph(g, file_path)));
 
-    let edges = shared
-        .edges
-        .clone()
-        .unwrap_or_else(|| graph.map(|g| edges_for_file(g, file_path)).unwrap_or_default());
+    let edges = shared.edges.clone().unwrap_or_else(|| {
+        graph
+            .map(|g| edges_for_file(g, file_path))
+            .unwrap_or_default()
+    });
 
     let callee_summaries = shared.callee_summaries.clone().unwrap_or_default();
 
@@ -73,6 +111,227 @@ pub fn assemble_gen_context(
         edges,
         callee_summaries,
     }
+}
+
+pub fn assemble_file_set_context(
+    graph: Option<&KnowledgeGraph>,
+    file_paths: &[String],
+) -> Result<FileSetContext, String> {
+    let selected_paths = dedup_file_paths(file_paths);
+    if selected_paths.len() < 2 {
+        return Err("select at least 2 files".into());
+    }
+    let Some(g) = graph else {
+        return Err("knowledge graph not found; generate understand-anything graph first".into());
+    };
+
+    let mut files = Vec::new();
+    for path in &selected_paths {
+        let Some(n) = g
+            .nodes
+            .iter()
+            .find(|n| n.node_type == "file" && n.file_path == *path)
+        else {
+            return Err(format!("selected file not found in graph: {path}"));
+        };
+        files.push(FileSetFile {
+            path: path.clone(),
+            name: n.name.clone(),
+            summary: n.summary.clone(),
+        });
+    }
+
+    let selected: HashSet<&str> = selected_paths.iter().map(String::as_str).collect();
+    let symbols = g
+        .nodes
+        .iter()
+        .filter(|n| selected.contains(n.file_path.as_str()))
+        .filter(|n| matches!(n.node_type.as_str(), "class" | "function"))
+        .map(|n| FileSetSymbol {
+            id: n.id.clone(),
+            node_type: n.node_type.clone(),
+            name: n.name.clone(),
+            file_path: n.file_path.clone(),
+            summary: n.summary.clone(),
+            line_range: n.line_range,
+        })
+        .collect();
+
+    let mut internal_edges = Vec::new();
+    let mut boundary_edges = Vec::new();
+    for e in &g.edges {
+        let Some(src) = find_node(g, &e.source) else {
+            continue;
+        };
+        let Some(tgt) = find_node(g, &e.target) else {
+            continue;
+        };
+        let src_selected = selected.contains(src.file_path.as_str());
+        let tgt_selected = selected.contains(tgt.file_path.as_str());
+        if src_selected && tgt_selected {
+            internal_edges.push(e.clone());
+        } else if src_selected && !tgt_selected {
+            boundary_edges.push(e.clone());
+        }
+    }
+
+    Ok(FileSetContext {
+        files,
+        symbols,
+        internal_edges,
+        boundary_edges,
+    })
+}
+
+fn dedup_file_paths(file_paths: &[String]) -> Vec<String> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut out = Vec::new();
+    for path in file_paths {
+        if seen.insert(path.as_str()) {
+            out.push(path.clone());
+        }
+    }
+    out
+}
+
+fn find_node<'a>(g: &'a KnowledgeGraph, id: &str) -> Option<&'a GraphNode> {
+    g.nodes.iter().find(|n| n.id == id)
+}
+
+pub fn build_file_set_query_prompt(
+    question: &str,
+    ctx: &FileSetContext,
+    extra_sources: &[(String, String)],
+) -> (String, String) {
+    let system = "你是 Fluid 的代码理解助手，面向零代码基础的读者。\
+基于下面给定的【已选文件集图谱上下文】回答用户关于这些文件职责、调用、依赖与关系的追问。\
+用简体中文，可使用简单 markdown；只依据给定信息作答，信息不足时直说，不要臆造未给出的源码细节。";
+
+    let mut user = String::new();
+    user.push_str("【选中文件】\n");
+    for f in &ctx.files {
+        user.push_str(&format!("- {}: {}\n", f.path, blank(&f.summary)));
+    }
+
+    if !ctx.symbols.is_empty() {
+        user.push_str("\n【选中文件内符号摘要】\n");
+        for s in &ctx.symbols {
+            user.push_str(&format!(
+                "- {} ({}, {}): {}\n",
+                s.name,
+                s.node_type,
+                s.file_path,
+                blank(&s.summary)
+            ));
+        }
+    }
+
+    if !ctx.internal_edges.is_empty() {
+        user.push_str("\n【选中文件内部关系】\n");
+        for e in &ctx.internal_edges {
+            user.push_str(&format!("- {}\n", describe_edge(e)));
+        }
+    }
+
+    if !ctx.boundary_edges.is_empty() {
+        user.push_str("\n【选中文件对外边界关系】\n");
+        for e in &ctx.boundary_edges {
+            user.push_str(&format!("- {}\n", describe_edge(e)));
+        }
+    }
+
+    for (name, src) in extra_sources {
+        user.push_str(&format!(
+            "\n【按需追加的图谱节点源码: {name}(带绝对行号)】\n"
+        ));
+        user.push_str(src);
+        user.push('\n');
+    }
+
+    user.push_str(&format!("\n【用户问题】{question}\n"));
+    (system.to_string(), user)
+}
+
+pub fn file_set_fetchable_targets(ctx: &FileSetContext) -> Vec<FileSetSourceTarget> {
+    ctx.symbols
+        .iter()
+        .filter_map(|s| {
+            s.line_range.map(|line_range| FileSetSourceTarget {
+                id: s.id.clone(),
+                name: s.name.clone(),
+                node_type: s.node_type.clone(),
+                file_path: s.file_path.clone(),
+                line_range,
+            })
+        })
+        .collect()
+}
+
+pub fn build_file_set_query_planning_prompt(
+    question: &str,
+    ctx: &FileSetContext,
+    fetchable: &[FileSetSourceTarget],
+) -> (String, String) {
+    let system = "你是 Fluid 的代码理解助手。下面给出【已选文件集图谱上下文】与一份【可按需索取源码的图谱节点清单】。\
+判断:要准确回答用户关于这些文件关系的追问，你还需要其中哪些节点的源码？\
+只输出一个 JSON 对象 {\"need\":[\"节点ID\", ...]}，不需要任何源码就返回 {\"need\":[]}；\
+禁止任何额外文字或 markdown 代码围栏。";
+
+    let (_, mut user) = build_file_set_query_prompt(question, ctx, &[]);
+    user.push_str("\n【可按需索取源码的图谱节点】\n");
+    for t in fetchable {
+        user.push_str(&format!(
+            "- {} | {} | {} | {}\n",
+            t.id, t.name, t.node_type, t.file_path
+        ));
+    }
+    (system.to_string(), user)
+}
+
+pub fn slice_file_set_sources(
+    targets: &[FileSetSourceTarget],
+    sources: &BTreeMap<String, String>,
+    need: &[String],
+    budget: usize,
+) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut used = 0usize;
+    for id in need {
+        let Some(t) = targets.iter().find(|t| &t.id == id) else {
+            continue; // model named a node outside the selected fetchable set
+        };
+        if !seen.insert(id.as_str()) {
+            continue; // dedup
+        }
+        let Some(src) = sources.get(&t.file_path) else {
+            continue; // caller could not read this selected file
+        };
+        let Some(sliced) = slice_span(src, t.line_range) else {
+            continue; // stale graph lineRange
+        };
+        let numbered = number_lines(&sliced, t.line_range[0]);
+        let label = format!("{} @ {} ({})", t.name, t.file_path, t.id);
+        let cost = numbered.chars().count() + label.chars().count() + 4;
+        if used + cost > budget {
+            continue;
+        }
+        used += cost;
+        out.push((label, numbered));
+    }
+    out
+}
+
+fn blank(s: &str) -> &str {
+    if s.is_empty() {
+        "无摘要"
+    } else {
+        s
+    }
+}
+
+fn describe_edge(e: &GraphEdge) -> String {
+    format!("{} -{}-> {}", e.source, e.edge_type, e.target)
 }
 
 /// The summary of the `file` node for `file_path`, if the graph has one.
@@ -389,7 +648,12 @@ fn query_spine_chars(question: &str, ctx: &GenContext, focus: Option<&QueryFocus
         n += fs.chars().count() + 8;
     }
     if !ctx.roster.is_empty() {
-        n += ctx.roster.iter().map(|r| r.chars().count() + 2).sum::<usize>() + 12;
+        n += ctx
+            .roster
+            .iter()
+            .map(|r| r.chars().count() + 2)
+            .sum::<usize>()
+            + 12;
     }
     for e in &ctx.edges {
         n += e.source.chars().count() + e.edge_type.chars().count() + e.target.chars().count() + 4;
@@ -449,10 +713,13 @@ pub fn query_degraded_names(
 ) -> Vec<String> {
     let spine = query_spine_chars(question, ctx, focus);
     let focus_name = focus.map(|f| f.name);
-    let kept: HashSet<usize> =
-        select_capsule_summaries(capsules, focus_name, QUERY_CONTEXT_BUDGET_CHARS.saturating_sub(spine))
-            .into_iter()
-            .collect();
+    let kept: HashSet<usize> = select_capsule_summaries(
+        capsules,
+        focus_name,
+        QUERY_CONTEXT_BUDGET_CHARS.saturating_sub(spine),
+    )
+    .into_iter()
+    .collect();
     capsules
         .iter()
         .enumerate()
@@ -639,6 +906,19 @@ mod tests {
         }
     }
 
+    fn ranged_node(
+        id: &str,
+        ty: &str,
+        file: &str,
+        summary: &str,
+        line_range: [u32; 2],
+    ) -> GraphNode {
+        GraphNode {
+            line_range: Some(line_range),
+            ..node(id, ty, file, summary)
+        }
+    }
+
     fn edge(src: &str, tgt: &str, ty: &str) -> GraphEdge {
         GraphEdge {
             source: src.to_string(),
@@ -702,10 +982,217 @@ mod tests {
 
     #[test]
     fn no_graph_yields_empty_context_no_panic() {
-        let ctx = assemble_gen_context(None, "a.py", &["f".into(), "g".into()], &SharedContext::default());
+        let ctx = assemble_gen_context(
+            None,
+            "a.py",
+            &["f".into(), "g".into()],
+            &SharedContext::default(),
+        );
         assert!(ctx.file_summary.is_none());
         assert!(ctx.edges.is_empty());
         assert_eq!(ctx.roster, vec!["f".to_string(), "g".to_string()]);
+    }
+
+    #[test]
+    fn file_set_context_requires_two_files_and_graph() {
+        let one = vec!["a.py".to_string()];
+        assert_eq!(
+            assemble_file_set_context(None, &one).unwrap_err(),
+            "select at least 2 files"
+        );
+
+        let two = vec!["a.py".to_string(), "b.py".to_string()];
+        assert!(assemble_file_set_context(None, &two)
+            .unwrap_err()
+            .contains("knowledge graph not found"));
+    }
+
+    #[test]
+    fn file_set_context_rejects_selected_file_missing_from_graph() {
+        let g = KnowledgeGraph {
+            nodes: vec![node("file:a.py", "file", "a.py", "A")],
+            edges: vec![],
+        };
+        let paths = vec!["a.py".to_string(), "b.py".to_string()];
+        assert_eq!(
+            assemble_file_set_context(Some(&g), &paths).unwrap_err(),
+            "selected file not found in graph: b.py"
+        );
+    }
+
+    #[test]
+    fn file_set_context_collects_summaries_internal_edges_and_boundary_edges() {
+        let g = KnowledgeGraph {
+            nodes: vec![
+                node("file:a.py", "file", "a.py", "文件 A"),
+                node("file:b.py", "file", "b.py", "文件 B"),
+                node("file:c.py", "file", "c.py", "文件 C"),
+                ranged_node("function:a.py:fa", "function", "a.py", "fa 摘要", [1, 2]),
+                ranged_node("class:b.py:B", "class", "b.py", "B 摘要", [4, 5]),
+                node("function:c.py:fc", "function", "c.py", "fc 摘要"),
+            ],
+            edges: vec![
+                edge("file:a.py", "function:a.py:fa", "contains"),
+                edge("function:a.py:fa", "class:b.py:B", "calls"),
+                edge("function:a.py:fa", "function:c.py:fc", "calls"),
+                edge("function:c.py:fc", "function:a.py:fa", "calls"),
+            ],
+        };
+        let paths = vec!["a.py".to_string(), "b.py".to_string(), "a.py".to_string()];
+        let ctx = assemble_file_set_context(Some(&g), &paths).unwrap();
+
+        assert_eq!(
+            ctx.files
+                .iter()
+                .map(|f| f.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a.py", "b.py"]
+        );
+        assert_eq!(ctx.symbols.len(), 2);
+        assert!(ctx
+            .symbols
+            .iter()
+            .any(|s| s.name == "function:a.py:fa" && s.summary == "fa 摘要"));
+        assert!(ctx
+            .internal_edges
+            .iter()
+            .any(|e| e.source == "function:a.py:fa" && e.target == "class:b.py:B"));
+        assert_eq!(ctx.boundary_edges.len(), 1);
+        assert_eq!(ctx.boundary_edges[0].target, "function:c.py:fc");
+    }
+
+    #[test]
+    fn file_set_query_prompt_renders_graph_sections() {
+        let ctx = FileSetContext {
+            files: vec![
+                FileSetFile {
+                    path: "a.py".into(),
+                    name: "a.py".into(),
+                    summary: "文件 A".into(),
+                },
+                FileSetFile {
+                    path: "b.py".into(),
+                    name: "b.py".into(),
+                    summary: "文件 B".into(),
+                },
+            ],
+            symbols: vec![FileSetSymbol {
+                id: "function:a.py:fa".into(),
+                node_type: "function".into(),
+                name: "fa".into(),
+                file_path: "a.py".into(),
+                summary: "fa 摘要".into(),
+                line_range: Some([1, 2]),
+            }],
+            internal_edges: vec![edge("function:a.py:fa", "function:b.py:fb", "calls")],
+            boundary_edges: vec![edge("function:a.py:fa", "function:c.py:fc", "imports")],
+        };
+        let (system, user) = build_file_set_query_prompt("它们怎么协作？", &ctx, &[]);
+
+        assert!(system.contains("已选文件集图谱上下文"));
+        assert!(user.contains("【选中文件】"));
+        assert!(user.contains("- a.py: 文件 A"));
+        assert!(user.contains("【选中文件内符号摘要】"));
+        assert!(user.contains("- fa (function, a.py): fa 摘要"));
+        assert!(user.contains("function:a.py:fa -calls-> function:b.py:fb"));
+        assert!(user.contains("function:a.py:fa -imports-> function:c.py:fc"));
+        assert!(user.contains("【用户问题】它们怎么协作？"));
+    }
+
+    #[test]
+    fn file_set_fetchable_targets_keep_only_symbols_with_line_ranges() {
+        let ctx = FileSetContext {
+            files: vec![],
+            symbols: vec![
+                FileSetSymbol {
+                    id: "function:a.py:fa".into(),
+                    node_type: "function".into(),
+                    name: "fa".into(),
+                    file_path: "a.py".into(),
+                    summary: "fa 摘要".into(),
+                    line_range: Some([1, 2]),
+                },
+                FileSetSymbol {
+                    id: "function:b.py:fb".into(),
+                    node_type: "function".into(),
+                    name: "fb".into(),
+                    file_path: "b.py".into(),
+                    summary: "fb 摘要".into(),
+                    line_range: None,
+                },
+            ],
+            internal_edges: vec![],
+            boundary_edges: vec![],
+        };
+        let targets = file_set_fetchable_targets(&ctx);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].id, "function:a.py:fa");
+        assert_eq!(targets[0].line_range, [1, 2]);
+    }
+
+    #[test]
+    fn file_set_planning_prompt_lists_fetchable_node_ids() {
+        let ctx = FileSetContext {
+            files: vec![FileSetFile {
+                path: "a.py".into(),
+                name: "a.py".into(),
+                summary: "文件 A".into(),
+            }],
+            symbols: vec![],
+            internal_edges: vec![],
+            boundary_edges: vec![],
+        };
+        let fetchable = vec![FileSetSourceTarget {
+            id: "function:a.py:fa".into(),
+            name: "fa".into(),
+            node_type: "function".into(),
+            file_path: "a.py".into(),
+            line_range: [1, 2],
+        }];
+        let (system, user) = build_file_set_query_planning_prompt("fa 怎么用？", &ctx, &fetchable);
+
+        assert!(system.contains("{\"need\""));
+        assert!(system.contains("节点ID"));
+        assert!(user.contains("【可按需索取源码的图谱节点】"));
+        assert!(user.contains("function:a.py:fa | fa | function | a.py"));
+    }
+
+    #[test]
+    fn slice_file_set_sources_guards_ids_dedups_numbers_and_caps_budget() {
+        let targets = vec![
+            FileSetSourceTarget {
+                id: "function:a.py:fa".into(),
+                name: "fa".into(),
+                node_type: "function".into(),
+                file_path: "a.py".into(),
+                line_range: [2, 3],
+            },
+            FileSetSourceTarget {
+                id: "function:b.py:fb".into(),
+                name: "fb".into(),
+                node_type: "function".into(),
+                file_path: "b.py".into(),
+                line_range: [1, 2],
+            },
+        ];
+        let mut sources = BTreeMap::new();
+        sources.insert("a.py".into(), "skip\ndef fa():\n    return 1\n".into());
+        sources.insert("b.py".into(), "def fb():\n    return 2\n".into());
+        let need = vec![
+            "function:a.py:fa".into(),
+            "function:a.py:fa".into(),
+            "function:outside.py:x".into(),
+            "function:b.py:fb".into(),
+        ];
+
+        let got = slice_file_set_sources(&targets, &sources, &need, 10_000);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].0, "fa @ a.py (function:a.py:fa)");
+        assert!(got[0].1.contains("   2 | def fa():"));
+        assert!(got[1].1.contains("   1 | def fb():"));
+
+        let tiny = slice_file_set_sources(&targets, &sources, &["function:a.py:fa".into()], 3);
+        assert!(tiny.is_empty());
     }
 
     #[test]
@@ -766,7 +1253,12 @@ mod tests {
             nodes: vec![node("file:a.py", "file", "a.py", "配置加载模块")],
             edges: vec![],
         };
-        let ctx = assemble_gen_context(Some(&g), "a.py", &["load".into(), "save".into()], &SharedContext::default());
+        let ctx = assemble_gen_context(
+            Some(&g),
+            "a.py",
+            &["load".into(), "save".into()],
+            &SharedContext::default(),
+        );
         let capsules = vec![
             ("load".to_string(), "读配置".to_string()),
             ("save".to_string(), "写配置".to_string()),
@@ -774,7 +1266,11 @@ mod tests {
         let (system, user) = build_query_prompt(
             "load 为什么要先校验？",
             &capsules,
-            Some(QueryFocus { source: "def load():\n    return 1", start_line: 10, name: "load" }),
+            Some(QueryFocus {
+                source: "def load():\n    return 1",
+                start_line: 10,
+                name: "load",
+            }),
             &ctx,
             &[],
         );
@@ -820,7 +1316,10 @@ mod tests {
         let capsules = bulky_capsules(5, 20); // tiny — well under budget
         let (_, user) = build_query_prompt("这个文件做什么？", &capsules, None, &ctx, &[]);
         for i in 0..5 {
-            assert!(user.contains(&format!("fn{i}: S{i}")), "fn{i} summary should be present");
+            assert!(
+                user.contains(&format!("fn{i}: S{i}")),
+                "fn{i} summary should be present"
+            );
         }
         assert!(!user.contains("上下文超长"));
     }
@@ -832,14 +1331,24 @@ mod tests {
         let ctx = assemble_gen_context(None, "a.py", &names, &SharedContext::default());
         // 60 × ~600-char summaries ≈ 36k chars > 24k budget → must degrade.
         let capsules = bulky_capsules(n, 600);
-        let full: usize = capsules.iter().map(|(k, v)| k.chars().count() + v.chars().count()).sum();
-        assert!(full > QUERY_CONTEXT_BUDGET_CHARS, "test precondition: summaries exceed budget");
+        let full: usize = capsules
+            .iter()
+            .map(|(k, v)| k.chars().count() + v.chars().count())
+            .sum();
+        assert!(
+            full > QUERY_CONTEXT_BUDGET_CHARS,
+            "test precondition: summaries exceed budget"
+        );
 
         // Focus the middle function so its neighbors are prioritized.
         let (_, user) = build_query_prompt(
             "fn30 在做什么？",
             &capsules,
-            Some(QueryFocus { source: "def fn30():\n    return 1", start_line: 1, name: "fn30" }),
+            Some(QueryFocus {
+                source: "def fn30():\n    return 1",
+                start_line: 1,
+                name: "fn30",
+            }),
             &ctx,
             &[],
         );
@@ -847,8 +1356,14 @@ mod tests {
         // Degradation happened, and is announced.
         assert!(user.contains("上下文超长"), "degradation note expected");
         // Focused function's summary survives; the farthest function's summary does not.
-        assert!(user.contains("fn30: S30"), "focused function summary must be kept");
-        assert!(!user.contains("fn0: S0"), "distant function summary must degrade to name-only");
+        assert!(
+            user.contains("fn30: S30"),
+            "focused function summary must be kept"
+        );
+        assert!(
+            !user.contains("fn0: S0"),
+            "distant function summary must degrade to name-only"
+        );
         // …but every function is still named in the roster line.
         assert!(user.contains("【本文件函数清单】"));
         assert!(user.contains("fn0, fn1"));
@@ -863,7 +1378,7 @@ mod tests {
     #[test]
     fn select_capsule_summaries_prioritizes_focus_neighbors() {
         let capsules = bulky_capsules(10, 100); // each ~100 chars
-        // Budget for ~3 summaries (~104 each) centered on fn5.
+                                                // Budget for ~3 summaries (~104 each) centered on fn5.
         let kept = select_capsule_summaries(&capsules, Some("fn5"), 320);
         assert!(kept.contains(&5), "focus center kept");
         assert!(kept.contains(&4) || kept.contains(&6), "a neighbor kept");
@@ -877,7 +1392,11 @@ mod tests {
     // — S10a-追源 on-demand source fetch (ADR-0017) —
 
     fn span(name: &str, lr: [u32; 2]) -> FunctionSpan {
-        FunctionSpan { id: format!("{name}#1"), name: name.to_string(), line_range: lr }
+        FunctionSpan {
+            id: format!("{name}#1"),
+            name: name.to_string(),
+            line_range: lr,
+        }
     }
 
     #[test]
@@ -885,11 +1404,24 @@ mod tests {
         let names: Vec<String> = (0..60).map(|i| format!("fn{i}")).collect();
         let ctx = assemble_gen_context(None, "a.py", &names, &SharedContext::default());
         let capsules = bulky_capsules(60, 600); // > budget → degrades
-        let focus = QueryFocus { source: "def fn30():\n    return 1", start_line: 1, name: "fn30" };
+        let focus = QueryFocus {
+            source: "def fn30():\n    return 1",
+            start_line: 1,
+            name: "fn30",
+        };
         let degraded = query_degraded_names("fn30 在做什么？", &capsules, Some(&focus), &ctx);
-        assert!(!degraded.is_empty(), "large file should degrade some functions");
-        assert!(degraded.contains(&"fn0".to_string()), "distant fn0 degraded to name-only");
-        assert!(!degraded.contains(&"fn30".to_string()), "focused fn30 not degraded");
+        assert!(
+            !degraded.is_empty(),
+            "large file should degrade some functions"
+        );
+        assert!(
+            degraded.contains(&"fn0".to_string()),
+            "distant fn0 degraded to name-only"
+        );
+        assert!(
+            !degraded.contains(&"fn30".to_string()),
+            "focused fn30 not degraded"
+        );
     }
 
     #[test]
@@ -905,7 +1437,8 @@ mod tests {
         let file = "def a():\n    return 1\ndef b():\n    return 2\ndef c():\n    return 3\n";
         let roster = vec![span("a", [1, 2]), span("b", [3, 4]), span("c", [5, 6])];
         let fetchable = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-        let got = slice_requested_sources(file, &roster, &["b".into(), "c".into()], &fetchable, 10_000);
+        let got =
+            slice_requested_sources(file, &roster, &["b".into(), "c".into()], &fetchable, 10_000);
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].0, "b");
         assert!(got[0].1.contains("   3 | def b():"));
@@ -917,7 +1450,7 @@ mod tests {
         let file = "def a():\n    return 1\ndef b():\n    return 2\n";
         let roster = vec![span("a", [1, 2]), span("b", [3, 4])];
         let fetchable = vec!["a".to_string()]; // only a is name-only/degraded
-        // "b" not fetchable (kept-summary), "ghost" nonexistent, "a" requested twice.
+                                               // "b" not fetchable (kept-summary), "ghost" nonexistent, "a" requested twice.
         let need = vec!["b".into(), "ghost".into(), "a".into(), "a".into()];
         let got = slice_requested_sources(file, &roster, &need, &fetchable, 10_000);
         assert_eq!(got.len(), 1);
@@ -942,7 +1475,11 @@ mod tests {
         let (system, user) = build_query_planning_prompt(
             "保存时如何校验？",
             &capsules,
-            Some(QueryFocus { source: "def load():\n    return 1", start_line: 1, name: "load" }),
+            Some(QueryFocus {
+                source: "def load():\n    return 1",
+                start_line: 1,
+                name: "load",
+            }),
             &ctx,
             &["save".to_string(), "verify".to_string()],
         );
@@ -954,7 +1491,10 @@ mod tests {
     #[test]
     fn query_prompt_renders_extra_fetched_sources() {
         let ctx = assemble_gen_context(None, "a.py", &["a".into()], &SharedContext::default());
-        let extra = vec![("save".to_string(), "   3 | def save():\n   4 |     pass".to_string())];
+        let extra = vec![(
+            "save".to_string(),
+            "   3 | def save():\n   4 |     pass".to_string(),
+        )];
         let (_, user) = build_query_prompt("?", &[], None, &ctx, &extra);
         assert!(user.contains("【按需追加的函数源码: save(带绝对行号)】"));
         assert!(user.contains("   3 | def save():"));
@@ -1000,7 +1540,7 @@ mod tests {
                 edge("function:a.py:caller", "function:b.py:sign", "calls"),    // cross-file ✓
                 edge("function:a.py:caller", "function:c.py:nolines", "calls"), // no span → drop
                 edge("function:a.py:caller", "function:a.py:local2", "calls"),  // same-file → drop
-                edge("function:b.py:x", "function:b.py:encrypt", "calls"),      // foreign src → drop
+                edge("function:b.py:x", "function:b.py:encrypt", "calls"), // foreign src → drop
                 edge("function:a.py:caller", "function:b.py:encrypt", "contains"), // wrong type
             ],
         };
@@ -1023,7 +1563,12 @@ mod tests {
         // questions.
         let g = KnowledgeGraph {
             nodes: vec![
-                class_node("class:engine.py:AlphaEngine", "AlphaEngine", "engine.py", [1, 50]),
+                class_node(
+                    "class:engine.py:AlphaEngine",
+                    "AlphaEngine",
+                    "engine.py",
+                    [1, 50],
+                ),
                 class_node(
                     "class:alphagpt.py:NewtonSchulzLowRankDecay",
                     "NewtonSchulzLowRankDecay",
@@ -1091,14 +1636,27 @@ mod tests {
     #[test]
     fn slice_cross_file_sources_guards_hallucination_dedup_and_budget() {
         let targets = vec![
-            CrossFileTarget { name: "encrypt".into(), file_path: "b.py".into(), line_range: [1, 2] },
-            CrossFileTarget { name: "missing".into(), file_path: "z.py".into(), line_range: [1, 2] },
+            CrossFileTarget {
+                name: "encrypt".into(),
+                file_path: "b.py".into(),
+                line_range: [1, 2],
+            },
+            CrossFileTarget {
+                name: "missing".into(),
+                file_path: "z.py".into(),
+                line_range: [1, 2],
+            },
         ];
         let mut sources: BTreeMap<String, String> = BTreeMap::new();
         sources.insert("b.py".into(), "def encrypt():\n    return 1\n".into());
         // "ghost" not a target (hallucination) → skip; "missing" has no read source → skip;
         // "encrypt" requested twice → dedup.
-        let need = vec!["ghost".into(), "missing".into(), "encrypt".into(), "encrypt".into()];
+        let need = vec![
+            "ghost".into(),
+            "missing".into(),
+            "encrypt".into(),
+            "encrypt".into(),
+        ];
         let got = slice_cross_file_sources(&targets, &sources, &need, 10_000);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].0, "encrypt @ b.py");

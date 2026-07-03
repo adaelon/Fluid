@@ -302,3 +302,68 @@ export function streamQuery(
     },
   }
 }
+
+/** Open `WS /api/query-files`, send one selected-file-set relationship question,
+ *  and stream the answer back token by token (S-FSQ). */
+export function streamQueryFiles(
+  req: {
+    filePaths: string[]
+    question: string
+  },
+  h: QueryHandlers,
+): QueryStream {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws'
+  const sock = new WebSocket(`${proto}://${location.host}/api/query-files`)
+  let settled = false
+  const close = () => {
+    try {
+      sock.close()
+    } catch {
+      /* already closing */
+    }
+  }
+  sock.onopen = () => {
+    sock.send(
+      JSON.stringify({
+        reqId: 'qf',
+        filePaths: req.filePaths,
+        question: req.question,
+      }),
+    )
+  }
+  sock.onmessage = (ev) => {
+    let frame: QueryFrame
+    try {
+      frame = JSON.parse(ev.data as string) as QueryFrame
+    } catch {
+      return
+    }
+    if (frame.kind === 'delta') h.onDelta(frame.text)
+    else if (frame.kind === 'done') {
+      settled = true
+      h.onDone()
+      close()
+    } else if (frame.kind === 'error') {
+      settled = true
+      h.onError(frame.message)
+      close()
+    }
+  }
+  sock.onerror = () => {
+    if (settled) return
+    settled = true
+    h.onError('连接失败')
+    close()
+  }
+  sock.onclose = () => {
+    if (settled) return
+    settled = true
+    h.onError('连接已关闭')
+  }
+  return {
+    cancel: () => {
+      settled = true
+      close()
+    },
+  }
+}

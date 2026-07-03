@@ -21,10 +21,10 @@ Fluid提供**只读**代码理解环境。在不修改源码任何字节的前�
 - **只读浏览**:文件树导航 + CodeMirror 6 只读编辑器(暗色主题、字号可调)。
 - **流式语义生成**:每个函数一个「胶囊」(签名·摘要·复杂度·IO)+ 重点行尾随式玻璃注释,逐个显影;失败可单点重试。
 - **旁路缓存**:产物落盘 `.fluid/`,键含文件内容 hash + 模型/prompt 版本;重开未变文件零 Token 秒显。
-- **追问器**:针对当前文件的流式问答(Markdown + LaTeX 渲染);上下文超窗自动分层降级,可按需追源,支持**跨文件**取被调函数/类实现(经知识图谱定位)。
+- **追问器**:针对当前文件的流式问答(Markdown + LaTeX 渲染);也可显式选择多个文件做职责/调用/依赖关系追问。当前文件追问支持分层降级与按需追源;文件集追问依赖知识图谱,源码只按需切少数 graph 节点。
 - **手动单行补注**:非重点行 hover → 「解释这一行」按需生成。
 - **类 VSCode 壳**:活动栏 / 资源管理器 / 多 tab + 面包屑 / 状态栏 / Open Folder 换根 / 命令面板 / LLM 设置面板。
-- **知识图谱增强(推荐)**:存在 `.understand-anything/knowledge-graph.json` 时作为上下文增强——文件摘要、调用关系、跨文件取源;缺失不影响运行,但**最佳体验是先跑 understand-anything**(见「快速开始」)。
+- **知识图谱增强(推荐)**:存在 `.understand-anything/knowledge-graph.json` 时作为上下文增强——文件摘要、调用关系、跨文件取源、文件集关系追问;缺失不影响单文件运行,但**最佳体验是先跑 understand-anything**(见「快速开始」)。
 
 ## 架构
 
@@ -71,7 +71,7 @@ fluid /path/to/your/project        # 或直接 fluid,启动后在界面里「打
 
 启动后后端+前端在同一端口,默认自动打开 **http://127.0.0.1:7878**(没自动开就手动访问)。
 
-> **最佳体验:先对目标项目跑一遍 [understand-anything](https://github.com/Understand-Anything)**,在项目根生成 `.understand-anything/knowledge-graph.json`。Fluid 没有它也能跑(纯只读浏览 + 单文件生成/追问),但有了图谱才解锁:文件级摘要、调用/导入关系上下文,以及追问时**跨文件取被调函数/类的实现**(S10c 依赖图谱定位)。
+> **最佳体验:先对目标项目跑一遍 [understand-anything](https://github.com/Understand-Anything)**,在项目根生成 `.understand-anything/knowledge-graph.json`。Fluid 没有它也能跑(纯只读浏览 + 单文件生成/追问),但有了图谱才解锁:文件级摘要、调用/导入关系上下文、文件集关系追问,以及追问时**跨文件取被调函数/类的实现**(S10c / S-FSQ 依赖图谱定位)。
 >
 > 别在被服务项目自带 `.env` 的目录里启动 fluid(会读错 LLM 配置);从其他目录启动即可。
 
@@ -111,7 +111,7 @@ cd web && npm install && npm run dev                # Vite 5173,/api 代理到 7
 
 ## 主要端点
 
-`GET /api/project/tree`、`GET /api/file`、`GET /api/project/graph`、`POST /api/project/open|pick`、`GET|POST /api/settings/llm`、`POST /api/settings/llm/test`、`POST /api/explain-line`、`WS /api/generate`、`WS /api/query`。
+`GET /api/project/tree`、`GET /api/file`、`GET /api/project/graph`、`POST /api/project/open|pick`、`GET|POST /api/settings/llm`、`POST /api/settings/llm/test`、`POST /api/explain-line`、`WS /api/generate`、`WS /api/query`、`WS /api/query-files`。
 
 ## 开发与验证
 
