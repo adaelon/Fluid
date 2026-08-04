@@ -2,7 +2,7 @@
 
 Fluid提供**只读**代码理解环境。在不修改源码任何字节的前提下,用 LLM 为你打开的每个文件生成人类可读的语义投影——函数摘要、逐行解释、可追问——帮你看懂代码每一行在做什么。
 
-> 状态:MVP 功能闭环,全部规划切片已完成(见 `docs/切片计划.md`)。
+> 状态:MVP 功能闭环;「代码选区解释 + 追问器共享供应商托管联网检索」已完成(见 `docs/切片方案-代码选区解释与共享联网检索.md`)。
 
 ## 核心理念
 
@@ -20,8 +20,10 @@ Fluid提供**只读**代码理解环境。在不修改源码任何字节的前�
 
 - **只读浏览**:文件树导航 + CodeMirror 6 只读编辑器(暗色主题、字号可调)。
 - **流式语义生成**:每个函数一个「胶囊」(签名·摘要·复杂度·IO)+ 重点行尾随式玻璃注释,逐个显影;失败可单点重试。
-- **旁路缓存**:产物落盘 `.fluid/`,键含文件内容 hash + 模型/prompt 版本;重开未变文件零 Token 秒显。
-- **追问器**:针对当前文件的流式问答(Markdown + LaTeX 渲染);也可显式选择多个文件做职责/调用/依赖关系追问。当前文件追问支持分层降级与按需追源;文件集追问依赖知识图谱,源码只按需切少数 graph 节点。
+- **代码选区解释**:选择任意非空单行代码后点「解释」,临时浮层显示「它是什么 / 这里做什么 / 来源状态」;项目内符号优先临时取源,第三方证据不足时可自动联网。
+- **旁路缓存**:函数/行与选区解释都落盘 `.fluid/`;相关源码、模型、Prompt、选区范围或联网模式不变时零 Token 秒显,解释文本始终不回写源码。
+- **追问器**:针对当前文件的流式问答(Markdown + LaTeX 渲染);也可显式选择多个文件做职责/调用/依赖关系追问。两种范围共享供应商托管 Web Search,并显示「网页有来源 / 联网无来源 / 未核验」;联网失败会显式降级后继续本地回答。
+- **联网可控**:设置里的「允许联网检索」默认开启,同时控制选区解释与追问器;关闭后不做检索规划或 Web Search,只使用本地上下文。
 - **手动单行补注**:非重点行 hover → 「解释这一行」按需生成。
 - **类 VSCode 壳**:活动栏 / 资源管理器 / 多 tab + 面包屑 / 状态栏 / Open Folder 换根 / 命令面板 / LLM 设置面板。
 - **知识图谱增强(推荐)**:存在 `.understand-anything/knowledge-graph.json` 时作为上下文增强——文件摘要、调用关系、跨文件取源、文件集关系追问;缺失不影响单文件运行,但**最佳体验是先跑 understand-anything**(见「快速开始」)。
@@ -33,7 +35,8 @@ Fluid提供**只读**代码理解环境。在不修改源码任何字节的前�
   ProjectReader  读文件树/源码(路径穿越防护)
   GraphLoader    可选加载 understand-anything 图谱
   ContextAssembler 装配生成/追问上下文(分层降级 + 跨文件取源)
-  LlmProxy       唯一出网组件,OpenAI 兼容 /chat/completions(流式 + 非流式)
+  WebEvidenceService 共享 local → plan → search → fallback 证据编排
+  LlmProxy       唯一出网组件,/chat/completions + 可选 /responses Web Search
   CacheStore     旁路缓存 .fluid/
   routes         REST + WebSocket 端点
 
@@ -41,6 +44,7 @@ Fluid提供**只读**代码理解环境。在不修改源码任何字节的前�
   CodeMirror 6 只读编辑器 + 幽灵注释 widget(玻璃材质)
   tree-sitter WASM 解析(Python / Rust)→ 函数清单 + 重点行
   GhostStore 内存态 + 视口感知生成调度(并行 WS)
+  SelectionState / QueryState 投影选区与追问的状态、证据和降级
   shell/ 类 VSCode 壳组件
 ```
 
@@ -98,7 +102,7 @@ cd web && npm install && npm run dev                # Vite 5173,/api 代理到 7
 - **`.env` 文件**(复制 `.env.example`):启动时由 `dotenvy` 加载。
 - **运行时设置面板**:活动栏底部齿轮 → 居中模态,改 base/model/key → 保存即热生效(无需重启)并回写 `.env`。密钥 **write-only**:只显示掩码末 4 位,留空即保持原值。可「测试连接」做一次最小探针。
 
-仅支持 OpenAI 兼容 `/chat/completions`。
+常规生成要求 OpenAI 兼容 `/chat/completions`;选区解释与追问器还会在当前供应商/模型支持时调用 `/responses` 的 `web_search` 工具。联网请求只接收先行规划得到的公开检索请求,不直接附加原始源码;供应商不支持、认证失败、限流或超时时显式降级为本地回答。设置面板可关闭联网检索。
 
 ## 快捷键
 
@@ -111,14 +115,14 @@ cd web && npm install && npm run dev                # Vite 5173,/api 代理到 7
 
 ## 主要端点
 
-`GET /api/project/tree`、`GET /api/file`、`GET /api/project/graph`、`POST /api/project/open|pick`、`GET|POST /api/settings/llm`、`POST /api/settings/llm/test`、`POST /api/explain-line`、`WS /api/generate`、`WS /api/query`、`WS /api/query-files`。
+`GET /api/project/tree`、`GET /api/file`、`GET /api/project/graph`、`POST /api/project/open|pick`、`GET|POST /api/settings/llm`、`POST /api/settings/llm/test`、`POST /api/explain-line`、`WS /api/generate`、`WS /api/explain-selection`、`WS /api/query`、`WS /api/query-files`。
 
 ## 开发与验证
 
 ```bash
 # 后端
 cargo test -p fluid-server      # 单元 + 集成(确定性)
-cargo clippy -p fluid-server
+cargo clippy -p fluid-server -- -D warnings
 
 # 前端
 cd web
@@ -127,9 +131,12 @@ node scripts/fuzzy-check.ts     # 命令面板模糊匹配
 node scripts/scheduler-check.ts # 生成调度核
 node scripts/parse-check.ts     # tree-sitter 解析
 node scripts/markdown-check.ts  # 追问答案渲染
+node scripts/selection-check.ts # 选区 UTF-8 range + 状态机
+node scripts/query-context-check.ts # 追问上下文投影
+node scripts/query-web-check.ts # 两种 scope 的联网证据状态机
 ```
 
-验证纪律:用确定性工具判定对错(编译/测试/脚本),不靠 AI 自评;纯浏览器视觉/真 LLM 路径在文档里诚实标注「留眼验」。
+验证纪律:用确定性工具判定对错(编译/测试/脚本),不靠 AI 自评;浏览器交互用本地 fixture 复验,真实供应商 Web Search 仅作补充冒烟。无余额、无能力或无网络时必须记录「未验证」,不得用 fixture 结果冒充真实联网成功。
 
 ## 文档地图
 
