@@ -143,7 +143,7 @@ function onAllowWebChange(event: Event) {
           <span>
             <span class="settings-toggle-title">允许联网检索</span>
             <span class="settings-toggle-note">
-              选区解释可自动检索公开技术资料；关闭后只使用本地上下文。
+              选区解释与追问器共享公开技术资料检索；关闭后两者都只使用本地上下文。
             </span>
           </span>
         </label>

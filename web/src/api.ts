@@ -280,11 +280,9 @@ export function streamTranslate(filePath: string, h: TranslateHandlers): Transla
   }
 }
 
-/** Callbacks for a streaming follow-up query (S10b). */
+/** Ordered frame callback shared by both streaming follow-up scopes. */
 export interface QueryHandlers {
-  onDelta: (text: string) => void
-  onDone: () => void
-  onError: (message: string) => void
+  onFrame: (frame: QueryFrame) => void
 }
 
 /** Handle to an in-flight query stream; `cancel` tears the socket down silently. */
@@ -292,8 +290,8 @@ export interface QueryStream {
   cancel: () => void
 }
 
-/** Open `WS /api/query`, send one question, and stream the answer back token by
- *  token (S10a frames: delta×N → done | error). One socket per question; it is
+/** Open `WS /api/query`, send one question, and forward optional status/evidence
+ *  frames followed by delta×N → done | error. One socket per question; it is
  *  closed on the terminal frame or on `cancel` (file switch / unmount). The S10a
  *  backend treats roster/capsules/focus as optional; S10b-cap layers in the
  *  current file's roster + generated capsule summaries so the answer no longer
@@ -305,6 +303,7 @@ export function streamQuery(
     roster?: string[]
     rosterSpans?: FunctionSpan[]
     capsules?: CapsuleSummary[]
+    allowWeb: boolean
   },
   h: QueryHandlers,
 ): QueryStream {
@@ -327,6 +326,7 @@ export function streamQuery(
         roster: req.roster ?? [],
         rosterSpans: req.rosterSpans ?? [],
         capsules: req.capsules ?? [],
+        allowWeb: req.allowWeb,
       }),
     )
   }
@@ -337,27 +337,25 @@ export function streamQuery(
     } catch {
       return
     }
-    if (frame.kind === 'delta') h.onDelta(frame.text)
-    else if (frame.kind === 'done') {
+    h.onFrame(frame)
+    if (frame.kind === 'done') {
       settled = true
-      h.onDone()
       close()
     } else if (frame.kind === 'error') {
       settled = true
-      h.onError(frame.message)
       close()
     }
   }
   sock.onerror = () => {
     if (settled) return
     settled = true
-    h.onError('连接失败')
+    h.onFrame({ kind: 'error', reqId: 'q', message: '连接失败' })
     close()
   }
   sock.onclose = () => {
     if (settled) return
     settled = true
-    h.onError('连接已关闭')
+    h.onFrame({ kind: 'error', reqId: 'q', message: '连接已关闭' })
   }
   return {
     cancel: () => {
@@ -368,11 +366,12 @@ export function streamQuery(
 }
 
 /** Open `WS /api/query-files`, send one selected-file-set relationship question,
- *  and stream the answer back token by token (S-FSQ). */
+ *  and forward the same status/evidence/delta terminal contract (S-QWEB-2). */
 export function streamQueryFiles(
   req: {
     filePaths: string[]
     question: string
+    allowWeb: boolean
   },
   h: QueryHandlers,
 ): QueryStream {
@@ -392,6 +391,7 @@ export function streamQueryFiles(
         reqId: 'qf',
         filePaths: req.filePaths,
         question: req.question,
+        allowWeb: req.allowWeb,
       }),
     )
   }
@@ -402,27 +402,25 @@ export function streamQueryFiles(
     } catch {
       return
     }
-    if (frame.kind === 'delta') h.onDelta(frame.text)
-    else if (frame.kind === 'done') {
+    h.onFrame(frame)
+    if (frame.kind === 'done') {
       settled = true
-      h.onDone()
       close()
     } else if (frame.kind === 'error') {
       settled = true
-      h.onError(frame.message)
       close()
     }
   }
   sock.onerror = () => {
     if (settled) return
     settled = true
-    h.onError('连接失败')
+    h.onFrame({ kind: 'error', reqId: 'qf', message: '连接失败' })
     close()
   }
   sock.onclose = () => {
     if (settled) return
     settled = true
-    h.onError('连接已关闭')
+    h.onFrame({ kind: 'error', reqId: 'qf', message: '连接已关闭' })
   }
   return {
     cancel: () => {

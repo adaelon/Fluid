@@ -77,7 +77,7 @@ const settingsOpen = ref(false)
 
 // S-SEL-2: user-level pre-authorization for supplier-hosted Web Search. It is
 // local UI state (not an LLM credential), defaults on, and is sent with each
-// selection request. S-QWEB-2 will reuse the same App-level value later.
+// selection and follow-up-query request, so both paths share one policy switch.
 const ALLOW_WEB_KEY = 'fluid:allowWeb'
 const allowWeb = ref(localStorage.getItem(ALLOW_WEB_KEY) !== 'false')
 
@@ -328,6 +328,7 @@ function closeTab(path: string) {
       :selection-mode="fileSelectionMode"
       :selected-count="selectedFileCount"
       :selected-paths="selectedFilePathList"
+      :allow-web="allowWeb"
       @close="queryPanelOpen = false"
       @toggle-selection-mode="fileSelectionMode = !fileSelectionMode"
       @clear-selected="clearSelectedFiles"

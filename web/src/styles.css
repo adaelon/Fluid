@@ -813,8 +813,92 @@ body {
   padding: 10px;
   font-size: 13px;
   line-height: 1.55;
-  white-space: pre-wrap;
+  white-space: normal;
   color: var(--text);
+}
+
+.query-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.query-status.fallback {
+  color: var(--c-branch);
+}
+.query-status-spinner {
+  flex: none;
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: selection-spin 700ms linear infinite;
+}
+
+.query-evidence-block {
+  margin-bottom: 9px;
+  padding: 7px 9px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 12px;
+}
+.query-evidence-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.query-evidence-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 20px;
+  padding: 1px 7px;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 11px;
+}
+.query-evidence-badge.tone-project,
+.query-evidence-badge.tone-cited {
+  color: var(--c-normal);
+  border-color: color-mix(in srgb, var(--c-normal) 45%, var(--border));
+  background: color-mix(in srgb, var(--c-normal) 10%, transparent);
+}
+.query-evidence-badge.tone-uncited {
+  color: var(--c-branch);
+  border-color: color-mix(in srgb, var(--c-branch) 45%, var(--border));
+  background: color-mix(in srgb, var(--c-branch) 10%, transparent);
+}
+.query-source-count {
+  color: var(--muted);
+  font-size: 11px;
+}
+.query-sources {
+  margin: 6px 0 0;
+  padding-left: 18px;
+}
+.query-sources li + li {
+  margin-top: 3px;
+}
+.query-sources a {
+  color: var(--accent);
+  text-decoration: none;
+  overflow-wrap: anywhere;
+}
+.query-sources a:hover {
+  text-decoration: underline;
+}
+.query-warning,
+.query-error {
+  margin: 6px 0 0;
+  color: var(--c-branch);
+  font-size: 12px;
+}
+.query-answer-plain {
+  white-space: pre-wrap;
 }
 
 /* Rendered Markdown answer (S11-md): override the panel's pre-wrap, give block

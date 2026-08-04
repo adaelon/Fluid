@@ -1,12 +1,14 @@
 <script setup lang="ts">
 // S10b: the follow-up query terminal, docked as a bottom panel (ADR-0015/0016
 // PENDING resolved — out of the right edge so it never fights trailing line
-// notes). Asks the current file a free-form question and streams the answer back
-// token by token over WS /api/query (S10a). Context is the whole current file
-// (CONTEXT 追问器); switching files vacuums the in-flight Q&A.
+// notes). Asks the current file or selected file set a free-form question and
+// projects status/evidence plus token deltas from the matching query WebSocket.
+// Switching files or scope vacuums the in-flight Q&A.
 import { computed, ref, watch, nextTick, onBeforeUnmount } from 'vue'
 import { streamQuery, streamQueryFiles, type QueryStream } from './api'
+import type { QueryFrame } from './ghostTypes'
 import { EMPTY_QUERY_CONTEXT, type QueryContext } from './queryContext'
+import { idleQueryState, reduceQueryFrame, startQueryRequest } from './queryState'
 // S11-lazy: markdown-it / DOMPurify / KaTeX (+ its CSS) are heavy and only needed
 // once an answer finishes streaming, so they are dynamically import()ed inside
 // renderAnswer() rather than at module top — Rollup splits them into async chunks
@@ -19,8 +21,15 @@ const props = withDefaults(
     selectionMode?: boolean
     selectedCount?: number
     selectedPaths?: string[]
+    allowWeb?: boolean
   }>(),
-  { ctx: () => EMPTY_QUERY_CONTEXT, selectionMode: false, selectedCount: 0, selectedPaths: () => [] },
+  {
+    ctx: () => EMPTY_QUERY_CONTEXT,
+    selectionMode: false,
+    selectedCount: 0,
+    selectedPaths: () => [],
+    allowWeb: true,
+  },
 )
 // Visibility is owned by the parent (App) via the status-bar toggle — default
 // hidden so the bottom space goes back to the code area; the panel only asks to
@@ -34,13 +43,45 @@ const emit = defineEmits<{
 type QueryScope = 'current' | 'selected'
 
 const question = ref('')
-const answer = ref('') // plain token-by-token text shown while streaming
 const answerHtml = ref('') // sanitized Markdown HTML, set once on `done`
-const streaming = ref(false)
-const errorMsg = ref('')
+const viewState = ref(idleQueryState())
 const renderedEl = ref<HTMLElement | null>(null)
 const scope = ref<QueryScope>('current')
 let stream: QueryStream | null = null
+let requestGeneration = 0
+
+const answer = computed(() => viewState.value.answer)
+const streaming = computed(() => viewState.value.mode === 'streaming')
+const errorMsg = computed(() => viewState.value.errorMessage)
+const evidenceState = computed(() => viewState.value.evidence)
+const evidenceDisplay = computed(() => {
+  switch (evidenceState.value?.status) {
+    case 'project-source':
+      return { label: '项目源码', tone: 'project' }
+    case 'web-cited':
+      return { label: '网页有来源', tone: 'cited' }
+    case 'web-uncited':
+      return { label: '联网无来源', tone: 'uncited' }
+    default:
+      return { label: '未核验', tone: 'unverified' }
+  }
+})
+const statusText = computed(() => {
+  switch (viewState.value.phase) {
+    case 'connecting':
+      return '正在连接追问服务…'
+    case 'planning-web':
+      return '正在规划联网检索…'
+    case 'searching-web':
+      return '正在检索网页…'
+    case 'answering':
+      return '正在生成回答…'
+    case 'fallback':
+      return viewState.value.statusMessage || '联网失败，正在改用本地上下文…'
+    default:
+      return ''
+  }
+})
 
 const selectedReady = computed(() => props.selectedCount >= 2)
 const selectedLabel = computed(() => `已选文件(${props.selectedCount})`)
@@ -57,16 +98,15 @@ const canAsk = computed(() => {
 
 function resetAnswer(clearQuestion = true) {
   teardown()
-  answer.value = ''
+  viewState.value = idleQueryState()
   answerHtml.value = ''
-  errorMsg.value = ''
   if (clearQuestion) question.value = ''
 }
 
 function teardown() {
+  requestGeneration++
   stream?.cancel()
   stream = null
-  streaming.value = false
 }
 
 // Switching/closing files resets the panel (vacuum semantics, §7).
@@ -81,7 +121,7 @@ watch(scope, () => resetAnswer(false))
 
 // On `done`, render the full Markdown answer (ADR-0008): markdown-it escapes raw
 // HTML, DOMPurify is defense-in-depth, then KaTeX transforms $…$/$$…$$ in the DOM.
-async function renderAnswer() {
+async function renderAnswer(generation: number, text: string) {
   // Pull the render libs on demand (S11-lazy). The CSS import is a side effect
   // (injects KaTeX styles) — its module value is unused.
   const [{ renderMarkdown }, { default: DOMPurify }, { default: renderMathInElement }] =
@@ -91,9 +131,10 @@ async function renderAnswer() {
       import('katex/contrib/auto-render'),
       import('katex/dist/katex.min.css'),
     ])
-  answerHtml.value = DOMPurify.sanitize(renderMarkdown(answer.value))
+  if (generation !== requestGeneration) return
+  answerHtml.value = DOMPurify.sanitize(renderMarkdown(text))
   await nextTick()
-  if (!renderedEl.value) return
+  if (generation !== requestGeneration || !renderedEl.value) return
   renderMathInElement(renderedEl.value, {
     delimiters: [
       { left: '$$', right: '$$', display: true },
@@ -105,46 +146,49 @@ async function renderAnswer() {
   })
 }
 
+function acceptFrame(generation: number, frame: QueryFrame) {
+  if (generation !== requestGeneration) return
+  const next = reduceQueryFrame(viewState.value, frame)
+  viewState.value = next
+  if (frame.kind === 'done') {
+    stream = null
+    void renderAnswer(generation, next.answer)
+  } else if (frame.kind === 'error') {
+    stream = null
+  }
+}
+
 function ask() {
   const q = question.value.trim()
   if (!q || streaming.value) return
   if (scope.value === 'selected') {
     if (!selectedReady.value) {
-      errorMsg.value = selectedScopeHint.value
+      viewState.value = {
+        ...idleQueryState(),
+        mode: 'error',
+        errorMessage: selectedScopeHint.value,
+      }
       return
     }
-    answer.value = ''
+    const generation = ++requestGeneration
+    viewState.value = startQueryRequest()
     answerHtml.value = ''
-    errorMsg.value = ''
-    streaming.value = true
     stream = streamQueryFiles(
       {
         filePaths: props.selectedPaths,
         question: q,
+        allowWeb: props.allowWeb,
       },
       {
-        onDelta: (t) => {
-          answer.value += t
-        },
-        onDone: () => {
-          streaming.value = false
-          stream = null
-          void renderAnswer()
-        },
-        onError: (m) => {
-          errorMsg.value = m
-          streaming.value = false
-          stream = null
-        },
+        onFrame: (frame) => acceptFrame(generation, frame),
       },
     )
     return
   }
   if (!props.path) return
-  answer.value = ''
+  const generation = ++requestGeneration
+  viewState.value = startQueryRequest()
   answerHtml.value = ''
-  errorMsg.value = ''
-  streaming.value = true
   stream = streamQuery(
     {
       filePath: props.path,
@@ -152,21 +196,10 @@ function ask() {
       roster: props.ctx.roster,
       rosterSpans: props.ctx.rosterSpans,
       capsules: props.ctx.capsules,
+      allowWeb: props.allowWeb,
     },
     {
-      onDelta: (t) => {
-        answer.value += t
-      },
-      onDone: () => {
-        streaming.value = false
-        stream = null
-        void renderAnswer()
-      },
-      onError: (m) => {
-        errorMsg.value = m
-        streaming.value = false
-        stream = null
-      },
+      onFrame: (frame) => acceptFrame(generation, frame),
     },
   )
 }
@@ -239,12 +272,57 @@ onBeforeUnmount(teardown)
     <div v-if="!path && scope === 'current'" class="query-vacuum">打开文件以启用追问</div>
       <template v-else>
         <div class="query-answer">
-          <span v-if="errorMsg" class="query-error">{{ errorMsg }}</span>
-          <div v-else-if="answerHtml" ref="renderedEl" class="query-answer-md" v-html="answerHtml"></div>
-          <template v-else-if="answer">{{ answer }}</template>
-          <span v-else-if="streaming" class="query-thinking">思考中…</span>
-          <span v-else-if="scope === 'selected'" class="query-hint">{{ selectedScopeHint }}</span>
-          <span v-else class="query-hint">就当前文件提问，例如「这个文件做什么？」</span>
+          <div
+            v-if="streaming && statusText"
+            class="query-status"
+            :class="{ fallback: viewState.phase === 'fallback' }"
+            role="status"
+          >
+            <span v-if="viewState.phase !== 'fallback'" class="query-status-spinner" aria-hidden="true"></span>
+            <span>{{ statusText }}</span>
+          </div>
+
+          <div v-if="evidenceState" class="query-evidence-block">
+            <div class="query-evidence-summary">
+              <span class="query-evidence-badge" :class="`tone-${evidenceDisplay.tone}`">
+                {{ evidenceDisplay.label }}
+              </span>
+              <span v-if="evidenceState.sources.length" class="query-source-count">
+                {{ evidenceState.sources.length }} 个来源
+              </span>
+            </div>
+            <ul v-if="evidenceState.sources.length" class="query-sources">
+              <li v-for="source in evidenceState.sources" :key="source.url">
+                <a :href="source.url" target="_blank" rel="noopener noreferrer">
+                  {{ source.title }}
+                </a>
+              </li>
+            </ul>
+            <p v-else-if="evidenceState.status === 'web-uncited'" class="query-warning">
+              供应商返回了联网整理内容，但没有可追溯 URL。
+            </p>
+            <p
+              v-else-if="evidenceState.status === 'unverified' && !evidenceState.warning"
+              class="query-warning"
+            >
+              本次回答仅依据本地上下文，未由外部来源核验。
+            </p>
+            <p v-if="evidenceState.warning" class="query-warning">
+              {{ evidenceState.warning }}
+            </p>
+          </div>
+
+          <div v-if="answerHtml" ref="renderedEl" class="query-answer-md" v-html="answerHtml"></div>
+          <div v-else-if="answer" class="query-answer-plain">{{ answer }}</div>
+          <span v-else-if="!streaming && !errorMsg && scope === 'selected'" class="query-hint">
+            {{ selectedScopeHint }}
+          </span>
+          <span v-else-if="!streaming && !errorMsg" class="query-hint">
+            就当前文件提问，例如「这个文件做什么？」
+          </span>
+          <p v-if="errorMsg" class="query-error">
+            {{ answer ? `回答中断：${errorMsg}` : errorMsg }}
+          </p>
         </div>
         <form class="query-form" @submit.prevent="ask">
           <input

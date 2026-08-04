@@ -28,22 +28,32 @@ export type GenFrame =
   | { kind: 'done'; reqId: string }
   | { kind: 'error'; reqId: string; message: string }
 
-/** One inbound frame from `WS /api/query` (S10a, routes.rs QueryFrame). The answer
- *  is free-form markdown streamed as `delta` chunks; terminal frames are
- *  `done` | `error`. `reqId` echoes the request. */
-export type QueryFrame =
-  | { kind: 'delta'; reqId: string; text: string }
-  | { kind: 'done'; reqId: string }
-  | { kind: 'error'; reqId: string; message: string }
-
-/** Evidence metadata shared by selection explanations and the later query-Web
- * slice. `web-uncited` is a successful supplier search with no returned URLs. */
+/** Evidence metadata shared by selection explanations and follow-up queries.
+ * `web-uncited` is a successful supplier search with no returned URLs. */
 export type EvidenceStatus = 'project-source' | 'web-cited' | 'web-uncited' | 'unverified'
 
 export interface SourceLink {
   title: string
   url: string
 }
+
+export type QueryPhase = 'planning-web' | 'searching-web' | 'answering' | 'fallback'
+
+/** One inbound frame from either query WebSocket (S-QWEB-2, routes.rs
+ * QueryFrame). `status` and `evidence` precede the existing free-form markdown
+ * `delta` stream; terminal frames remain `done` | `error`. */
+export type QueryFrame =
+  | { kind: 'status'; reqId: string; phase: QueryPhase; message: string }
+  | {
+      kind: 'evidence'
+      reqId: string
+      status: EvidenceStatus
+      sources?: SourceLink[]
+      warning?: string
+    }
+  | { kind: 'delta'; reqId: string; text: string }
+  | { kind: 'done'; reqId: string }
+  | { kind: 'error'; reqId: string; message: string }
 
 export type SelectionKind = '模块' | '类型' | '函数' | '方法' | '变量' | '表达式' | '未知'
 
