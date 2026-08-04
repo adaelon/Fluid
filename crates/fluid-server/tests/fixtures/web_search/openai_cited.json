@@ -1,0 +1,45 @@
+{
+  "id": "resp_openai_fixture",
+  "status": "completed",
+  "output": [
+    {
+      "type": "web_search_call",
+      "status": "completed",
+      "action": {
+        "type": "search",
+        "sources": [
+          {
+            "type": "url",
+            "title": "Rust Blog",
+            "url": "https://blog.rust-lang.org/release.html"
+          },
+          {
+            "type": "url",
+            "title": "Release Notes",
+            "url": "https://doc.rust-lang.org/releases.html"
+          }
+        ]
+      }
+    },
+    {
+      "type": "message",
+      "status": "completed",
+      "role": "assistant",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "Rust 1.80 was released with cited details.",
+          "annotations": [
+            {
+              "type": "url_citation",
+              "start_index": 0,
+              "end_index": 9,
+              "title": "Rust Blog",
+              "url": "https://blog.rust-lang.org/release.html"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+{
+  "id": "resp_deepseek_fixture",
+  "status": "completed",
+  "output": [
+    {
+      "type": "web_search_call",
+      "status": "completed",
+      "action": {
+        "type": "search",
+        "query": "DeepSeek Responses web search"
+      }
+    },
+    {
+      "type": "message",
+      "status": "completed",
+      "role": "assistant",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "DeepSeek returned a web-grounded summary.",
+          "annotations": []
+        }
+      ]
+    }
+  ]
+}

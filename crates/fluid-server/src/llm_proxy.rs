@@ -12,18 +12,25 @@
 //! - `FLUID_LLM_MODEL`    (default `glm-5.1`; passed in from main so the cache
 //!   model_version stays in lock-step with the model actually queried)
 
+use std::time::Duration;
+
 use serde::Deserialize;
 
 use crate::cache_store::{Capsule, LineAnnotation};
+use crate::web_evidence::{parse_web_search_response, WebSearchError, WebSearchResult};
 
 pub const DEFAULT_BASE_URL: &str = "https://opencode.ai/zen/go/v1";
 pub const DEFAULT_MODEL: &str = "glm-5.1";
+const WEB_SEARCH_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct LlmProxy {
     client: reqwest::Client,
     base_url: String,
     api_key: String,
     pub model: String,
+    // S-WEB-2 will make the S-WEB-1 search adapter reachable from a route.
+    #[allow(dead_code)]
+    web_search_timeout: Duration,
 }
 
 impl LlmProxy {
@@ -40,7 +47,43 @@ impl LlmProxy {
             base_url: cfg.base_url.clone(),
             api_key: cfg.api_key.clone(),
             model: cfg.model.clone(),
+            web_search_timeout: WEB_SEARCH_TIMEOUT,
         })
+    }
+
+    /// Run one non-streaming supplier-hosted web search through the Responses
+    /// API. `query` is the only business input: no source code, file path, or
+    /// private context is accepted by this boundary.
+    #[allow(dead_code)] // staged protocol entry point; first consumer is S-WEB-2
+    pub async fn responses_web_search(
+        &self,
+        query: &str,
+    ) -> Result<WebSearchResult, WebSearchError> {
+        let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
+        let body = serde_json::json!({
+            "model": self.model,
+            "input": query,
+            "tools": [{ "type": "web_search" }],
+            "tool_choice": { "type": "web_search" },
+        });
+
+        let response = self
+            .client
+            .post(&url)
+            .bearer_auth(&self.api_key)
+            .json(&body)
+            .timeout(self.web_search_timeout)
+            .send()
+            .await
+            .map_err(classify_transport_error)?;
+
+        let status = response.status();
+        let text = response.text().await.map_err(classify_transport_error)?;
+        if !status.is_success() {
+            return Err(classify_web_search_status(status.as_u16(), &text));
+        }
+
+        parse_web_search_response(&text)
     }
 
     /// One non-streaming chat completion; returns the assistant message content.
@@ -111,6 +154,63 @@ impl LlmProxy {
         }
         Ok(resp)
     }
+}
+
+#[allow(dead_code)] // reachable with responses_web_search in S-WEB-2
+fn classify_transport_error(error: reqwest::Error) -> WebSearchError {
+    if error.is_timeout() {
+        WebSearchError::Timeout(error.to_string())
+    } else {
+        WebSearchError::Transport(error.to_string())
+    }
+}
+
+#[allow(dead_code)] // reachable with responses_web_search in S-WEB-2
+fn classify_web_search_status(status: u16, body: &str) -> WebSearchError {
+    let message = provider_error_message(body);
+    match status {
+        401 | 403 => WebSearchError::Authentication { status, message },
+        404 | 405 | 501 => WebSearchError::Unsupported { status, message },
+        429 => WebSearchError::RateLimited { status, message },
+        400 | 422
+            if indicates_unsupported_tool(body) || indicates_unsupported_tool(&message) =>
+        {
+            WebSearchError::Unsupported { status, message }
+        }
+        _ => WebSearchError::Provider { status, message },
+    }
+}
+
+#[allow(dead_code)] // reachable with responses_web_search in S-WEB-2
+fn provider_error_message(body: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/error/message")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .filter(|message| !message.trim().is_empty())
+        .unwrap_or_else(|| {
+            let body = body.trim();
+            if body.is_empty() {
+                "empty response body".to_string()
+            } else {
+                body.to_string()
+            }
+        })
+}
+
+#[allow(dead_code)] // reachable with responses_web_search in S-WEB-2
+fn indicates_unsupported_tool(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    let names_web_search = message.contains("web_search") || message.contains("web search");
+    let names_tool = names_web_search || message.contains("tool");
+    names_tool
+        && (message.contains("unsupported")
+            || message.contains("not supported")
+            || message.contains("does not support"))
 }
 
 /// Incremental decoder for an OpenAI-compatible SSE stream. The byte stream is
@@ -313,6 +413,235 @@ fn extract_json(content: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+
+    use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
+
+    #[derive(Clone)]
+    struct MockResponse {
+        status: StatusCode,
+        body: &'static str,
+        delay: Duration,
+        requests: Arc<Mutex<Vec<serde_json::Value>>>,
+    }
+
+    struct MockServer {
+        base_url: String,
+        requests: Arc<Mutex<Vec<serde_json::Value>>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for MockServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    async fn mock_responses(
+        State(state): State<MockResponse>,
+        Json(request): Json<serde_json::Value>,
+    ) -> (StatusCode, String) {
+        state.requests.lock().unwrap().push(request);
+        if !state.delay.is_zero() {
+            tokio::time::sleep(state.delay).await;
+        }
+        (state.status, state.body.to_string())
+    }
+
+    async fn start_mock(status: StatusCode, body: &'static str, delay: Duration) -> MockServer {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let state = MockResponse {
+            status,
+            body,
+            delay,
+            requests: Arc::clone(&requests),
+        };
+        let app = Router::new()
+            .route("/responses", post(mock_responses))
+            .with_state(state);
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        MockServer {
+            base_url: format!("http://{address}"),
+            requests,
+            task,
+        }
+    }
+
+    fn test_proxy(base_url: &str, timeout: Duration) -> LlmProxy {
+        LlmProxy {
+            client: reqwest::Client::new(),
+            base_url: base_url.to_string(),
+            api_key: "fixture-key".to_string(),
+            model: "fixture-model".to_string(),
+            web_search_timeout: timeout,
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_web_search_sends_only_public_query_and_protocol_fields() {
+        let server = start_mock(
+            StatusCode::OK,
+            include_str!("../tests/fixtures/web_search/openai_cited.json"),
+            Duration::ZERO,
+        )
+        .await;
+        let proxy = test_proxy(&server.base_url, Duration::from_secs(1));
+
+        let result = proxy
+            .responses_web_search("Rust 1.80 release notes")
+            .await
+            .unwrap();
+
+        assert_eq!(result.sources.len(), 2);
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert_eq!(request.as_object().unwrap().len(), 4);
+        assert_eq!(request["model"], "fixture-model");
+        assert_eq!(request["input"], "Rust 1.80 release notes");
+        assert_eq!(
+            request["tools"],
+            serde_json::json!([{ "type": "web_search" }])
+        );
+        assert_eq!(
+            request["tool_choice"],
+            serde_json::json!({ "type": "web_search" })
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_web_search_accepts_uncited_supplier_output() {
+        let server = start_mock(
+            StatusCode::OK,
+            include_str!("../tests/fixtures/web_search/deepseek_uncited.json"),
+            Duration::ZERO,
+        )
+        .await;
+        let proxy = test_proxy(&server.base_url, Duration::from_secs(1));
+
+        let result = proxy.responses_web_search("DeepSeek docs").await.unwrap();
+
+        assert!(result.sources.is_empty());
+        assert_eq!(result.text, "DeepSeek returned a web-grounded summary.");
+    }
+
+    #[tokio::test]
+    async fn responses_web_search_classifies_authentication_failure() {
+        let server = start_mock(
+            StatusCode::UNAUTHORIZED,
+            include_str!("../tests/fixtures/web_search/error.json"),
+            Duration::ZERO,
+        )
+        .await;
+        let proxy = test_proxy(&server.base_url, Duration::from_secs(1));
+
+        let error = proxy.responses_web_search("query").await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            WebSearchError::Authentication { status: 401, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn responses_web_search_classifies_missing_endpoint_as_unsupported() {
+        let server = start_mock(
+            StatusCode::NOT_FOUND,
+            include_str!("../tests/fixtures/web_search/error.json"),
+            Duration::ZERO,
+        )
+        .await;
+        let proxy = test_proxy(&server.base_url, Duration::from_secs(1));
+
+        let error = proxy.responses_web_search("query").await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            WebSearchError::Unsupported { status: 404, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn responses_web_search_classifies_rejected_tool_as_unsupported() {
+        let server = start_mock(
+            StatusCode::BAD_REQUEST,
+            include_str!("../tests/fixtures/web_search/error.json"),
+            Duration::ZERO,
+        )
+        .await;
+        let proxy = test_proxy(&server.base_url, Duration::from_secs(1));
+
+        let error = proxy.responses_web_search("query").await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            WebSearchError::Unsupported { status: 400, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn responses_web_search_classifies_rate_limit_and_provider_failure() {
+        for (status, expected_rate_limit) in [
+            (StatusCode::TOO_MANY_REQUESTS, true),
+            (StatusCode::BAD_GATEWAY, false),
+        ] {
+            let server = start_mock(
+                status,
+                include_str!("../tests/fixtures/web_search/error.json"),
+                Duration::ZERO,
+            )
+            .await;
+            let proxy = test_proxy(&server.base_url, Duration::from_secs(1));
+
+            let error = proxy.responses_web_search("query").await.unwrap_err();
+
+            if expected_rate_limit {
+                assert!(matches!(
+                    error,
+                    WebSearchError::RateLimited { status: 429, .. }
+                ));
+            } else {
+                assert!(matches!(
+                    error,
+                    WebSearchError::Provider { status: 502, .. }
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_web_search_classifies_timeout() {
+        let server = start_mock(
+            StatusCode::OK,
+            include_str!("../tests/fixtures/web_search/openai_cited.json"),
+            Duration::from_millis(200),
+        )
+        .await;
+        let proxy = test_proxy(&server.base_url, Duration::from_millis(20));
+
+        let error = proxy.responses_web_search("query").await.unwrap_err();
+
+        assert!(matches!(error, WebSearchError::Timeout(_)));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a configured provider/model with Responses Web Search and external network"]
+    async fn responses_web_search_real_provider_smoke() {
+        let _ = dotenvy::dotenv();
+        let config = crate::settings::LlmConfig::from_env();
+        let proxy = LlmProxy::from_config(&config).expect("OPENCODE_API_KEY must be configured");
+
+        let result = proxy
+            .responses_web_search("Rust programming language official website")
+            .await
+            .expect("configured provider/model must support Responses Web Search");
+
+        assert!(!result.text.trim().is_empty());
+    }
 
     #[test]
     fn parses_plain_json_and_injects_fn_id() {

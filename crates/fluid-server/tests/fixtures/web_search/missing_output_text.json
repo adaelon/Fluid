@@ -1,0 +1,20 @@
+{
+  "id": "resp_missing_text_fixture",
+  "status": "completed",
+  "output": [
+    {
+      "type": "web_search_call",
+      "status": "completed",
+      "action": {
+        "type": "search",
+        "sources": []
+      }
+    },
+    {
+      "type": "message",
+      "status": "completed",
+      "role": "assistant",
+      "content": []
+    }
+  ]
+}

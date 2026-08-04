@@ -12,6 +12,10 @@ mod routes;
 mod settings;
 mod static_assets;
 mod translate;
+// S-WEB-1 intentionally lands the stable protocol layer before S-WEB-2 adds
+// its first business consumer. Keep this allowance local to that staged module.
+#[allow(dead_code)]
+mod web_evidence;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

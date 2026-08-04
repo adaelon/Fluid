@@ -1,0 +1,7 @@
+{
+  "error": {
+    "message": "Invalid tool for this model",
+    "type": "invalid_request_error",
+    "code": "unsupported_tool"
+  }
+}
