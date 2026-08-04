@@ -125,6 +125,12 @@ pub struct EvidenceRequest<'a> {
     pub allow_web: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvidenceProgress {
+    PlanningWeb,
+    SearchingWeb,
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct WebEvidenceService;
 
@@ -142,6 +148,18 @@ impl WebEvidenceService {
         llm: Arc<LlmProxy>,
         request: EvidenceRequest<'_>,
     ) -> EvidenceOutcome {
+        self.resolve_with_progress(llm, request, |_| {}).await
+    }
+
+    pub async fn resolve_with_progress<F>(
+        &self,
+        llm: Arc<LlmProxy>,
+        request: EvidenceRequest<'_>,
+        mut progress: F,
+    ) -> EvidenceOutcome
+    where
+        F: FnMut(EvidenceProgress),
+    {
         if let Some(project_evidence) = request
             .project_evidence
             .map(str::trim)
@@ -153,6 +171,7 @@ impl WebEvidenceService {
             return EvidenceOutcome::unverified(None);
         }
 
+        progress(EvidenceProgress::PlanningWeb);
         let (system, user) = build_web_search_planning_prompt(
             request.private_context,
             request.dependency_hints,
@@ -177,6 +196,7 @@ impl WebEvidenceService {
             return EvidenceOutcome::unverified(None);
         };
 
+        progress(EvidenceProgress::SearchingWeb);
         match llm.responses_web_search(&query).await {
             Ok(result) if result.sources.is_empty() => EvidenceOutcome {
                 status: EvidenceStatus::WebUncited,
@@ -217,12 +237,25 @@ impl EvidenceOutcome {
 
 /// Function-shaped entry point for selection/query consumers that do not need to
 /// retain a service value.
-#[allow(dead_code)] // staged shared entry point; route consumers arrive after S-WEB-2
+#[allow(dead_code)] // non-progress consumer entry point; selection uses the progress variant
 pub async fn resolve_web_evidence(
     llm: Arc<LlmProxy>,
     request: EvidenceRequest<'_>,
 ) -> EvidenceOutcome {
     WebEvidenceService::new().resolve(llm, request).await
+}
+
+pub async fn resolve_web_evidence_with_progress<F>(
+    llm: Arc<LlmProxy>,
+    request: EvidenceRequest<'_>,
+    progress: F,
+) -> EvidenceOutcome
+where
+    F: FnMut(EvidenceProgress),
+{
+    WebEvidenceService::new()
+        .resolve_with_progress(llm, request, progress)
+        .await
 }
 
 /// Stable failure categories consumed by the future evidence orchestrator.
@@ -634,12 +667,19 @@ mod tests {
         )
         .await;
         let proxy = test_proxy(&server, Duration::from_secs(1));
+        let mut progress = Vec::new();
 
-        let outcome = WebEvidenceService::new().resolve(proxy, request()).await;
+        let outcome = WebEvidenceService::new()
+            .resolve_with_progress(proxy, request(), |phase| progress.push(phase))
+            .await;
 
         assert_eq!(outcome.status, EvidenceStatus::WebCited);
         assert_eq!(outcome.sources.len(), 2);
         assert!(outcome.warning.is_none());
+        assert_eq!(
+            progress,
+            vec![EvidenceProgress::PlanningWeb, EvidenceProgress::SearchingWeb]
+        );
 
         let requests = server.requests.lock().unwrap();
         assert_eq!(requests.len(), 2);

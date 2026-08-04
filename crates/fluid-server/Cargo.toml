@@ -10,7 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 axum = { version = "0.7", features = ["ws"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive"] }
@@ -34,3 +34,9 @@ rust-embed = "8"
 mime_guess = "2"
 # Best-effort: open the default browser at the served URL on startup.
 open = "5"
+
+[dev-dependencies]
+# Real WebSocket fixture for route/protocol coverage; all supplier calls remain
+# local axum fixtures and never require external network.
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+tokio-tungstenite = "0.24"

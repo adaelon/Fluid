@@ -16,8 +16,10 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::cache_store::{Capsule, LineAnnotation};
-use crate::web_evidence::{parse_web_search_response, WebSearchError, WebSearchResult};
+use crate::cache_store::{Capsule, LineAnnotation, SelectionExplanation, SelectionKind};
+use crate::web_evidence::{
+    parse_web_search_response, EvidenceStatus, SourceLink, WebSearchError, WebSearchResult,
+};
 
 pub const DEFAULT_BASE_URL: &str = "https://opencode.ai/zen/go/v1";
 pub const DEFAULT_MODEL: &str = "glm-5.1";
@@ -136,7 +138,11 @@ impl LlmProxy {
     /// /api/query). The caller drives `resp.bytes_stream()` through an `SseDecoder`
     /// to pull content deltas. A non-2xx status is drained and turned into an error
     /// here, so the caller only ever streams a healthy body.
-    pub async fn open_chat_stream(&self, system: &str, user: &str) -> anyhow::Result<reqwest::Response> {
+    pub async fn open_chat_stream(
+        &self,
+        system: &str,
+        user: &str,
+    ) -> anyhow::Result<reqwest::Response> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let body = serde_json::json!({
             "model": self.model,
@@ -179,9 +185,7 @@ fn classify_web_search_status(status: u16, body: &str) -> WebSearchError {
         401 | 403 => WebSearchError::Authentication { status, message },
         404 | 405 | 501 => WebSearchError::Unsupported { status, message },
         429 => WebSearchError::RateLimited { status, message },
-        400 | 422
-            if indicates_unsupported_tool(body) || indicates_unsupported_tool(&message) =>
-        {
+        400 | 422 if indicates_unsupported_tool(body) || indicates_unsupported_tool(&message) => {
             WebSearchError::Unsupported { status, message }
         }
         _ => WebSearchError::Provider { status, message },
@@ -314,10 +318,14 @@ const DEFAULT_LINE_COLOR: &str = "#7ee787";
 /// Parse the model's content into a `(Capsule, Vec<LineAnnotation>)`. Tolerates
 /// markdown code fences / surrounding prose; `fn_id` is injected by us (the model
 /// is not asked to echo it). A missing line color defaults to the neutral tone.
-pub fn parse_generation(content: &str, fn_id: &str) -> anyhow::Result<(Capsule, Vec<LineAnnotation>)> {
+pub fn parse_generation(
+    content: &str,
+    fn_id: &str,
+) -> anyhow::Result<(Capsule, Vec<LineAnnotation>)> {
     let json = extract_json(content);
-    let raw: RawGeneration = serde_json::from_str(json)
-        .map_err(|e| anyhow::anyhow!("LLM did not return the expected JSON: {e}; content: {content}"))?;
+    let raw: RawGeneration = serde_json::from_str(json).map_err(|e| {
+        anyhow::anyhow!("LLM did not return the expected JSON: {e}; content: {content}")
+    })?;
 
     let capsule = Capsule {
         fn_id: fn_id.to_string(),
@@ -352,6 +360,19 @@ struct RawLineAnnotation {
     color: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawSelectionExplanation {
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    meaning: String,
+    #[serde(default)]
+    role_here: String,
+    #[serde(default)]
+    origin: Option<String>,
+}
+
 /// Parse the model's reply for a single manual-line explanation (S9) into one
 /// `LineAnnotation`. The model returns only `{text, color}`; `fn_id` and
 /// `line_number` are injected by us. Tolerates fences/prose like `parse_generation`;
@@ -363,8 +384,9 @@ pub fn parse_line_annotation(
     line_number: u32,
 ) -> anyhow::Result<LineAnnotation> {
     let json = extract_json(content);
-    let raw: RawLineAnnotation = serde_json::from_str(json)
-        .map_err(|e| anyhow::anyhow!("LLM did not return the expected JSON: {e}; content: {content}"))?;
+    let raw: RawLineAnnotation = serde_json::from_str(json).map_err(|e| {
+        anyhow::anyhow!("LLM did not return the expected JSON: {e}; content: {content}")
+    })?;
     if raw.text.trim().is_empty() {
         anyhow::bail!("LLM returned an empty line annotation; content: {content}");
     }
@@ -378,6 +400,55 @@ pub fn parse_line_annotation(
             raw.color
         },
     })
+}
+
+/// Parse the model-authored semantic fields for one arbitrary selection. The
+/// selected source text and every evidence field are injected from deterministic
+/// backend state, so a model reply cannot forge citations or upgrade its status.
+pub fn parse_selection_explanation(
+    content: &str,
+    selected_text: &str,
+    evidence_status: EvidenceStatus,
+    sources: Vec<SourceLink>,
+    warning: Option<String>,
+) -> anyhow::Result<SelectionExplanation> {
+    let raw: RawSelectionExplanation =
+        serde_json::from_str(extract_json(content)).map_err(|e| {
+            anyhow::anyhow!(
+                "LLM did not return the expected selection JSON: {e}; content: {content}"
+            )
+        })?;
+    let meaning = raw.meaning.trim();
+    let role_here = raw.role_here.trim();
+    if meaning.is_empty() || role_here.is_empty() {
+        anyhow::bail!("LLM returned an incomplete selection explanation; content: {content}");
+    }
+
+    Ok(SelectionExplanation {
+        selected_text: selected_text.to_string(),
+        kind: parse_selection_kind(&raw.kind),
+        meaning: meaning.to_string(),
+        role_here: role_here.to_string(),
+        origin: raw.origin.and_then(|origin| {
+            let origin = origin.trim();
+            (!origin.is_empty()).then(|| origin.to_string())
+        }),
+        evidence_status,
+        sources,
+        warning,
+    })
+}
+
+fn parse_selection_kind(kind: &str) -> SelectionKind {
+    match kind.trim().to_ascii_lowercase().as_str() {
+        "模块" | "module" => SelectionKind::Module,
+        "类型" | "type" => SelectionKind::Type,
+        "函数" | "function" => SelectionKind::Function,
+        "方法" | "method" => SelectionKind::Method,
+        "变量" | "variable" => SelectionKind::Variable,
+        "表达式" | "expression" => SelectionKind::Expression,
+        _ => SelectionKind::Unknown,
+    }
 }
 
 #[derive(Deserialize)]
@@ -717,6 +788,59 @@ mod tests {
     }
 
     #[test]
+    fn selection_parser_injects_backend_evidence_and_constrains_kind() {
+        let content = r#"{
+            "kind":"函数",
+            "meaning":"把文本解析成 JSON 值",
+            "roleHere":"读取当前配置输入",
+            "origin":"serde_json",
+            "evidenceStatus":"unverified",
+            "sources":[{"title":"forged","url":"https://forged.invalid"}]
+        }"#;
+        let trusted_sources = vec![SourceLink {
+            title: "serde_json docs".into(),
+            url: "https://docs.rs/serde_json".into(),
+        }];
+
+        let explanation = parse_selection_explanation(
+            content,
+            "from_str",
+            EvidenceStatus::WebCited,
+            trusted_sources.clone(),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(explanation.selected_text, "from_str");
+        assert_eq!(explanation.kind, SelectionKind::Function);
+        assert_eq!(explanation.evidence_status, EvidenceStatus::WebCited);
+        assert_eq!(explanation.sources, trusted_sources);
+        assert_eq!(explanation.origin.as_deref(), Some("serde_json"));
+    }
+
+    #[test]
+    fn selection_parser_maps_unknown_kind_and_rejects_incomplete_text() {
+        let explanation = parse_selection_explanation(
+            r#"{"kind":"mystery","meaning":"值","roleHere":"参与计算"}"#,
+            "x",
+            EvidenceStatus::Unverified,
+            vec![],
+            None,
+        )
+        .unwrap();
+        assert_eq!(explanation.kind, SelectionKind::Unknown);
+
+        assert!(parse_selection_explanation(
+            r#"{"kind":"变量","meaning":"","roleHere":"参与计算"}"#,
+            "x",
+            EvidenceStatus::Unverified,
+            vec![],
+            None,
+        )
+        .is_err());
+    }
+
+    #[test]
     fn sse_decoder_extracts_content_deltas_in_order() {
         let mut d = SseDecoder::new();
         let out = d.push(
@@ -750,7 +874,8 @@ mod tests {
     #[test]
     fn sse_decoder_ignores_blank_lines_and_comments() {
         let mut d = SseDecoder::new();
-        let out = d.push(": keep-alive\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n");
+        let out =
+            d.push(": keep-alive\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n");
         assert_eq!(out, vec!["a".to_string()]);
     }
 

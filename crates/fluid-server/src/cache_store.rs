@@ -23,6 +23,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::web_evidence::{EvidenceStatus, SourceLink};
+
 /// A function-granularity semantic capsule (技术方案 §3). S5 stores these
 /// verbatim; S6 will populate them from the LLM.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -61,9 +63,56 @@ pub struct Translation {
     pub text: String,
 }
 
+/// Coarse semantic kind returned for one arbitrary code selection. The model may
+/// classify a selection, but the backend constrains the value to this closed set
+/// before it can be cached or sent to the client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SelectionKind {
+    #[serde(rename = "模块")]
+    Module,
+    #[serde(rename = "类型")]
+    Type,
+    #[serde(rename = "函数")]
+    Function,
+    #[serde(rename = "方法")]
+    Method,
+    #[serde(rename = "变量")]
+    Variable,
+    #[serde(rename = "表达式")]
+    Expression,
+    #[serde(rename = "未知")]
+    Unknown,
+}
+
+/// The stable selection-explanation product shared by the WebSocket response and
+/// the on-disk bypass cache. Evidence metadata is injected by the backend rather
+/// than trusted to the model's JSON reply.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SelectionExplanation {
+    pub selected_text: String,
+    pub kind: SelectionKind,
+    pub meaning: String,
+    pub role_here: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    pub evidence_status: EvidenceStatus,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<SourceLink>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelectionCacheEntry {
+    pub explanation: SelectionExplanation,
+}
+
 /// On-disk bypass cache rooted at `<project>/.fluid/capsules/`.
+#[derive(Clone)]
 pub struct CacheStore {
     dir: PathBuf,
+    selection_dir: PathBuf,
     model_version: String,
     prompt_version: String,
 }
@@ -78,6 +127,7 @@ impl CacheStore {
     ) -> Self {
         Self {
             dir: project_root.join(".fluid").join("capsules"),
+            selection_dir: project_root.join(".fluid").join("selections"),
             model_version: model_version.into(),
             prompt_version: prompt_version.into(),
         }
@@ -152,7 +202,12 @@ impl CacheStore {
     }
 
     /// Persist a single manual-line annotation under `.fluid/capsules/<line_key>.json`.
-    pub fn put_line(&self, fn_source: &str, line_number: u32, line: &LineAnnotation) -> std::io::Result<()> {
+    pub fn put_line(
+        &self,
+        fn_source: &str,
+        line_number: u32,
+        line: &LineAnnotation,
+    ) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.dir)?;
         let json = serde_json::to_vec_pretty(line)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -160,7 +215,8 @@ impl CacheStore {
     }
 
     fn line_path_for(&self, fn_source: &str, line_number: u32) -> PathBuf {
-        self.dir.join(format!("{}.json", self.line_key(fn_source, line_number)))
+        self.dir
+            .join(format!("{}.json", self.line_key(fn_source, line_number)))
     }
 
     /// Cache key for a whole-document translation (文档翻译). Folds the full file
@@ -186,7 +242,9 @@ impl CacheStore {
     /// or unreadable entry reads as absent → re-translate (reopen unchanged doc =
     /// zero token).
     pub fn get_translation(&self, source: &str) -> Option<Translation> {
-        let path = self.dir.join(format!("{}.json", self.translate_key(source)));
+        let path = self
+            .dir
+            .join(format!("{}.json", self.translate_key(source)));
         let bytes = std::fs::read(&path).ok()?;
         serde_json::from_slice(&bytes).ok()
     }
@@ -197,7 +255,91 @@ impl CacheStore {
         std::fs::create_dir_all(&self.dir)?;
         let json = serde_json::to_vec_pretty(t)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        std::fs::write(self.dir.join(format!("{}.json", self.translate_key(source))), json)
+        std::fs::write(
+            self.dir
+                .join(format!("{}.json", self.translate_key(source))),
+            json,
+        )
+    }
+
+    /// Stable identity for one selection explanation. Unlike capsule entries, the
+    /// provider/model are explicit request-snapshot inputs: a concurrent settings
+    /// swap cannot make an old proxy response land under a new model's cache key.
+    pub fn selection_key(
+        &self,
+        full_file_source: &str,
+        start_byte: u64,
+        end_byte: u64,
+        provider_base_url: &str,
+        model: &str,
+        web_mode: bool,
+    ) -> String {
+        let mut hash = FNV_OFFSET;
+        for part in ["explain-selection", full_file_source] {
+            hash = fnv1a_step(hash, part.as_bytes());
+            hash = fnv1a_step(hash, &[0]);
+        }
+        hash = fnv1a_step(hash, &start_byte.to_le_bytes());
+        hash = fnv1a_step(hash, &[0]);
+        hash = fnv1a_step(hash, &end_byte.to_le_bytes());
+        hash = fnv1a_step(hash, &[0]);
+        for part in [
+            provider_base_url,
+            model,
+            self.prompt_version.as_str(),
+            if web_mode { "web:on" } else { "web:off" },
+        ] {
+            hash = fnv1a_step(hash, part.as_bytes());
+            hash = fnv1a_step(hash, &[0]);
+        }
+        format!("{hash:016x}")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn get_selection(
+        &self,
+        full_file_source: &str,
+        start_byte: u64,
+        end_byte: u64,
+        provider_base_url: &str,
+        model: &str,
+        web_mode: bool,
+    ) -> Option<SelectionCacheEntry> {
+        let key = self.selection_key(
+            full_file_source,
+            start_byte,
+            end_byte,
+            provider_base_url,
+            model,
+            web_mode,
+        );
+        let bytes = std::fs::read(self.selection_dir.join(format!("{key}.json"))).ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn put_selection(
+        &self,
+        full_file_source: &str,
+        start_byte: u64,
+        end_byte: u64,
+        provider_base_url: &str,
+        model: &str,
+        web_mode: bool,
+        entry: &SelectionCacheEntry,
+    ) -> std::io::Result<()> {
+        std::fs::create_dir_all(&self.selection_dir)?;
+        let key = self.selection_key(
+            full_file_source,
+            start_byte,
+            end_byte,
+            provider_base_url,
+            model,
+            web_mode,
+        );
+        let json = serde_json::to_vec_pretty(entry)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(self.selection_dir.join(format!("{key}.json")), json)
     }
 }
 
@@ -316,7 +458,11 @@ mod tests {
         // Hand-write garbage at the key's path.
         let cap_dir = dir.path().join(".fluid").join("capsules");
         std::fs::create_dir_all(&cap_dir).unwrap();
-        std::fs::write(cap_dir.join(format!("{}.json", cache.key(src))), b"{ not json").unwrap();
+        std::fs::write(
+            cap_dir.join(format!("{}.json", cache.key(src))),
+            b"{ not json",
+        )
+        .unwrap();
 
         assert!(cache.get(src).is_none(), "corrupt entry must read as miss");
     }
@@ -337,7 +483,10 @@ mod tests {
         let src = "def f(x):\n    y = x + 1\n    return y\n";
         let line = sample_line("f#1", 2);
 
-        assert!(cache.get_line(src, 2).is_none(), "cold line cache must miss");
+        assert!(
+            cache.get_line(src, 2).is_none(),
+            "cold line cache must miss"
+        );
         cache.put_line(src, 2, &line).unwrap();
         assert_eq!(cache.get_line(src, 2), Some(line));
     }
@@ -357,7 +506,9 @@ mod tests {
     fn line_cache_misses_on_changed_span_or_version() {
         let dir = tempdir_guard::TempDir::new();
         let src = "def f(x):\n    y = x + 1\n    return y\n";
-        store(dir.path()).put_line(src, 2, &sample_line("f#1", 2)).unwrap();
+        store(dir.path())
+            .put_line(src, 2, &sample_line("f#1", 2))
+            .unwrap();
 
         // Edited span → different line key → miss.
         let edited = "def f(x):\n    y = x + 2\n    return y\n";
@@ -372,9 +523,14 @@ mod tests {
         let dir = tempdir_guard::TempDir::new();
         let cache = store(dir.path());
         let src = "# Title\n\nHello world.\n";
-        let t = Translation { text: "# 标题\n\n你好世界。\n".to_string() };
+        let t = Translation {
+            text: "# 标题\n\n你好世界。\n".to_string(),
+        };
 
-        assert!(cache.get_translation(src).is_none(), "cold translation cache must miss");
+        assert!(
+            cache.get_translation(src).is_none(),
+            "cold translation cache must miss"
+        );
         cache.put_translation(src, &t).unwrap();
         assert_eq!(cache.get_translation(src), Some(t));
 
@@ -388,6 +544,111 @@ mod tests {
         let bumped = CacheStore::new(dir.path(), "model-v2", "prompt-v1");
         assert!(bumped.get_translation(src).is_none());
         assert_ne!(cache.translate_key(src), cache.key(src));
+    }
+
+    fn sample_selection(meaning: &str) -> SelectionCacheEntry {
+        SelectionCacheEntry {
+            explanation: SelectionExplanation {
+                selected_text: "from_str".into(),
+                kind: SelectionKind::Function,
+                meaning: meaning.into(),
+                role_here: "把 JSON 文本解析为值".into(),
+                origin: Some("serde_json".into()),
+                evidence_status: EvidenceStatus::WebCited,
+                sources: vec![SourceLink {
+                    title: "serde_json docs".into(),
+                    url: "https://docs.rs/serde_json".into(),
+                }],
+                warning: None,
+            },
+        }
+    }
+
+    #[test]
+    fn selection_round_trips_and_force_style_put_overwrites_same_identity() {
+        let dir = tempdir_guard::TempDir::new();
+        let cache = store(dir.path());
+        let source = "fn f() { serde_json::from_str(input); }\n";
+        let identity = (10, 18, "https://provider.test/v1", "model-v1", true);
+
+        assert!(cache
+            .get_selection(source, identity.0, identity.1, identity.2, identity.3, identity.4,)
+            .is_none());
+        cache
+            .put_selection(
+                source,
+                identity.0,
+                identity.1,
+                identity.2,
+                identity.3,
+                identity.4,
+                &sample_selection("first"),
+            )
+            .unwrap();
+        assert_eq!(
+            cache
+                .get_selection(source, identity.0, identity.1, identity.2, identity.3, identity.4,)
+                .unwrap()
+                .explanation
+                .meaning,
+            "first"
+        );
+
+        cache
+            .put_selection(
+                source,
+                identity.0,
+                identity.1,
+                identity.2,
+                identity.3,
+                identity.4,
+                &sample_selection("refreshed"),
+            )
+            .unwrap();
+        assert_eq!(
+            cache
+                .get_selection(source, identity.0, identity.1, identity.2, identity.3, identity.4,)
+                .unwrap()
+                .explanation
+                .meaning,
+            "refreshed"
+        );
+    }
+
+    #[test]
+    fn selection_key_changes_with_every_frozen_identity_field() {
+        let dir = tempdir_guard::TempDir::new();
+        let cache = store(dir.path());
+        let source = "fn f() { serde_json::from_str(input); }\n";
+        let base = cache.selection_key(source, 10, 18, "https://p.test/v1", "model-v1", true);
+
+        let changed = [
+            cache.selection_key(
+                "fn f() { serde_json::from_slice(input); }\n",
+                10,
+                18,
+                "https://p.test/v1",
+                "model-v1",
+                true,
+            ),
+            cache.selection_key(source, 11, 18, "https://p.test/v1", "model-v1", true),
+            cache.selection_key(source, 10, 19, "https://p.test/v1", "model-v1", true),
+            cache.selection_key(source, 10, 18, "https://other.test/v1", "model-v1", true),
+            cache.selection_key(source, 10, 18, "https://p.test/v1", "model-v2", true),
+            cache.selection_key(source, 10, 18, "https://p.test/v1", "model-v1", false),
+            CacheStore::new(dir.path(), "model-v1", "prompt-v2").selection_key(
+                source,
+                10,
+                18,
+                "https://p.test/v1",
+                "model-v1",
+                true,
+            ),
+        ];
+
+        for key in changed {
+            assert_ne!(base, key);
+        }
     }
 
     /// Minimal self-cleaning temp dir (same pattern as project_reader's S1 tests;
