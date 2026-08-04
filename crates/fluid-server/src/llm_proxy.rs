@@ -51,10 +51,19 @@ impl LlmProxy {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_config_with_web_search_timeout(
+        cfg: &crate::settings::LlmConfig,
+        web_search_timeout: Duration,
+    ) -> Option<Self> {
+        let mut proxy = Self::from_config(cfg)?;
+        proxy.web_search_timeout = web_search_timeout;
+        Some(proxy)
+    }
+
     /// Run one non-streaming supplier-hosted web search through the Responses
     /// API. `query` is the only business input: no source code, file path, or
     /// private context is accepted by this boundary.
-    #[allow(dead_code)] // staged protocol entry point; first consumer is S-WEB-2
     pub async fn responses_web_search(
         &self,
         query: &str,
@@ -156,7 +165,6 @@ impl LlmProxy {
     }
 }
 
-#[allow(dead_code)] // reachable with responses_web_search in S-WEB-2
 fn classify_transport_error(error: reqwest::Error) -> WebSearchError {
     if error.is_timeout() {
         WebSearchError::Timeout(error.to_string())
@@ -165,7 +173,6 @@ fn classify_transport_error(error: reqwest::Error) -> WebSearchError {
     }
 }
 
-#[allow(dead_code)] // reachable with responses_web_search in S-WEB-2
 fn classify_web_search_status(status: u16, body: &str) -> WebSearchError {
     let message = provider_error_message(body);
     match status {
@@ -181,7 +188,6 @@ fn classify_web_search_status(status: u16, body: &str) -> WebSearchError {
     }
 }
 
-#[allow(dead_code)] // reachable with responses_web_search in S-WEB-2
 fn provider_error_message(body: &str) -> String {
     serde_json::from_str::<serde_json::Value>(body)
         .ok()
@@ -202,7 +208,6 @@ fn provider_error_message(body: &str) -> String {
         })
 }
 
-#[allow(dead_code)] // reachable with responses_web_search in S-WEB-2
 fn indicates_unsupported_tool(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
     let names_web_search = message.contains("web_search") || message.contains("web search");
