@@ -35,3 +35,40 @@ export type QueryFrame =
   | { kind: 'delta'; reqId: string; text: string }
   | { kind: 'done'; reqId: string }
   | { kind: 'error'; reqId: string; message: string }
+
+/** Evidence metadata shared by selection explanations and the later query-Web
+ * slice. `web-uncited` is a successful supplier search with no returned URLs. */
+export type EvidenceStatus = 'project-source' | 'web-cited' | 'web-uncited' | 'unverified'
+
+export interface SourceLink {
+  title: string
+  url: string
+}
+
+export type SelectionKind = '模块' | '类型' | '函数' | '方法' | '变量' | '表达式' | '未知'
+
+export interface SelectionExplanation {
+  selectedText: string
+  kind: SelectionKind
+  meaning: string
+  roleHere: string
+  origin?: string
+  evidenceStatus: EvidenceStatus
+  sources?: SourceLink[]
+  warning?: string
+}
+
+export type SelectionPhase =
+  | 'resolving-project'
+  | 'planning-web'
+  | 'searching-web'
+  | 'answering'
+  | 'fallback'
+
+/** One inbound frame from `WS /api/explain-selection` (S-SEL-1). */
+export type SelectionFrame =
+  | { kind: 'cache-hit'; reqId: string }
+  | { kind: 'status'; reqId: string; phase: SelectionPhase; message: string }
+  | { kind: 'result'; reqId: string; explanation: SelectionExplanation }
+  | { kind: 'done'; reqId: string }
+  | { kind: 'error'; reqId: string; message: string }

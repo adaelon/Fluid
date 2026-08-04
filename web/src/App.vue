@@ -75,6 +75,17 @@ const queryPanelOpen = ref(false)
 // LLM backend settings modal (U5b, ADR-0018), opened from the activity-bar gear.
 const settingsOpen = ref(false)
 
+// S-SEL-2: user-level pre-authorization for supplier-hosted Web Search. It is
+// local UI state (not an LLM credential), defaults on, and is sent with each
+// selection request. S-QWEB-2 will reuse the same App-level value later.
+const ALLOW_WEB_KEY = 'fluid:allowWeb'
+const allowWeb = ref(localStorage.getItem(ALLOW_WEB_KEY) !== 'false')
+
+function setAllowWeb(value: boolean) {
+  allowWeb.value = value
+  localStorage.setItem(ALLOW_WEB_KEY, String(value))
+}
+
 // Command palette (U4): Ctrl/Cmd+P → fuzzy file open, Ctrl/Cmd+Shift+P → app
 // commands. Null = closed. Items are rebuilt per mode from current app state.
 const paletteMode = ref<'files' | 'commands' | null>(null)
@@ -303,6 +314,7 @@ function closeTab(path: string) {
           :source="current.source"
           :lang="current.lang"
           :path="current.path"
+          :allow-web="allowWeb"
           @progress="genProgress = $event"
           @context="queryCtx = $event"
         />
@@ -327,7 +339,12 @@ function closeTab(path: string) {
       :query-open="queryPanelOpen"
       @toggle-query="queryPanelOpen = !queryPanelOpen"
     />
-    <SettingsModal v-if="settingsOpen" @close="settingsOpen = false" />
+    <SettingsModal
+      v-if="settingsOpen"
+      :allow-web="allowWeb"
+      @allow-web-change="setAllowWeb"
+      @close="settingsOpen = false"
+    />
     <CommandPalette
       v-if="paletteMode"
       :items="paletteItems"

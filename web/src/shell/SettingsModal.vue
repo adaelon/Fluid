@@ -7,7 +7,8 @@
 import { ref, onMounted, onBeforeUnmount } from 'vue'
 import { getLlmSettings, saveLlmSettings, testLlmSettings } from '../api'
 
-const emit = defineEmits<{ close: [] }>()
+defineProps<{ allowWeb: boolean }>()
+const emit = defineEmits<{ close: []; allowWebChange: [boolean] }>()
 
 const baseUrl = ref('')
 const model = ref('')
@@ -94,6 +95,10 @@ const keyPlaceholder = () =>
   keyStatus.value === 'set'
     ? `已配置 ${keyHint.value ?? ''} — 留空＝保持不变`
     : '未配置 — 输入以启用'
+
+function onAllowWebChange(event: Event) {
+  emit('allowWebChange', (event.target as HTMLInputElement).checked)
+}
 </script>
 
 <template>
@@ -127,6 +132,20 @@ const keyPlaceholder = () =>
             autocomplete="off"
             :placeholder="keyPlaceholder()"
           />
+        </label>
+        <label class="settings-toggle-field">
+          <input
+            class="settings-checkbox"
+            type="checkbox"
+            :checked="allowWeb"
+            @change="onAllowWebChange"
+          />
+          <span>
+            <span class="settings-toggle-title">允许联网检索</span>
+            <span class="settings-toggle-note">
+              选区解释可自动检索公开技术资料；关闭后只使用本地上下文。
+            </span>
+          </span>
         </label>
         <p class="settings-note">
           仅支持 OpenAI 兼容端点。密钥写回本地 .env,不上传、不回显;留空即保持当前密钥。

@@ -9,15 +9,27 @@ import { javascript } from '@codemirror/lang-javascript'
 import { GhostStore } from './ghostStore'
 import { ghostField, foldClickHandler, retryClickHandler, refreshGhosts } from './render/ghostField'
 import { fnGutter, explainClickHandler } from './render/gutter'
-import { explainLine as fetchExplainLine } from './api'
+import {
+  explainLine as fetchExplainLine,
+  streamSelectionExplanation,
+  type SelectionStream,
+} from './api'
 import { getParser } from './parser/browser'
 import { fluidDarkTheme } from './theme'
 import { GenScheduler, viewportDistance } from './scheduler'
 import { buildQueryContext, type QueryContext } from './queryContext'
+import SelectionPopover from './SelectionPopover.vue'
+import {
+  reduceSelectionFrame,
+  selectionToUtf8ByteRange,
+  startSelectionRequest,
+  type SelectionByteRange,
+  type SelectionViewState,
+} from './selectionState'
 import type { DeclSpan, FunctionSpan, ParserLang } from './parser/types.ts'
 import type { GenFrame } from './ghostTypes'
 
-const props = defineProps<{ source: string; lang: string; path: string }>()
+const props = defineProps<{ source: string; lang: string; path: string; allowWeb: boolean }>()
 // Generation progress surfaces to the status bar (U1) via @progress; the
 // per-file query context (roster + generated capsules) surfaces to QueryPanel
 // via @context (S10b-cap), lifted through App as a sibling-component bridge.
@@ -33,6 +45,7 @@ function emitContext(): void {
   emit('context', buildQueryContext(currentRoster, (id) => store.capsule(id)?.summary))
 }
 
+const wrap = shallowRef<HTMLDivElement | null>(null)
 const host = shallowRef<HTMLDivElement | null>(null)
 // ADR-0014: the CM6 EditorView is an imperative object. Hold it in a
 // shallowRef so Vue never deep-proxies its internal state. NEVER a plain ref().
@@ -51,6 +64,20 @@ let currentRoster: FunctionSpan[] = []
 // Top-level declarations (S-TS-3): targets for the manual "解释这个声明" hotspot.
 let currentDecls: DeclSpan[] = []
 let currentPath = ''
+
+interface SelectionTarget extends SelectionByteRange {
+  from: number
+  to: number
+}
+
+// S-SEL-2 transient selection UI. It never enters GhostStore and is discarded
+// on selection/file changes, Esc, outside click, or unmount. The request sequence
+// is a stale-write guard independent of the backend's echoed reqId.
+const selectionTarget = ref<SelectionTarget | null>(null)
+const selectionState = ref<SelectionViewState>({ mode: 'idle' })
+const selectionAnchor = ref({ left: 8, top: 8 })
+let selectionStream: SelectionStream | null = null
+let selectionRequestSeq = 0
 
 // Generation progress (S7.5) — reactive; emitted up to the status bar (U1).
 const phase = ref<'idle' | 'running' | 'done'>('idle')
@@ -138,6 +165,8 @@ function buildState(source: string, lang: string): EditorState {
       // Scroll → re-order the pending generation queue by the new viewport (S8).
       EditorView.updateListener.of((u) => {
         if (u.viewportChanged) scheduler?.reprioritize(viewportDist())
+        if (u.selectionSet) syncSelection(u.view)
+        if (u.viewportChanged || u.geometryChanged) updateSelectionAnchor()
       }),
     ],
   })
@@ -212,6 +241,106 @@ function refresh(): void {
   view.value?.dispatch({ effects: refreshGhosts.of() })
 }
 
+function cancelSelectionRequest(): void {
+  selectionRequestSeq++
+  selectionStream?.cancel()
+  selectionStream = null
+}
+
+function closeSelectionUi(): void {
+  cancelSelectionRequest()
+  selectionTarget.value = null
+  selectionState.value = { mode: 'idle' }
+}
+
+function syncSelection(editor: EditorView): void {
+  const ranges = editor.state.selection.ranges
+  if (ranges.length !== 1) {
+    closeSelectionUi()
+    return
+  }
+  const { from, to } = ranges[0]
+  const range = selectionToUtf8ByteRange(editor.state.doc.toString(), from, to)
+  if (!range) {
+    closeSelectionUi()
+    return
+  }
+
+  const previous = selectionTarget.value
+  if (!previous || previous.from !== from || previous.to !== to) {
+    cancelSelectionRequest()
+    selectionState.value = { mode: 'idle' }
+    selectionTarget.value = { ...range, from, to }
+  }
+  updateSelectionAnchor()
+}
+
+function updateSelectionAnchor(): void {
+  const editor = view.value
+  const container = wrap.value
+  const target = selectionTarget.value
+  if (!editor || !container || !target) return
+
+  const start = editor.coordsAtPos(target.from)
+  const end = editor.coordsAtPos(target.to)
+  if (!start && !end) return
+  const rect = container.getBoundingClientRect()
+  const right = Math.max(start?.right ?? 0, end?.right ?? 0)
+  const top = Math.min(start?.top ?? Number.POSITIVE_INFINITY, end?.top ?? Number.POSITIVE_INFINITY)
+  const bottom = Math.max(start?.bottom ?? 0, end?.bottom ?? 0)
+  const overlayWidth = selectionState.value.mode === 'idle' ? 70 : 420
+  const overlayHeight = selectionState.value.mode === 'idle' ? 34 : 340
+  const maxLeft = Math.max(8, rect.width - overlayWidth - 8)
+  const left = Math.max(8, Math.min(right - rect.left + 8, maxLeft))
+  let anchoredTop = bottom - rect.top + 6
+  if (anchoredTop + overlayHeight > rect.height - 8) {
+    anchoredTop = Math.max(8, top - rect.top - overlayHeight - 6)
+  }
+  selectionAnchor.value = { left, top: anchoredTop }
+}
+
+function explainSelection(forceRefresh = false): void {
+  const target = selectionTarget.value
+  if (!target || !currentPath) return
+
+  cancelSelectionRequest()
+  const guard = selectionRequestSeq
+  const reqId = `selection-${guard}`
+  const filePath = currentPath
+  selectionState.value = startSelectionRequest()
+  updateSelectionAnchor()
+  selectionStream = streamSelectionExplanation(
+    {
+      reqId,
+      filePath,
+      startByte: target.startByte,
+      endByte: target.endByte,
+      rosterSpans: currentRoster,
+      allowWeb: props.allowWeb,
+      forceRefresh,
+    },
+    (frame) => {
+      if (guard !== selectionRequestSeq || filePath !== currentPath) return
+      selectionState.value = reduceSelectionFrame(selectionState.value, frame)
+      if (frame.kind === 'done' || frame.kind === 'error') selectionStream = null
+      updateSelectionAnchor()
+    },
+  )
+}
+
+function onSelectionKey(event: KeyboardEvent): void {
+  if (event.key !== 'Escape' || !selectionTarget.value) return
+  event.preventDefault()
+  closeSelectionUi()
+}
+
+function onDocumentPointerDown(event: PointerEvent): void {
+  if (!selectionTarget.value) return
+  const target = event.target
+  if (target instanceof Element && target.closest('.selection-action, .selection-popover')) return
+  closeSelectionUi()
+}
+
 // Mark one function's generation finished (S7.5): advance progress once, and
 // when all functions are settled, flash the done chip then fade it out. On
 // failure the message is kept for the 生成失败 chip (S7.6).
@@ -279,6 +408,7 @@ async function explainLine(id: string, lineNumber: number): Promise<void> {
 // Activate a file: parse → open WS → stream per-function generation → render.
 async function activate(source: string, lang: string, path: string): Promise<void> {
   scheduler?.stop()
+  closeSelectionUi()
   store.reset()
   currentRoster = []
   currentDecls = []
@@ -334,6 +464,9 @@ onMounted(() => {
     parent: host.value!,
   })
   window.addEventListener('keydown', onFontKey)
+  window.addEventListener('keydown', onSelectionKey)
+  window.addEventListener('resize', updateSelectionAnchor)
+  document.addEventListener('pointerdown', onDocumentPointerDown, true)
   void activate(props.source, props.lang, props.path)
 })
 
@@ -347,6 +480,10 @@ watch(
 
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', onFontKey)
+  window.removeEventListener('keydown', onSelectionKey)
+  window.removeEventListener('resize', updateSelectionAnchor)
+  document.removeEventListener('pointerdown', onDocumentPointerDown, true)
+  cancelSelectionRequest()
   scheduler?.stop()
   scheduler = null
   view.value?.destroy()
@@ -355,7 +492,26 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="cm-wrap">
+  <div ref="wrap" class="cm-wrap">
     <div ref="host" class="cm-host"></div>
+    <button
+      v-if="selectionTarget && selectionState.mode === 'idle'"
+      class="selection-action"
+      type="button"
+      :style="{ left: `${selectionAnchor.left}px`, top: `${selectionAnchor.top}px` }"
+      @pointerdown.stop
+      @click="explainSelection(false)"
+    >
+      解释
+    </button>
+    <SelectionPopover
+      v-else-if="selectionTarget && selectionState.mode !== 'idle'"
+      :state="selectionState"
+      :selected-text="selectionTarget.selectedText"
+      :style="{ left: `${selectionAnchor.left}px`, top: `${selectionAnchor.top}px` }"
+      @pointerdown.stop
+      @close="closeSelectionUi"
+      @regenerate="explainSelection(true)"
+    />
   </div>
 </template>
