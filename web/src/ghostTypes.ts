@@ -9,6 +9,8 @@ export interface Capsule {
   summary: string
   complexity: string
   io: string
+  orientationId: string
+  role: FunctionRole
 }
 
 /** Line-level ghost annotation on a key line (技术方案 §3). */
@@ -19,9 +21,8 @@ export interface LineAnnotation {
   color: string
 }
 
-/** Source-backed file-orientation types. These mirror orientation.rs and are
- * deliberately separate from Capsule: S-ORI-4 only gates activation and does
- * not yet bind child products to orientationId (that is S-CAP-1). */
+/** Source-backed file-orientation types. These mirror orientation.rs; every
+ * generated Capsule carries the exact backend-selected FunctionRole. */
 export interface CodeEvidenceRef {
   id: string
   filePath: string

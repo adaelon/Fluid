@@ -5,11 +5,10 @@
 //! "zero byte contamination" holds (核心律 1). Layout is split below `.fluid/`
 //! into `capsules/`, `selections/`, and `orientations/`.
 //!
-//! Key (技术方案 §6, refining ADR-0003): `hash(function source span)` folded
-//! together with the model version and prompt version. Changing any of the three
-//! changes the key → cache miss → recompute. Per-function granularity means
-//! editing one function only invalidates that function's entry; sibling
-//! functions in the same file stay hot.
+//! Capsule key (技术方案 §6, refining ADR-0003/0021): function source span +
+//! normalized file-orientation coordinates + provider/model + capsule-specific
+//! prompt/schema versions. Per-function granularity keeps unchanged siblings hot
+//! when a regenerated file card has the same normalized coordinates.
 //!
 //! Hash = FNV-1a 64-bit, computed inline. A disk-persisted key needs a hash that
 //! is stable across processes, platforms and toolchain versions — `std`'s
@@ -25,12 +24,18 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::orientation::{
-    FileOrientationCard, OrientationCacheIdentity, OrientationValidationContext,
+    FileOrientationCard, FunctionRole, OrientationCacheIdentity, OrientationValidationContext,
 };
 use crate::web_evidence::{EvidenceStatus, SourceLink};
 
-/// A function-granularity semantic capsule (技术方案 §3). S5 stores these
-/// verbatim; S6 will populate them from the LLM.
+/// Product-specific versions for function capsules. Keeping these separate from
+/// line/translation prompts prevents an unrelated prompt bump from flushing the
+/// whole bypass cache.
+pub const CAPSULE_PROMPT_VERSION: &str = "capsule-p1";
+pub const CAPSULE_SCHEMA_VERSION: u32 = 1;
+
+/// A function-granularity semantic capsule bound to one backend-validated file
+/// orientation and its exact role (技术方案 §3, ADR-0021).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Capsule {
     #[serde(rename = "fnId")]
@@ -39,6 +44,9 @@ pub struct Capsule {
     pub summary: String,
     pub complexity: String,
     pub io: String,
+    #[serde(rename = "orientationId")]
+    pub orientation_id: String,
+    pub role: FunctionRole,
 }
 
 /// A line-level ghost annotation attached to a key line (技术方案 §3).
@@ -58,6 +66,39 @@ pub struct LineAnnotation {
 pub struct CapsuleEntry {
     pub capsule: Capsule,
     pub lines: Vec<LineAnnotation>,
+}
+
+/// Exact inputs that identify one function-capsule artifact. The file-level
+/// orientation ID is deliberately not included: a regenerated card whose
+/// normalized coordinate projection is unchanged may reuse unaffected sibling
+/// capsules, while any actual actor/flow/role/evidence change produces a miss.
+#[derive(Debug, Clone, Copy)]
+pub struct CapsuleCacheIdentity<'a> {
+    pub fn_source: &'a str,
+    pub orientation_context_hash: &'a str,
+    pub provider_base_url: &'a str,
+    pub model: &'a str,
+    pub prompt_version: &'a str,
+    pub schema_version: u32,
+}
+
+impl CapsuleCacheIdentity<'_> {
+    pub fn key(&self) -> String {
+        let mut hash = FNV_OFFSET;
+        for part in [
+            "capsule-cache-v2",
+            self.fn_source,
+            self.orientation_context_hash,
+            self.provider_base_url,
+            self.model,
+            self.prompt_version,
+        ] {
+            hash = fnv1a_step(hash, part.as_bytes());
+            hash = fnv1a_step(hash, &[0]);
+        }
+        hash = fnv1a_step(hash, &self.schema_version.to_le_bytes());
+        format!("{hash:016x}")
+    }
 }
 
 /// A cached whole-document translation (文档翻译): the Simplified-Chinese Markdown
@@ -140,43 +181,28 @@ impl CacheStore {
         }
     }
 
-    /// Cache key for a function: stable hex of FNV-1a over
-    /// (model_version, prompt_version, function source span). Public so S6 can
-    /// reuse it and tests can assert miss-on-change.
-    pub fn key(&self, fn_source: &str) -> String {
-        let mut hash = FNV_OFFSET;
-        for part in [
-            self.model_version.as_str(),
-            self.prompt_version.as_str(),
-            fn_source,
-        ] {
-            // NUL separator so concatenation can't alias across fields.
-            hash = fnv1a_step(hash, part.as_bytes());
-            hash = fnv1a_step(hash, &[0]);
-        }
-        format!("{hash:016x}")
-    }
-
-    /// Look up a function's cached entry. Returns `None` on miss or on any read/
-    /// parse error (a corrupt entry is treated as absent → recompute). Reads a
-    /// file only; never touches any downstream generator.
-    pub fn get(&self, fn_source: &str) -> Option<CapsuleEntry> {
-        let path = self.path_for(fn_source);
+    /// Look up a function capsule by source + normalized orientation identity.
+    /// Corrupt or legacy entries (which lack orientation binding) are misses.
+    pub fn get_capsule(&self, identity: &CapsuleCacheIdentity<'_>) -> Option<CapsuleEntry> {
+        let path = self.capsule_path_for(identity);
         let bytes = std::fs::read(&path).ok()?;
         serde_json::from_slice(&bytes).ok()
     }
 
-    /// Persist a function's entry under `.fluid/capsules/<key>.json`. Creates the
-    /// cache directory on demand. Never writes into the source tree.
-    pub fn put(&self, fn_source: &str, entry: &CapsuleEntry) -> std::io::Result<()> {
+    /// Persist a bound function capsule under `.fluid/capsules/<key>.json`.
+    pub fn put_capsule(
+        &self,
+        identity: &CapsuleCacheIdentity<'_>,
+        entry: &CapsuleEntry,
+    ) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.dir)?;
         let json = serde_json::to_vec_pretty(entry)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        std::fs::write(self.path_for(fn_source), json)
+        std::fs::write(self.capsule_path_for(identity), json)
     }
 
-    fn path_for(&self, fn_source: &str) -> PathBuf {
-        self.dir.join(format!("{}.json", self.key(fn_source)))
+    fn capsule_path_for(&self, identity: &CapsuleCacheIdentity<'_>) -> PathBuf {
+        self.dir.join(format!("{}.json", identity.key()))
     }
 
     /// Cache key for a single manual-line annotation (S9 explain-line). Folds the
@@ -428,6 +454,21 @@ fn fnv1a_step(mut hash: u64, bytes: &[u8]) -> u64 {
 mod tests {
     use super::*;
 
+    fn sample_role(fn_id: &str) -> FunctionRole {
+        FunctionRole {
+            fn_id: fn_id.to_string(),
+            lane: crate::orientation::FunctionLane::Core,
+            flow_ids: vec!["request-flow".into()],
+            stage: "dispatch request".into(),
+            receives_from_actor_ids: vec!["caller".into()],
+            consumes: vec!["Request".into()],
+            sends_to_actor_ids: vec!["worker".into()],
+            produces: vec!["Work".into()],
+            why: "Moves a request into the worker.".into(),
+            evidence_ids: vec!["E1".into()],
+        }
+    }
+
     fn sample_entry(fn_id: &str) -> CapsuleEntry {
         CapsuleEntry {
             capsule: Capsule {
@@ -436,6 +477,8 @@ mod tests {
                 summary: "把 x 加一并返回".to_string(),
                 complexity: "simple".to_string(),
                 io: "x:int -> int".to_string(),
+                orientation_id: "orientation-1".to_string(),
+                role: sample_role(fn_id),
             },
             lines: vec![LineAnnotation {
                 fn_id: fn_id.to_string(),
@@ -450,17 +493,95 @@ mod tests {
         CacheStore::new(dir, "model-v1", "prompt-v1")
     }
 
+    fn capsule_identity<'a>(
+        fn_source: &'a str,
+        orientation_context_hash: &'a str,
+    ) -> CapsuleCacheIdentity<'a> {
+        CapsuleCacheIdentity {
+            fn_source,
+            orientation_context_hash,
+            provider_base_url: "https://provider.test/v1",
+            model: "model-v1",
+            prompt_version: CAPSULE_PROMPT_VERSION,
+            schema_version: CAPSULE_SCHEMA_VERSION,
+        }
+    }
+
+    #[test]
+    fn capsule_identity_changes_only_when_source_coordinates_or_provider_contract_change() {
+        let dir = tempdir_guard::TempDir::new();
+        let cache = store(dir.path());
+        let source = "def f(x):\n    return x + 1\n";
+        let base = capsule_identity(source, "coordinates-v1");
+        cache.put_capsule(&base, &sample_entry("f#1")).unwrap();
+
+        let changed_source = CapsuleCacheIdentity {
+            fn_source: "def f(x):\n    return x + 2\n",
+            ..base
+        };
+        let changed_coordinates = CapsuleCacheIdentity {
+            orientation_context_hash: "coordinates-v2",
+            ..base
+        };
+        let changed_provider = CapsuleCacheIdentity {
+            provider_base_url: "https://other-provider.test/v1",
+            ..base
+        };
+        let changed_model = CapsuleCacheIdentity {
+            model: "model-v2",
+            ..base
+        };
+        let changed_prompt = CapsuleCacheIdentity {
+            prompt_version: "capsule-p-next",
+            ..base
+        };
+        let changed_schema = CapsuleCacheIdentity {
+            schema_version: CAPSULE_SCHEMA_VERSION + 1,
+            ..base
+        };
+
+        for changed in [
+            changed_source,
+            changed_coordinates,
+            changed_provider,
+            changed_model,
+            changed_prompt,
+            changed_schema,
+        ] {
+            assert_ne!(base.key(), changed.key());
+            assert!(cache.get_capsule(&changed).is_none());
+        }
+    }
+
+    #[test]
+    fn same_function_and_normalized_coordinates_share_one_capsule_key() {
+        let dir = tempdir_guard::TempDir::new();
+        let cache = store(dir.path());
+        let source = "def sibling():\n    return 1\n";
+        let first_card = capsule_identity(source, "same-normalized-coordinates");
+        let regenerated_card = capsule_identity(source, "same-normalized-coordinates");
+        let entry = sample_entry("sibling#1");
+        cache.put_capsule(&first_card, &entry).unwrap();
+
+        assert_eq!(first_card.key(), regenerated_card.key());
+        assert_eq!(cache.get_capsule(&regenerated_card), Some(entry));
+    }
+
     #[test]
     fn put_then_get_hits_and_round_trips() {
         let dir = tempdir_guard::TempDir::new();
         let cache = store(dir.path());
         let src = "def f(x):\n    return x + 1\n";
         let entry = sample_entry("f#1");
+        let identity = capsule_identity(src, "coordinates-v1");
 
-        assert!(cache.get(src).is_none(), "cold cache must miss");
-        cache.put(src, &entry).unwrap();
+        assert!(
+            cache.get_capsule(&identity).is_none(),
+            "cold cache must miss"
+        );
+        cache.put_capsule(&identity, &entry).unwrap();
         // Hit returns exactly what was stored (no downstream involved).
-        assert_eq!(cache.get(src), Some(entry));
+        assert_eq!(cache.get_capsule(&identity), Some(entry));
     }
 
     #[test]
@@ -468,26 +589,34 @@ mod tests {
         let dir = tempdir_guard::TempDir::new();
         let cache = store(dir.path());
         let src = "def f(x):\n    return x + 1\n";
-        cache.put(src, &sample_entry("f#1")).unwrap();
+        let identity = capsule_identity(src, "coordinates-v1");
+        cache.put_capsule(&identity, &sample_entry("f#1")).unwrap();
 
         // A single edited byte in the function span → different key → miss.
         let edited = "def f(x):\n    return x + 2\n";
-        assert_ne!(cache.key(src), cache.key(edited));
-        assert!(cache.get(edited).is_none());
+        let edited_identity = capsule_identity(edited, "coordinates-v1");
+        assert_ne!(identity.key(), edited_identity.key());
+        assert!(cache.get_capsule(&edited_identity).is_none());
     }
 
     #[test]
     fn model_or_prompt_version_change_invalidates() {
         let dir = tempdir_guard::TempDir::new();
         let src = "def f(x):\n    return x + 1\n";
-        store(dir.path()).put(src, &sample_entry("f#1")).unwrap();
+        let cache = store(dir.path());
+        let identity = capsule_identity(src, "coordinates-v1");
+        cache.put_capsule(&identity, &sample_entry("f#1")).unwrap();
 
-        // Same source, bumped model version → miss (ADR-0003: model bump 失效).
-        let bumped_model = CacheStore::new(dir.path(), "model-v2", "prompt-v1");
-        assert!(bumped_model.get(src).is_none());
-        // Same source, bumped prompt version → miss.
-        let bumped_prompt = CacheStore::new(dir.path(), "model-v1", "prompt-v2");
-        assert!(bumped_prompt.get(src).is_none());
+        let bumped_model = CapsuleCacheIdentity {
+            model: "model-v2",
+            ..identity
+        };
+        assert!(cache.get_capsule(&bumped_model).is_none());
+        let bumped_prompt = CapsuleCacheIdentity {
+            prompt_version: "capsule-p-next",
+            ..identity
+        };
+        assert!(cache.get_capsule(&bumped_prompt).is_none());
     }
 
     #[test]
@@ -500,7 +629,8 @@ mod tests {
 
         let cache = store(dir.path());
         let src = "def f(x):\n    return x + 1\n";
-        cache.put(src, &sample_entry("f#1")).unwrap();
+        let identity = capsule_identity(src, "coordinates-v1");
+        cache.put_capsule(&identity, &sample_entry("f#1")).unwrap();
 
         // Entry landed under .fluid/capsules/.
         let written = dir.path().join(".fluid").join("capsules");
@@ -525,16 +655,20 @@ mod tests {
         let dir = tempdir_guard::TempDir::new();
         let cache = store(dir.path());
         let src = "def f(x):\n    return x + 1\n";
+        let identity = capsule_identity(src, "coordinates-v1");
         // Hand-write garbage at the key's path.
         let cap_dir = dir.path().join(".fluid").join("capsules");
         std::fs::create_dir_all(&cap_dir).unwrap();
         std::fs::write(
-            cap_dir.join(format!("{}.json", cache.key(src))),
+            cap_dir.join(format!("{}.json", identity.key())),
             b"{ not json",
         )
         .unwrap();
 
-        assert!(cache.get(src).is_none(), "corrupt entry must read as miss");
+        assert!(
+            cache.get_capsule(&identity).is_none(),
+            "corrupt entry must read as miss"
+        );
     }
 
     fn sample_line(fn_id: &str, n: u32) -> LineAnnotation {
@@ -567,7 +701,10 @@ mod tests {
         let cache = store(dir.path());
         let src = "def f(x):\n    y = x + 1\n    return y\n";
         // A line key never aliases the function's capsule key for the same source.
-        assert_ne!(cache.line_key(src, 2), cache.key(src));
+        assert_ne!(
+            cache.line_key(src, 2),
+            capsule_identity(src, "coordinates-v1").key()
+        );
         // Different target lines get distinct keys.
         assert_ne!(cache.line_key(src, 2), cache.line_key(src, 3));
     }
@@ -613,7 +750,10 @@ mod tests {
         // the capsule key for the same bytes.
         let bumped = CacheStore::new(dir.path(), "model-v2", "prompt-v1");
         assert!(bumped.get_translation(src).is_none());
-        assert_ne!(cache.translate_key(src), cache.key(src));
+        assert_ne!(
+            cache.translate_key(src),
+            capsule_identity(src, "coordinates-v1").key()
+        );
     }
 
     fn sample_selection(meaning: &str) -> SelectionCacheEntry {

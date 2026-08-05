@@ -321,11 +321,14 @@ struct RawGeneration {
 const DEFAULT_LINE_COLOR: &str = "#7ee787";
 
 /// Parse the model's content into a `(Capsule, Vec<LineAnnotation>)`. Tolerates
-/// markdown code fences / surrounding prose; `fn_id` is injected by us (the model
-/// is not asked to echo it). A missing line color defaults to the neutral tone.
+/// markdown code fences / surrounding prose. Function identity and the complete
+/// validated orientation binding are injected by the backend; the model is not
+/// allowed to echo or alter them. A missing line color defaults to neutral.
 pub fn parse_generation(
     content: &str,
     fn_id: &str,
+    orientation_id: &str,
+    role: FunctionRole,
 ) -> anyhow::Result<(Capsule, Vec<LineAnnotation>)> {
     let json = extract_json(content);
     let raw: RawGeneration = serde_json::from_str(json).map_err(|e| {
@@ -338,6 +341,8 @@ pub fn parse_generation(
         summary: raw.capsule.summary,
         complexity: raw.capsule.complexity,
         io: raw.capsule.io,
+        orientation_id: orientation_id.to_string(),
+        role,
     };
     let lines = raw
         .lines
@@ -576,6 +581,25 @@ mod tests {
 
     use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
 
+    fn role(fn_id: &str) -> FunctionRole {
+        FunctionRole {
+            fn_id: fn_id.into(),
+            lane: crate::orientation::FunctionLane::Core,
+            flow_ids: vec!["request-flow".into()],
+            stage: "dispatch request".into(),
+            receives_from_actor_ids: vec!["caller".into()],
+            consumes: vec!["Request".into()],
+            sends_to_actor_ids: vec!["worker".into()],
+            produces: vec!["Work".into()],
+            why: "Moves the request into the worker.".into(),
+            evidence_ids: vec!["E1".into()],
+        }
+    }
+
+    fn parse_fixture(content: &str, fn_id: &str) -> anyhow::Result<(Capsule, Vec<LineAnnotation>)> {
+        parse_generation(content, fn_id, "orientation-1", role(fn_id))
+    }
+
     #[derive(Clone)]
     struct MockResponse {
         status: StatusCode,
@@ -805,8 +829,10 @@ mod tests {
     #[test]
     fn parses_plain_json_and_injects_fn_id() {
         let content = r##"{"capsule":{"signature":"def f(x)","summary":"加一","complexity":"simple","io":"x:int->int"},"lines":[{"lineNumber":2,"text":"返回 x+1","color":"#abcdef"}]}"##;
-        let (cap, lines) = parse_generation(content, "f#1").unwrap();
+        let (cap, lines) = parse_fixture(content, "f#1").unwrap();
         assert_eq!(cap.fn_id, "f#1");
+        assert_eq!(cap.orientation_id, "orientation-1");
+        assert_eq!(cap.role, role("f#1"));
         assert_eq!(cap.summary, "加一");
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].fn_id, "f#1");
@@ -817,7 +843,7 @@ mod tests {
     #[test]
     fn strips_markdown_code_fence() {
         let content = "```json\n{\"capsule\":{\"signature\":\"\",\"summary\":\"s\",\"complexity\":\"simple\",\"io\":\"\"},\"lines\":[]}\n```";
-        let (cap, lines) = parse_generation(content, "g#5").unwrap();
+        let (cap, lines) = parse_fixture(content, "g#5").unwrap();
         assert_eq!(cap.summary, "s");
         assert!(lines.is_empty());
     }
@@ -825,20 +851,20 @@ mod tests {
     #[test]
     fn tolerates_surrounding_prose() {
         let content = "好的，结果如下：{\"capsule\":{\"summary\":\"x\"},\"lines\":[]} 完毕";
-        let (cap, _) = parse_generation(content, "h#1").unwrap();
+        let (cap, _) = parse_fixture(content, "h#1").unwrap();
         assert_eq!(cap.summary, "x");
     }
 
     #[test]
     fn missing_line_color_defaults() {
         let content = r#"{"capsule":{"summary":"s"},"lines":[{"lineNumber":3,"text":"t"}]}"#;
-        let (_, lines) = parse_generation(content, "f#1").unwrap();
+        let (_, lines) = parse_fixture(content, "f#1").unwrap();
         assert_eq!(lines[0].color, DEFAULT_LINE_COLOR);
     }
 
     #[test]
     fn non_json_is_an_error_not_a_panic() {
-        assert!(parse_generation("抱歉我无法完成", "f#1").is_err());
+        assert!(parse_fixture("抱歉我无法完成", "f#1").is_err());
     }
 
     #[test]

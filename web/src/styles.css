@@ -1425,6 +1425,48 @@ body {
   margin-left: 6px;
   color: var(--muted);
 }
+.fluid-cap-coordinates {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 3px;
+  color: var(--muted);
+}
+.fluid-cap-lane,
+.fluid-cap-stage {
+  padding: 0 5px;
+  border: 1px solid color-mix(in srgb, var(--c, var(--accent)) 45%, transparent);
+  font-size: 0.82em;
+}
+.fluid-cap-lane.core {
+  color: var(--accent);
+}
+.fluid-cap-lane.supporting {
+  color: var(--muted);
+}
+.fluid-cap-direction {
+  color: var(--text);
+  font-size: 0.88em;
+}
+.fluid-cap-details {
+  margin-top: 2px;
+  color: var(--muted);
+  cursor: default;
+  font-size: 0.86em;
+}
+.fluid-cap-details summary {
+  cursor: pointer;
+  color: var(--accent);
+}
+.fluid-cap-why,
+.fluid-cap-evidence {
+  display: block;
+  padding-left: 10px;
+}
+.fluid-cap-evidence {
+  color: var(--muted);
+}
 
 /* Folded: collapse the header to a 4px color edge (§7.5); line notes hidden,
    not deleted (kept in GhostStore → unfold is zero-recompute re-render). */

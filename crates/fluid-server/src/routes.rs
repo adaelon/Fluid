@@ -26,8 +26,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::cache_store::{
-    CacheStore, Capsule, CapsuleEntry, LineAnnotation, SelectionCacheEntry, SelectionExplanation,
-    Translation,
+    CacheStore, Capsule, CapsuleCacheIdentity, CapsuleEntry, LineAnnotation, SelectionCacheEntry,
+    SelectionExplanation, Translation, CAPSULE_PROMPT_VERSION, CAPSULE_SCHEMA_VERSION,
 };
 use crate::context_assembler::{
     assemble_file_set_context, assemble_gen_context, build_bounded_orientation_prompt,
@@ -48,8 +48,9 @@ use crate::llm_proxy::{
     parse_orientation_source_plan, parse_selection_explanation, LlmProxy, SseDecoder,
 };
 use crate::orientation::{
-    FileOrientationCard, OrientationCacheIdentity, OrientationCoverage, OrientationCoverageMode,
-    OrientationValidationContext, ORIENTATION_PROMPT_VERSION, ORIENTATION_SCHEMA_VERSION,
+    orientation_context_hash, FileOrientationCard, FunctionRole, OrientationCacheIdentity,
+    OrientationCoverage, OrientationCoverageMode, OrientationValidationContext,
+    ORIENTATION_PROMPT_VERSION, ORIENTATION_SCHEMA_VERSION,
 };
 use crate::project_reader::{FileNode, ProjectReader, ReadErr};
 use crate::settings::{mask_key, rewrite_env, LlmConfig};
@@ -986,10 +987,14 @@ struct GenerateRequest {
     req_id: String,
     #[serde(rename = "filePath")]
     file_path: String,
+    #[serde(rename = "orientationId", default)]
+    orientation_id: String,
     #[serde(rename = "fn")]
     func: FunctionSpan,
     #[serde(default)]
     roster: Vec<String>,
+    #[serde(rename = "rosterSpans", default)]
+    roster_spans: Vec<FunctionSpan>,
     #[serde(rename = "keyLines", default)]
     key_lines: Vec<u32>,
     #[serde(default)]
@@ -1004,7 +1009,7 @@ struct GenerateRequest {
 #[serde(tag = "kind", rename_all = "kebab-case")]
 enum GenFrame {
     CacheHit,
-    Capsule { capsule: Capsule },
+    Capsule { capsule: Box<Capsule> },
     Line { line: LineAnnotation },
     Done,
     Error { message: String },
@@ -1018,7 +1023,9 @@ fn build_frames(cache_hit: bool, capsule: Capsule, lines: Vec<LineAnnotation>) -
     if cache_hit {
         frames.push(GenFrame::CacheHit);
     }
-    frames.push(GenFrame::Capsule { capsule });
+    frames.push(GenFrame::Capsule {
+        capsule: Box::new(capsule),
+    });
     for line in lines {
         frames.push(GenFrame::Line { line });
     }
@@ -1033,8 +1040,110 @@ enum GenStep {
     NeedLlm {
         system: String,
         user: String,
-        fn_source: String,
+        binding: Box<VerifiedCapsuleBinding>,
     },
+}
+
+struct VerifiedCapsuleBinding {
+    project_root: PathBuf,
+    fn_source: String,
+    card: FileOrientationCard,
+    role: FunctionRole,
+    orientation_context_hash: String,
+    roster_names: Vec<String>,
+}
+
+fn verify_capsule_binding(
+    project: &mut ProjectCtx,
+    config: &LlmConfig,
+    req: &GenerateRequest,
+) -> Result<VerifiedCapsuleBinding, String> {
+    project.graphs.refresh();
+    let source = project
+        .reader
+        .read_file(&req.file_path)
+        .map_err(|error| match error {
+            ReadErr::NotFound => "file not found".to_string(),
+            ReadErr::Forbidden => "path outside project root".to_string(),
+        })?;
+    if req.roster_spans.is_empty() {
+        return Err("rosterSpans is required for orientation validation".into());
+    }
+    let roster_fn_ids = verify_orientation_roster(&source, &req.roster_spans)
+        .map_err(|error| format!("invalid rosterSpans: {error}"))?;
+    let target_matches_roster = req.roster_spans.iter().any(|span| {
+        span.id == req.func.id
+            && span.name == req.func.name
+            && span.line_range == req.func.line_range
+    });
+    if !target_matches_roster {
+        return Err("target function does not match the verified rosterSpans".into());
+    }
+    let roster_names = req
+        .roster_spans
+        .iter()
+        .map(|span| span.name.clone())
+        .collect::<Vec<_>>();
+    if !req.roster.is_empty() && req.roster != roster_names {
+        return Err("roster names do not match rosterSpans".into());
+    }
+
+    let graph_paths = [req.file_path.clone()];
+    let relevant_graph_set_hash = project.graphs.relevant_graph_set_hash(&graph_paths);
+    let orientation_identity = OrientationCacheIdentity {
+        full_file_source: &source,
+        relevant_graph_set_hash: &relevant_graph_set_hash,
+        provider_base_url: &config.base_url,
+        model: &config.model,
+        prompt_version: ORIENTATION_PROMPT_VERSION,
+        schema_version: ORIENTATION_SCHEMA_VERSION,
+    };
+    if req.orientation_id != orientation_identity.key() {
+        return Err("unknown or stale orientationId; retry file orientation".into());
+    }
+    let roster_line_ranges = orientation_roster_line_ranges(&req.roster_spans);
+    let validation = OrientationValidationContext {
+        file_path: &req.file_path,
+        source: &source,
+        roster_fn_ids: &roster_fn_ids,
+        roster_line_ranges: Some(&roster_line_ranges),
+    };
+    let card = project
+        .cache
+        .get_orientation(&orientation_identity, &validation)
+        .ok_or_else(|| "unknown or stale orientationId; retry file orientation".to_string())?;
+    let role = card
+        .function_roles
+        .iter()
+        .find(|role| role.fn_id == req.func.id)
+        .cloned()
+        .ok_or_else(|| "orientation card has no role for the target function".to_string())?;
+    let context_hash = orientation_context_hash(&card);
+    let fn_source = slice_span(&source, req.func.line_range)
+        .ok_or_else(|| "invalid lineRange for file".to_string())?;
+
+    Ok(VerifiedCapsuleBinding {
+        project_root: project.reader.root().to_path_buf(),
+        fn_source,
+        card,
+        role,
+        orientation_context_hash: context_hash,
+        roster_names,
+    })
+}
+
+fn capsule_cache_identity<'a>(
+    binding: &'a VerifiedCapsuleBinding,
+    config: &'a LlmConfig,
+) -> CapsuleCacheIdentity<'a> {
+    CapsuleCacheIdentity {
+        fn_source: &binding.fn_source,
+        orientation_context_hash: &binding.orientation_context_hash,
+        provider_base_url: &config.base_url,
+        model: &config.model,
+        prompt_version: CAPSULE_PROMPT_VERSION,
+        schema_version: CAPSULE_SCHEMA_VERSION,
+    }
 }
 
 /// Run one generation request to a complete frame sequence. A cache hit returns
@@ -1043,62 +1152,77 @@ enum GenStep {
 /// the synchronous read/cache/assemble phase and is dropped before the LLM await
 /// (so the future stays Send and a concurrent Open Folder can't deadlock).
 async fn run_generation(state: &AppState, req: GenerateRequest) -> Vec<GenFrame> {
-    // Snapshot the proxy once (Arc clone, lock released) so it survives the project
-    // lock drop and the await below, and a concurrent settings swap can't tear it.
-    let llm = state.llm_proxy();
+    // One settings snapshot supplies both provider IO and the capsule/orientation
+    // identities, so a concurrent settings swap cannot tear the request.
+    let llm_snapshot = state.llm_snapshot();
     let step = {
-        let guard = state.project.read().unwrap();
-        let Some(proj) = guard.as_ref() else {
+        let mut guard = state.project.write().unwrap();
+        let Some(proj) = guard.as_mut() else {
             return vec![err("no project open")];
         };
-
-        // 1. Resolve the function source span (deterministic; the cache key derives from it).
-        let source = match proj.reader.read_file(&req.file_path) {
-            Ok(s) => s,
-            Err(ReadErr::NotFound) => return vec![err("file not found")],
-            Err(ReadErr::Forbidden) => return vec![err("path outside project root")],
+        let binding = match verify_capsule_binding(proj, &llm_snapshot.config, &req) {
+            Ok(binding) => binding,
+            Err(error) => return vec![err(error)],
         };
-        let Some(fn_source) = slice_span(&source, req.func.line_range) else {
-            return vec![err("invalid lineRange for file")];
-        };
+        let cache_identity = capsule_cache_identity(&binding, &llm_snapshot.config);
 
-        // 2. Cache: a hit returns the stored entry with zero token, no LLM (核心律).
-        if let Some(entry) = proj.cache.get(&fn_source) {
+        // A hit is valid only when the backend-injected role is byte-for-byte the
+        // current card role. A context-equivalent regenerated card may have a new
+        // orientationId; rebind that envelope without spending a model call.
+        if let Some(mut entry) = proj.cache.get_capsule(&cache_identity).filter(|entry| {
+            entry.capsule.fn_id == req.func.id && entry.capsule.role == binding.role
+        }) {
+            if entry.capsule.orientation_id != binding.card.orientation_id {
+                entry.capsule.orientation_id = binding.card.orientation_id.clone();
+                if let Err(error) = proj.cache.put_capsule(&cache_identity, &entry) {
+                    eprintln!("[generate] warning: capsule orientation rebind failed: {error}");
+                }
+            }
             eprintln!(
                 "[generate] cache HIT {}#{} — zero token",
                 req.file_path, req.func.name
             );
             GenStep::Ready(build_frames(true, entry.capsule, entry.lines))
-        } else if llm.is_none() {
+        } else if llm_snapshot.proxy.is_none() {
             // 3a. Miss but no LLM configured.
             GenStep::Ready(vec![err("LLM not configured: set OPENCODE_API_KEY")])
         } else {
-            // 3b. Miss → assemble the prompt while we still hold the project lock.
+            // 3b. Miss → assemble only from the verified card projection + source.
             let ctx = assemble_gen_context(
                 proj.graphs.graph_for_file(&req.file_path),
                 &req.file_path,
-                &req.roster,
+                &binding.roster_names,
                 &req.shared,
             );
-            let (system, user) = build_gen_prompt(&req.func, &fn_source, &req.key_lines, &ctx);
+            let (system, user) = build_gen_prompt(
+                &req.func,
+                &binding.fn_source,
+                &req.key_lines,
+                &ctx,
+                &binding.card,
+                &binding.role,
+            );
             GenStep::NeedLlm {
                 system,
                 user,
-                fn_source,
+                binding: Box::new(binding),
             }
         }
     }; // project lock dropped here — before any await.
 
-    let (system, user, fn_source) = match step {
+    let (system, user, binding) = match step {
         GenStep::Ready(frames) => return frames,
         GenStep::NeedLlm {
             system,
             user,
-            fn_source,
-        } => (system, user, fn_source),
+            binding,
+        } => (system, user, binding),
     };
 
-    let llm = llm.as_ref().expect("NeedLlm implies llm is Some");
+    let llm = llm_snapshot
+        .proxy
+        .as_ref()
+        .expect("NeedLlm implies llm is Some");
     eprintln!(
         "[generate] cache MISS {}#{} — calling LLM ({})",
         req.file_path, req.func.name, llm.model
@@ -1113,7 +1237,12 @@ async fn run_generation(state: &AppState, req: GenerateRequest) -> Vec<GenFrame>
             return vec![err(format!("LLM error: {e}"))];
         }
     };
-    let (capsule, lines) = match parse_generation(&content, &req.func.id) {
+    let (capsule, lines) = match parse_generation(
+        &content,
+        &req.func.id,
+        &binding.card.orientation_id,
+        binding.role.clone(),
+    ) {
         Ok(v) => v,
         Err(e) => {
             eprintln!(
@@ -1124,16 +1253,34 @@ async fn run_generation(state: &AppState, req: GenerateRequest) -> Vec<GenFrame>
         }
     };
 
-    // 4. Persist for the next open (best-effort; a write failure must not fail the
-    //    response). Re-acquire the lock briefly for the cache write.
+    // 4. Re-resolve the complete backend-owned binding after provider IO. Source,
+    // graph ownership, roster, card, or project changes make the result stale and
+    // visible rather than writing it under a newer context.
     let entry = CapsuleEntry {
         capsule: capsule.clone(),
         lines: lines.clone(),
     };
-    if let Some(proj) = state.project.read().unwrap().as_ref() {
-        if let Err(e) = proj.cache.put(&fn_source, &entry) {
-            eprintln!("[generate] warning: cache put failed: {e}");
-        }
+    let mut guard = state.project.write().unwrap();
+    let Some(project) = guard.as_mut() else {
+        return vec![err("project closed during generation; retry")];
+    };
+    if project.reader.root() != binding.project_root {
+        return vec![err("project changed during generation; retry")];
+    }
+    let current = match verify_capsule_binding(project, &llm_snapshot.config, &req) {
+        Ok(current) => current,
+        Err(error) => return vec![err(format!("generation context changed: {error}"))],
+    };
+    if current.fn_source != binding.fn_source
+        || current.orientation_context_hash != binding.orientation_context_hash
+        || current.card.orientation_id != binding.card.orientation_id
+        || current.role != binding.role
+    {
+        return vec![err("generation context changed; retry")];
+    }
+    let cache_identity = capsule_cache_identity(&current, &llm_snapshot.config);
+    if let Err(error) = project.cache.put_capsule(&cache_identity, &entry) {
+        eprintln!("[generate] warning: cache put failed: {error}");
     }
 
     build_frames(false, capsule, lines)
@@ -2943,6 +3090,21 @@ mod tests {
         }
     }
 
+    fn test_role(fn_id: &str) -> FunctionRole {
+        FunctionRole {
+            fn_id: fn_id.to_string(),
+            lane: crate::orientation::FunctionLane::Core,
+            flow_ids: vec!["request-flow".into()],
+            stage: "dispatch request".into(),
+            receives_from_actor_ids: vec!["caller".into()],
+            consumes: vec!["Request".into()],
+            sends_to_actor_ids: vec!["worker".into()],
+            produces: vec!["Work".into()],
+            why: "Moves the request into the worker.".into(),
+            evidence_ids: vec!["E1".into()],
+        }
+    }
+
     fn cap(fn_id: &str) -> Capsule {
         Capsule {
             fn_id: fn_id.to_string(),
@@ -2950,6 +3112,8 @@ mod tests {
             summary: "做一件事".into(),
             complexity: "simple".into(),
             io: "无->无".into(),
+            orientation_id: "orientation-1".into(),
+            role: test_role(fn_id),
         }
     }
 
@@ -3214,15 +3378,18 @@ mod tests {
     }
 
     fn req(file_path: &str, line_range: [u32; 2]) -> GenerateRequest {
+        let func = FunctionSpan {
+            id: "f#1".into(),
+            name: "f".into(),
+            line_range,
+        };
         GenerateRequest {
             req_id: "r1".into(),
             file_path: file_path.into(),
-            func: FunctionSpan {
-                id: "f#1".into(),
-                name: "f".into(),
-                line_range,
-            },
-            roster: vec![],
+            orientation_id: "orientation-1".into(),
+            func: func.clone(),
+            roster: vec!["f".into()],
+            roster_spans: vec![func],
             key_lines: vec![],
             shared: SharedContext::default(),
         }
@@ -3472,6 +3639,108 @@ mod tests {
         })
     }
 
+    fn generation_card_json(file_path: &str) -> serde_json::Value {
+        serde_json::json!({
+            "purpose": "Move a request from Caller to Worker.",
+            "actors": [
+                { "id": "caller", "name": "Caller", "role": "Starts work.", "boundary": "project" },
+                { "id": "worker", "name": "Worker", "role": "Finishes work.", "boundary": "inside-file" }
+            ],
+            "types": [
+                { "name": "Request", "ownerActorId": "caller", "meaning": "One work request." }
+            ],
+            "coreFlows": [{
+                "id": "request-flow",
+                "name": "Request delivery",
+                "kind": "request",
+                "why": "The worker needs the request.",
+                "steps": [{
+                    "fromActorId": "caller",
+                    "via": "f",
+                    "payload": "Request",
+                    "toActorId": "worker",
+                    "why": "Transfers the request.",
+                    "evidenceIds": ["E1"]
+                }]
+            }],
+            "supportingCapabilities": [],
+            "functionRoles": [{
+                "fnId": "f#1",
+                "lane": "core",
+                "flowIds": ["request-flow"],
+                "stage": "dispatch request",
+                "receivesFromActorIds": ["caller"],
+                "consumes": ["Request"],
+                "sendsToActorIds": ["worker"],
+                "produces": ["Work"],
+                "why": "Moves the request into the worker.",
+                "evidenceIds": ["E1"]
+            }],
+            "walkthrough": {
+                "title": "One request",
+                "input": "request-1",
+                "steps": [{ "text": "Caller invokes f.", "evidenceIds": ["E1"] }]
+            },
+            "invariants": [{ "text": "The request is delivered once.", "evidenceIds": ["E1"] }],
+            "evidence": [{
+                "id": "E1",
+                "filePath": file_path,
+                "startLine": 1,
+                "endLine": 2,
+                "symbol": "f"
+            }]
+        })
+    }
+
+    fn seed_generation_orientation(state: &AppState, req: &GenerateRequest) -> FileOrientationCard {
+        let config = state.llm_snapshot().config;
+        let mut guard = state.project.write().unwrap();
+        let project = guard.as_mut().unwrap();
+        project.graphs.refresh();
+        let source = project.reader.read_file(&req.file_path).unwrap();
+        let roster_fn_ids = verify_orientation_roster(&source, &req.roster_spans).unwrap();
+        let graph_paths = [req.file_path.clone()];
+        let graph_hash = project.graphs.relevant_graph_set_hash(&graph_paths);
+        let identity = OrientationCacheIdentity {
+            full_file_source: &source,
+            relevant_graph_set_hash: &graph_hash,
+            provider_base_url: &config.base_url,
+            model: &config.model,
+            prompt_version: ORIENTATION_PROMPT_VERSION,
+            schema_version: ORIENTATION_SCHEMA_VERSION,
+        };
+        let orientation_id = identity.key();
+        let card = parse_orientation_card(
+            &generation_card_json(&req.file_path).to_string(),
+            &orientation_id,
+            &req.file_path,
+            OrientationCoverage {
+                mode: OrientationCoverageMode::FullSource,
+                omitted_function_ids: Vec::new(),
+            },
+        )
+        .unwrap();
+        let line_ranges = orientation_roster_line_ranges(&req.roster_spans);
+        let validation = OrientationValidationContext {
+            file_path: &req.file_path,
+            source: &source,
+            roster_fn_ids: &roster_fn_ids,
+            roster_line_ranges: Some(&line_ranges),
+        };
+        project
+            .cache
+            .put_orientation(&identity, &validation, &card)
+            .unwrap();
+        card
+    }
+
+    fn bound_req(state: &AppState, file_path: &str) -> GenerateRequest {
+        let mut request = req(file_path, [1, 2]);
+        let card = seed_generation_orientation(state, &request);
+        request.orientation_id = card.orientation_id;
+        request
+    }
+
     fn bounded_orientation_source() -> String {
         let mut source = concat!(
             "use crate::Request;\n",
@@ -3602,27 +3871,42 @@ mod tests {
         std::fs::write(tmp.path().join("a.py"), "def f():\n    return 1\n").unwrap();
         // llm: None — yet a pre-populated cache must still succeed (zero token).
         let state = make_state(tmp.path(), "");
-        let fn_source = "def f():\n    return 1";
-        state
-            .project
-            .read()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .cache
-            .put(
-                fn_source,
-                &CapsuleEntry {
-                    capsule: cap("f#1"),
-                    lines: vec![line("f#1", 2)],
-                },
-            )
-            .unwrap();
+        let request = bound_req(&state, "a.py");
+        let config = state.llm_snapshot().config;
+        let current_orientation_id = request.orientation_id.clone();
+        let expected_role;
+        {
+            let mut guard = state.project.write().unwrap();
+            let project = guard.as_mut().unwrap();
+            let binding = verify_capsule_binding(project, &config, &request).unwrap();
+            expected_role = binding.role.clone();
+            let identity = capsule_cache_identity(&binding, &config);
+            let mut cached = cap("f#1");
+            cached.orientation_id = "previous-equivalent-card".into();
+            cached.role = binding.role.clone();
+            project
+                .cache
+                .put_capsule(
+                    &identity,
+                    &CapsuleEntry {
+                        capsule: cached,
+                        lines: vec![line("f#1", 2)],
+                    },
+                )
+                .unwrap();
+        }
 
-        let frames = run_generation(&state, req("a.py", [1, 2])).await;
+        let frames = run_generation(&state, request).await;
         assert_eq!(frames[0], GenFrame::CacheHit);
         assert!(matches!(frames.last(), Some(GenFrame::Done)));
         assert!(frames.iter().any(|f| matches!(f, GenFrame::Line { .. })));
+        let capsule = frames.iter().find_map(|frame| match frame {
+            GenFrame::Capsule { capsule } => Some(capsule),
+            _ => None,
+        });
+        let capsule = capsule.expect("capsule frame");
+        assert_eq!(capsule.orientation_id, current_orientation_id);
+        assert_eq!(capsule.role, expected_role);
     }
 
     #[tokio::test]
@@ -3630,7 +3914,9 @@ mod tests {
         let tmp = TmpDir::new();
         std::fs::write(tmp.path().join("a.py"), "def f():\n    return 1\n").unwrap();
         let state = make_state(tmp.path(), "");
-        let frames = run_generation(&state, req("a.py", [5, 9])).await;
+        let mut request = bound_req(&state, "a.py");
+        request.func.line_range = [5, 9];
+        let frames = run_generation(&state, request).await;
         assert_eq!(frames.len(), 1);
         assert!(matches!(frames[0], GenFrame::Error { .. }));
     }
@@ -3640,12 +3926,34 @@ mod tests {
         let tmp = TmpDir::new();
         std::fs::write(tmp.path().join("a.py"), "def f():\n    return 1\n").unwrap();
         let state = make_state(tmp.path(), "");
-        let frames = run_generation(&state, req("a.py", [1, 2])).await;
+        let request = bound_req(&state, "a.py");
+        let frames = run_generation(&state, request).await;
         assert_eq!(frames.len(), 1);
         match &frames[0] {
             GenFrame::Error { message } => assert!(message.contains("LLM not configured")),
             other => panic!("expected error frame, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn unknown_or_stale_orientation_id_is_rejected_before_generation() {
+        let tmp = TmpDir::new();
+        std::fs::write(tmp.path().join("a.py"), "def f():\n    return 1\n").unwrap();
+        let state = make_state(tmp.path(), "");
+
+        let unknown = run_generation(&state, req("a.py", [1, 2])).await;
+        assert!(matches!(
+            &unknown[..],
+            [GenFrame::Error { message }] if message.contains("orientationId")
+        ));
+
+        let stale_request = bound_req(&state, "a.py");
+        std::fs::write(tmp.path().join("a.py"), "def f():\n    return 2\n").unwrap();
+        let stale = run_generation(&state, stale_request).await;
+        assert!(matches!(
+            &stale[..],
+            [GenFrame::Error { message }] if message.contains("orientationId")
+        ));
     }
 
     #[tokio::test]
@@ -5260,6 +5568,15 @@ mod tests {
             capsule: cap("f#1"),
             lines: vec![line("f#1", 2)],
         };
+        let original_config = state.llm_snapshot().config;
+        let original_identity = CapsuleCacheIdentity {
+            fn_source,
+            orientation_context_hash: "coordinates-v1",
+            provider_base_url: &original_config.base_url,
+            model: &original_config.model,
+            prompt_version: CAPSULE_PROMPT_VERSION,
+            schema_version: CAPSULE_SCHEMA_VERSION,
+        };
         state
             .project
             .read()
@@ -5267,7 +5584,7 @@ mod tests {
             .as_ref()
             .unwrap()
             .cache
-            .put(fn_source, &entry)
+            .put_capsule(&original_identity, &entry)
             .unwrap();
         // Hit under the original model.
         assert!(state
@@ -5277,7 +5594,7 @@ mod tests {
             .as_ref()
             .unwrap()
             .cache
-            .get(fn_source)
+            .get_capsule(&original_identity)
             .is_some());
 
         apply_llm_settings(
@@ -5287,7 +5604,16 @@ mod tests {
             None,
         );
 
-        // Cache re-pointed under the new model → the old entry no longer matches.
+        let changed_config = state.llm_snapshot().config;
+        let changed_identity = CapsuleCacheIdentity {
+            fn_source,
+            orientation_context_hash: "coordinates-v1",
+            provider_base_url: &changed_config.base_url,
+            model: &changed_config.model,
+            prompt_version: CAPSULE_PROMPT_VERSION,
+            schema_version: CAPSULE_SCHEMA_VERSION,
+        };
+        // The old artifact remains on disk, but the new model identity misses it.
         assert!(state
             .project
             .read()
@@ -5295,18 +5621,27 @@ mod tests {
             .as_ref()
             .unwrap()
             .cache
-            .get(fn_source)
+            .get_capsule(&changed_identity)
             .is_none());
     }
 
     #[test]
-    fn keeping_the_model_leaves_the_cache_intact() {
+    fn changing_provider_base_url_invalidates_capsule_cache() {
         let tmp = TmpDir::new();
         let state = make_state(tmp.path(), "key123");
         let fn_source = "def f():\n    return 1\n";
         let entry = CapsuleEntry {
             capsule: cap("f#1"),
             lines: vec![line("f#1", 2)],
+        };
+        let original_config = state.llm_snapshot().config;
+        let original_identity = CapsuleCacheIdentity {
+            fn_source,
+            orientation_context_hash: "coordinates-v1",
+            provider_base_url: &original_config.base_url,
+            model: &original_config.model,
+            prompt_version: CAPSULE_PROMPT_VERSION,
+            schema_version: CAPSULE_SCHEMA_VERSION,
         };
         state
             .project
@@ -5315,11 +5650,20 @@ mod tests {
             .as_ref()
             .unwrap()
             .cache
-            .put(fn_source, &entry)
+            .put_capsule(&original_identity, &entry)
             .unwrap();
 
-        // Same model (only base_url changes) → cache untouched, entry still hits.
+        // Provider identity is part of the capsule key even when the model name stays fixed.
         apply_llm_settings(&state, "https://x/v1".into(), "test-model".into(), None);
+        let changed_config = state.llm_snapshot().config;
+        let changed_identity = CapsuleCacheIdentity {
+            fn_source,
+            orientation_context_hash: "coordinates-v1",
+            provider_base_url: &changed_config.base_url,
+            model: &changed_config.model,
+            prompt_version: CAPSULE_PROMPT_VERSION,
+            schema_version: CAPSULE_SCHEMA_VERSION,
+        };
         assert!(state
             .project
             .read()
@@ -5327,7 +5671,7 @@ mod tests {
             .as_ref()
             .unwrap()
             .cache
-            .get(fn_source)
-            .is_some());
+            .get_capsule(&changed_identity)
+            .is_none());
     }
 }

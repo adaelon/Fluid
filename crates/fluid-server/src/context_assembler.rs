@@ -19,6 +19,10 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::graph_loader::{GraphCatalog, GraphEdge, GraphNode, GraphSnapshot, KnowledgeGraph};
+use crate::orientation::{
+    CodeEvidenceRef, FileOrientationCard, FunctionRole, OrientationActor, OrientationFlow,
+    OrientationType,
+};
 
 /// A function as located by the frontend's tree-sitter pass (技术方案 §3).
 /// `lineRange` is 1-based inclusive `[start, end]`.
@@ -795,6 +799,48 @@ fn render_orientation_source_chunk(fn_id: &str, numbered_source: &str) -> String
     format!("【{fn_id}】\n{numbered_source}\n")
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CapsuleOrientationProjection<'a> {
+    actors: &'a [OrientationActor],
+    types: &'a [OrientationType],
+    core_flows: Vec<&'a OrientationFlow>,
+    function_role: &'a FunctionRole,
+    evidence: Vec<&'a CodeEvidenceRef>,
+}
+
+/// Project one validated file card down to the target function. The backend,
+/// not the model, chooses the role and reference closure that enter this prompt.
+fn capsule_orientation_projection(card: &FileOrientationCard, role: &FunctionRole) -> String {
+    let flow_ids = role.flow_ids.iter().collect::<BTreeSet<_>>();
+    let core_flows = card
+        .core_flows
+        .iter()
+        .filter(|flow| flow_ids.contains(&flow.id))
+        .collect::<Vec<_>>();
+
+    let mut evidence_ids = role.evidence_ids.iter().collect::<BTreeSet<_>>();
+    for flow in &core_flows {
+        for step in &flow.steps {
+            evidence_ids.extend(step.evidence_ids.iter());
+        }
+    }
+    let evidence = card
+        .evidence
+        .iter()
+        .filter(|item| evidence_ids.contains(&item.id))
+        .collect::<Vec<_>>();
+
+    serde_json::to_string(&CapsuleOrientationProjection {
+        actors: &card.actors,
+        types: &card.types,
+        core_flows,
+        function_role: role,
+        evidence,
+    })
+    .expect("validated orientation projection contains only serializable fields")
+}
+
 /// Build the full-source file-orientation prompt (S-ORI-2). Backend-owned
 /// identity fields (`schemaVersion`, `orientationId`, `filePath`, and coverage)
 /// are deliberately absent from the requested JSON and injected after parsing.
@@ -854,39 +900,27 @@ pub fn build_gen_prompt(
     fn_source: &str,
     key_lines: &[u32],
     ctx: &GenContext,
+    orientation: &FileOrientationCard,
+    role: &FunctionRole,
 ) -> (String, String) {
     let system = "你是 Fluid 的代码理解助手，面向零代码基础的读者。\
 针对给定的【单个函数】，用简体中文生成语义投影。\
 要求：summary 讲清这个函数“做什么、为什么”，避免逐字复述代码；\
-io 用一句话抽象输入与输出；complexity 取 simple/moderate/complex 之一；\
+summary 与 io 必须服从【后端核验定向投影】；io 必须点名来源参与者、消费类型、去向参与者与产物，禁止使用无主语的方向词；\
+complexity 取 simple/moderate/complex 之一；\
 signature 给出函数签名。\
 对【需要标注的重点行】各写一句话注释（text），并给一个语义色温的十六进制颜色（color，如 #7ee787 表正常流、#f0883e 表分支、#ff7b72 表异常/return）。\
+函数角色由后端从已校验定向卡注入，模型不得在 JSON 中创建或修改角色、参与者、流、证据 ID。\
 只输出一个 JSON 对象，禁止任何额外文字或 markdown 代码围栏。\
 JSON 形如：{\"capsule\":{\"signature\":\"...\",\"summary\":\"...\",\"complexity\":\"simple\",\"io\":\"...\"},\"lines\":[{\"lineNumber\":12,\"text\":\"...\",\"color\":\"#7ee787\"}]}";
 
     let mut user = String::new();
-    if let Some(fs) = &ctx.file_summary {
-        user.push_str(&format!("【文件摘要】{fs}\n"));
-    }
     if !ctx.roster.is_empty() {
         user.push_str(&format!("【本文件函数清单】{}\n", ctx.roster.join(", ")));
     }
-    if !ctx.edges.is_empty() {
-        let rels: Vec<String> = ctx
-            .edges
-            .iter()
-            .map(|e| format!("{}-{}->{}", e.source, e.edge_type, e.target))
-            .collect();
-        user.push_str(&format!("【相关关系(calls/imports)】{}\n", rels.join("; ")));
-    }
-    if !ctx.callee_summaries.is_empty() {
-        let cs: Vec<String> = ctx
-            .callee_summaries
-            .iter()
-            .map(|(k, v)| format!("{k}: {v}"))
-            .collect();
-        user.push_str(&format!("【被调对象一句话摘要】{}\n", cs.join("; ")));
-    }
+    user.push_str("【后端核验定向投影(JSON)】\n");
+    user.push_str(&capsule_orientation_projection(orientation, role));
+    user.push('\n');
 
     user.push_str(&format!("\n【目标函数】{}\n", func.name));
     if key_lines.is_empty() {
@@ -1686,6 +1720,71 @@ fn number_lines(src: &str, start_line: u32) -> String {
 mod tests {
     use super::*;
     use crate::graph_loader::{GraphCatalog, GraphNode, KnowledgeGraph};
+
+    fn capsule_orientation_fixture() -> (
+        crate::orientation::FileOrientationCard,
+        crate::orientation::FunctionRole,
+    ) {
+        let card = serde_json::from_value::<crate::orientation::FileOrientationCard>(
+            serde_json::json!({
+                "schemaVersion": 1,
+                "orientationId": "orientation-1",
+                "filePath": "a.py",
+                "purpose": "Move a request from Caller to Worker.",
+                "actors": [
+                    { "id": "caller", "name": "Caller", "role": "Starts work.", "boundary": "project" },
+                    { "id": "worker", "name": "Worker", "role": "Finishes work.", "boundary": "inside-file" }
+                ],
+                "types": [
+                    { "name": "Request", "ownerActorId": "caller", "meaning": "One work request." }
+                ],
+                "coreFlows": [{
+                    "id": "request-flow",
+                    "name": "Request delivery",
+                    "kind": "request",
+                    "why": "The worker needs the request.",
+                    "steps": [{
+                        "fromActorId": "caller",
+                        "via": "f",
+                        "payload": "Request",
+                        "toActorId": "worker",
+                        "why": "Transfers the request.",
+                        "evidenceIds": ["E1"]
+                    }]
+                }],
+                "supportingCapabilities": [],
+                "functionRoles": [{
+                    "fnId": "f#10",
+                    "lane": "core",
+                    "flowIds": ["request-flow"],
+                    "stage": "dispatch request",
+                    "receivesFromActorIds": ["caller"],
+                    "consumes": ["Request"],
+                    "sendsToActorIds": ["worker"],
+                    "produces": ["Work"],
+                    "why": "Moves the request into the worker.",
+                    "evidenceIds": ["E1"]
+                }],
+                "walkthrough": {
+                    "title": "One request",
+                    "input": "request-1",
+                    "steps": [{ "text": "Caller invokes f.", "evidenceIds": ["E1"] }]
+                },
+                "invariants": [{ "text": "The request is delivered once.", "evidenceIds": ["E1"] }],
+                "evidence": [{
+                    "id": "E1",
+                    "filePath": "a.py",
+                    "startLine": 10,
+                    "endLine": 11,
+                    "symbol": "f"
+                }],
+                "coverage": { "mode": "full-source", "omittedFunctionIds": [] }
+            }),
+        )
+        .unwrap();
+        let role = card.function_roles[0].clone();
+        (card, role)
+    }
 
     fn catalog(graph: KnowledgeGraph) -> GraphCatalog {
         GraphCatalog::from_root_graph_for_test(graph)
@@ -2490,12 +2589,28 @@ mod tests {
             name: "f".into(),
             line_range: [10, 11],
         };
-        let ctx = assemble_gen_context(None, "a.py", &["f".into()], &SharedContext::default());
-        let (system, user) = build_gen_prompt(&func, "def f():\n    return 1", &[11], &ctx);
+        let shared = SharedContext {
+            file_summary: Some("A vague upstream/downstream summary must not survive.".into()),
+            ..SharedContext::default()
+        };
+        let ctx = assemble_gen_context(None, "a.py", &["f".into()], &shared);
+        let (card, role) = capsule_orientation_fixture();
+        let (system, user) =
+            build_gen_prompt(&func, "def f():\n    return 1", &[11], &ctx, &card, &role);
         assert!(system.contains("只输出一个 JSON"));
         assert!(user.contains("  10 | def f():"));
         assert!(user.contains("  11 |     return 1"));
         assert!(user.contains("【需要标注的重点行(行号)】11"));
+        assert!(user.contains("【后端核验定向投影(JSON)】"));
+        assert!(user.contains("\"id\":\"caller\""));
+        assert!(user.contains("\"stage\":\"dispatch request\""));
+        assert!(user.contains("\"receivesFromActorIds\":[\"caller\"]"));
+        assert!(user.contains("\"sendsToActorIds\":[\"worker\"]"));
+        let complete_prompt = format!("{system}\n{user}").to_lowercase();
+        assert!(!complete_prompt.contains("upstream"));
+        assert!(!complete_prompt.contains("downstream"));
+        assert!(!complete_prompt.contains("上游"));
+        assert!(!complete_prompt.contains("下游"));
     }
 
     #[test]

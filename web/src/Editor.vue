@@ -203,11 +203,17 @@ function wsUrl(): string {
 // scheduler routes terminal frames by it). Reads the live current-file state.
 function buildRequest(fnId: string): unknown {
   const fn = currentRoster.find((r) => r.id === fnId)
+  const orientation = orientationState.value
+  if (!orientationCanActivate(orientation, currentPath)) {
+    throw new Error('capsule generation dispatched before file orientation completed')
+  }
   return {
     reqId: fnId,
     filePath: currentPath,
+    orientationId: orientation.card.orientationId,
     fn,
     roster: currentRoster.map((r) => r.name),
+    rosterSpans: currentRoster,
     keyLines: store.keyLinesOf(fnId),
     shared: {},
   }
