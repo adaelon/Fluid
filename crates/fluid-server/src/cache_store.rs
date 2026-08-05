@@ -1,8 +1,9 @@
-//! CacheStore — on-disk bypass cache for generated capsules (S5).
+//! CacheStore — on-disk bypass caches for generated semantic artifacts.
 //!
-//! Bypass cache = generated function capsules + line annotations, written
-//! *outside* the source tree so the core law "zero byte contamination" holds
-//! (核心律 1). Layout: `<project>/.fluid/capsules/<key>.json`.
+//! Function capsules/lines/translations, selection explanations, and validated
+//! file-orientation cards are written *outside* the source tree so the core law
+//! "zero byte contamination" holds (核心律 1). Layout is split below `.fluid/`
+//! into `capsules/`, `selections/`, and `orientations/`.
 //!
 //! Key (技术方案 §6, refining ADR-0003): `hash(function source span)` folded
 //! together with the model version and prompt version. Changing any of the three
@@ -23,6 +24,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::orientation::{
+    FileOrientationCard, OrientationCacheIdentity, OrientationValidationContext,
+};
 use crate::web_evidence::{EvidenceStatus, SourceLink};
 
 /// A function-granularity semantic capsule (技术方案 §3). S5 stores these
@@ -112,6 +116,9 @@ pub struct SelectionCacheEntry {
 #[derive(Clone)]
 pub struct CacheStore {
     dir: PathBuf,
+    // S-ORI-1 stages this store before the S-ORI-2 route consumes it.
+    #[allow(dead_code)]
+    orientation_dir: PathBuf,
     selection_dir: PathBuf,
     model_version: String,
     prompt_version: String,
@@ -127,6 +134,7 @@ impl CacheStore {
     ) -> Self {
         Self {
             dir: project_root.join(".fluid").join("capsules"),
+            orientation_dir: project_root.join(".fluid").join("orientations"),
             selection_dir: project_root.join(".fluid").join("selections"),
             model_version: model_version.into(),
             prompt_version: prompt_version.into(),
@@ -341,6 +349,69 @@ impl CacheStore {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         std::fs::write(self.selection_dir.join(format!("{key}.json")), json)
     }
+
+    /// Read and revalidate one file-orientation artifact. Corrupt, stale, or
+    /// structurally invalid entries are ordinary misses and never reach a child
+    /// prompt.
+    #[allow(dead_code)] // first production consumer lands in S-ORI-2
+    pub fn get_orientation(
+        &self,
+        identity: &OrientationCacheIdentity<'_>,
+        context: &OrientationValidationContext<'_>,
+    ) -> Option<FileOrientationCard> {
+        if identity.full_file_source != context.source {
+            return None;
+        }
+        let key = identity.key();
+        let bytes = std::fs::read(self.orientation_dir.join(format!("{key}.json"))).ok()?;
+        let card: FileOrientationCard = serde_json::from_slice(&bytes).ok()?;
+        if card.orientation_id != key || card.schema_version != identity.schema_version {
+            return None;
+        }
+        card.validate(context).ok()?;
+        Some(card)
+    }
+
+    /// Validate and persist one file-orientation artifact under
+    /// `.fluid/orientations/<orientationKey>.json`. Validation happens before
+    /// directory creation, so a rejected model product leaves no cache residue.
+    #[allow(dead_code)] // first production consumer lands in S-ORI-2
+    pub fn put_orientation(
+        &self,
+        identity: &OrientationCacheIdentity<'_>,
+        context: &OrientationValidationContext<'_>,
+        card: &FileOrientationCard,
+    ) -> std::io::Result<()> {
+        if identity.full_file_source != context.source {
+            return Err(invalid_cache_data(
+                "orientation identity source does not match validation source",
+            ));
+        }
+        let key = identity.key();
+        if card.orientation_id != key {
+            return Err(invalid_cache_data(
+                "orientationId does not match the orientation cache key",
+            ));
+        }
+        if card.schema_version != identity.schema_version {
+            return Err(invalid_cache_data(
+                "card schemaVersion does not match the cache identity",
+            ));
+        }
+        card.validate(context)
+            .map_err(|error| invalid_cache_data(error.to_string()))?;
+
+        std::fs::create_dir_all(&self.orientation_dir)?;
+        let json = serde_json::to_vec_pretty(card).map_err(invalid_cache_data)?;
+        std::fs::write(self.orientation_dir.join(format!("{key}.json")), json)
+    }
+}
+
+#[allow(dead_code)] // used by the staged S-ORI-1 cache methods above
+fn invalid_cache_data(
+    error: impl Into<Box<dyn std::error::Error + Send + Sync>>,
+) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, error)
 }
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;

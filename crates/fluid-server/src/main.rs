@@ -7,6 +7,10 @@ mod cache_store;
 mod context_assembler;
 mod graph_loader;
 mod llm_proxy;
+// S-ORI-1 lands the validated protocol/cache boundary before S-ORI-2 adds the
+// first route/LLM consumer. Keep the staged allowance local to that module.
+#[allow(dead_code)]
+mod orientation;
 mod project_reader;
 mod routes;
 mod settings;
