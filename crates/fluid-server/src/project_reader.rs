@@ -224,7 +224,10 @@ mod tests {
     #[test]
     fn missing_file_is_not_found() {
         let (_dir, reader) = temp_reader();
-        assert!(matches!(reader.read_file("src/nope.py"), Err(ReadErr::NotFound)));
+        assert!(matches!(
+            reader.read_file("src/nope.py"),
+            Err(ReadErr::NotFound)
+        ));
     }
 
     #[test]

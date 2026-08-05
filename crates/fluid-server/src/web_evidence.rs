@@ -172,10 +172,8 @@ impl WebEvidenceService {
         }
 
         progress(EvidenceProgress::PlanningWeb);
-        let (system, user) = build_web_search_planning_prompt(
-            request.private_context,
-            request.dependency_hints,
-        );
+        let (system, user) =
+            build_web_search_planning_prompt(request.private_context, request.dependency_hints);
         let plan = match llm.complete(&system, &user).await {
             Ok(content) => match parse_search_plan(&content) {
                 Ok(plan) => plan,
@@ -497,9 +495,7 @@ mod tests {
         web_body: &str,
         web_delay: Duration,
     ) -> MockServer {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let state = MockBackend {
@@ -568,8 +564,7 @@ mod tests {
             Err(SearchPlanParseError::InvalidJson(_))
         ));
         assert_eq!(
-            parse_search_plan("{\"action\":\"search\",\"query\":\"   \"}")
-                .unwrap_err(),
+            parse_search_plan("{\"action\":\"search\",\"query\":\"   \"}").unwrap_err(),
             SearchPlanParseError::EmptyQuery
         );
     }
@@ -678,7 +673,10 @@ mod tests {
         assert!(outcome.warning.is_none());
         assert_eq!(
             progress,
-            vec![EvidenceProgress::PlanningWeb, EvidenceProgress::SearchingWeb]
+            vec![
+                EvidenceProgress::PlanningWeb,
+                EvidenceProgress::SearchingWeb
+            ]
         );
 
         let requests = server.requests.lock().unwrap();
@@ -689,10 +687,7 @@ mod tests {
         assert_eq!(requests[1].body["model"], "fixture-model");
         assert!(requests[0].body.to_string().contains("secret_project"));
         assert_eq!(requests[1].body.as_object().unwrap().len(), 4);
-        assert_eq!(
-            requests[1].body["input"],
-            "serde_json Value public docs"
-        );
+        assert_eq!(requests[1].body["input"], "serde_json Value public docs");
         assert!(!requests[1].body.to_string().contains("secret_project"));
         assert!(!requests[1].body.to_string().contains("PrivateType"));
     }
@@ -733,7 +728,11 @@ mod tests {
         let outcome = WebEvidenceService::new().resolve(proxy, request()).await;
 
         assert_eq!(outcome.status, EvidenceStatus::Unverified);
-        assert!(outcome.warning.as_deref().unwrap().contains("不支持联网检索"));
+        assert!(outcome
+            .warning
+            .as_deref()
+            .unwrap()
+            .contains("不支持联网检索"));
         assert!(outcome.text.is_none());
     }
 

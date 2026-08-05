@@ -18,12 +18,22 @@ export interface CapsuleSummary {
  *  spans (with line ranges) so the backend can slice a function's source on demand
  *  (S10a-追源, ADR-0017). */
 export interface QueryContext {
+  /** File whose roster/orientation produced this snapshot. */
+  filePath: string
+  /** Ready file-orientation identity; empty while the activation gate is closed. */
+  orientationId: string
   roster: string[]
   rosterSpans: FunctionSpan[]
   capsules: CapsuleSummary[]
 }
 
-export const EMPTY_QUERY_CONTEXT: QueryContext = { roster: [], rosterSpans: [], capsules: [] }
+export const EMPTY_QUERY_CONTEXT: QueryContext = {
+  filePath: '',
+  orientationId: '',
+  roster: [],
+  rosterSpans: [],
+  capsules: [],
+}
 
 /** Build the snapshot QueryPanel sends with a follow-up: every function name in
  *  roster order, the roster spans (for on-demand source fetch), plus a
@@ -33,11 +43,19 @@ export const EMPTY_QUERY_CONTEXT: QueryContext = { roster: [], rosterSpans: [], 
 export function buildQueryContext(
   roster: FunctionSpan[],
   summaryOf: (fnId: string) => string | undefined,
+  orientationId = '',
+  filePath = '',
 ): QueryContext {
   const capsules: CapsuleSummary[] = []
   for (const fn of roster) {
     const summary = summaryOf(fn.id)
     if (summary) capsules.push({ name: fn.name, summary })
   }
-  return { roster: roster.map((r) => r.name), rosterSpans: roster, capsules }
+  return {
+    filePath,
+    orientationId,
+    roster: roster.map((r) => r.name),
+    rosterSpans: roster,
+    capsules,
+  }
 }

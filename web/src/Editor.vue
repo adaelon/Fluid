@@ -52,7 +52,19 @@ const emit = defineEmits<{
 // reset (→ empty), once the roster is parsed, and after each capsule arrives, so
 // follow-ups always carry whatever has been generated so far.
 function emitContext(): void {
-  emit('context', buildQueryContext(currentRoster, (id) => store.capsule(id)?.summary))
+  const orientation = orientationState.value
+  const orientationId = orientationCanActivate(orientation, currentPath)
+    ? orientation.card.orientationId
+    : ''
+  emit(
+    'context',
+    buildQueryContext(
+      currentRoster,
+      (id) => store.capsule(id)?.summary,
+      orientationId,
+      currentPath,
+    ),
+  )
 }
 
 const wrap = shallowRef<HTMLDivElement | null>(null)
@@ -315,6 +327,7 @@ function requestOrientation(token: number, filePath: string): void {
       orientationState.value = next
       if (frame.kind === 'done' || frame.kind === 'error') orientationStream = null
       if (!orientationCanActivate(previous, filePath) && orientationCanActivate(next, filePath)) {
+        emitContext() // publish the revision that binds the current-file trace
         void startCapsulesAfterOrientation(token, filePath)
       }
     },

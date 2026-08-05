@@ -80,7 +80,9 @@ async fn main() -> anyhow::Result<()> {
     if llm_config.key_set() {
         println!("LLM proxy ready: model {}", llm_config.model);
     } else {
-        println!("LLM proxy disabled (OPENCODE_API_KEY unset) — configure it in the settings panel");
+        println!(
+            "LLM proxy disabled (OPENCODE_API_KEY unset) — configure it in the settings panel"
+        );
     }
 
     // Project is optional: with a path we serve it immediately; without one we start

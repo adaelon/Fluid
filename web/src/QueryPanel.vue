@@ -6,9 +6,19 @@
 // Switching files or scope vacuums the in-flight Q&A.
 import { computed, ref, watch, nextTick, onBeforeUnmount } from 'vue'
 import { streamQuery, streamQueryFiles, type QueryStream } from './api'
-import type { QueryFrame } from './ghostTypes'
+import type { QueryFrame, QueryTrace } from './ghostTypes'
 import { EMPTY_QUERY_CONTEXT, type QueryContext } from './queryContext'
-import { idleQueryState, reduceQueryFrame, startQueryRequest } from './queryState'
+import {
+  alignQueryTrace,
+  appendCompletedQueryTurn,
+  currentQueryScope,
+  idleQueryState,
+  reduceQueryFrame,
+  selectedQueryScope,
+  startQueryRequest,
+  startQueryTrace,
+  type QueryScopeIdentity,
+} from './queryState'
 // S11-lazy: markdown-it / DOMPurify / KaTeX (+ its CSS) are heavy and only needed
 // once an answer finishes streaming, so they are dynamically import()ed inside
 // renderAnswer() rather than at module top — Rollup splits them into async chunks
@@ -43,14 +53,18 @@ const emit = defineEmits<{
 type QueryScope = 'current' | 'selected'
 
 const question = ref('')
-const answerHtml = ref('') // sanitized Markdown HTML, set once on `done`
 const viewState = ref(idleQueryState())
+const trace = ref<QueryTrace | null>(null)
+const traceAnswerHtml = ref<string[]>([])
+const activeQuestion = ref('')
 const renderedEl = ref<HTMLElement | null>(null)
 const scope = ref<QueryScope>('current')
 let stream: QueryStream | null = null
 let requestGeneration = 0
+let requestSequence = 0
 
 const answer = computed(() => viewState.value.answer)
+const completedTurns = computed(() => trace.value?.turns ?? [])
 const streaming = computed(() => viewState.value.mode === 'streaming')
 const errorMsg = computed(() => viewState.value.errorMessage)
 const evidenceState = computed(() => viewState.value.evidence)
@@ -84,6 +98,14 @@ const statusText = computed(() => {
 })
 
 const selectedReady = computed(() => props.selectedCount >= 2)
+const currentOrientationId = computed(() =>
+  props.path && props.ctx.filePath === props.path ? props.ctx.orientationId : '',
+)
+const scopeIdentity = computed<QueryScopeIdentity>(() =>
+  scope.value === 'current'
+    ? currentQueryScope(props.path ?? '', currentOrientationId.value)
+    : selectedQueryScope(props.selectedPaths),
+)
 const selectedLabel = computed(() => `已选文件(${props.selectedCount})`)
 const selectedScopeHint = computed(() => {
   if (props.selectedCount === 0) return '选择至少 2 个文件后可切换到文件集追问'
@@ -92,14 +114,16 @@ const selectedScopeHint = computed(() => {
 })
 const canAsk = computed(() => {
   if (!question.value.trim() || streaming.value) return false
-  if (scope.value === 'current') return Boolean(props.path)
+  if (scope.value === 'current') return Boolean(props.path && currentOrientationId.value)
   return selectedReady.value
 })
 
-function resetAnswer(clearQuestion = true) {
+function resetTrace(clearQuestion = true) {
   teardown()
+  trace.value = null
+  traceAnswerHtml.value = []
+  activeQuestion.value = ''
   viewState.value = idleQueryState()
-  answerHtml.value = ''
   if (clearQuestion) question.value = ''
 }
 
@@ -109,19 +133,22 @@ function teardown() {
   stream = null
 }
 
-// Switching/closing files resets the panel (vacuum semantics, §7).
+// File, scope, selected-set or source-revision changes all end the current trace.
 watch(
-  () => props.path,
-  () => {
-    resetAnswer()
+  () => [
+    props.path ?? '',
+    scope.value,
+    scopeIdentity.value.scopeKey,
+    scopeIdentity.value.scopeRevision,
+  ] as const,
+  (next, previous) => {
+    resetTrace(next[0] !== previous[0])
   },
 )
 
-watch(scope, () => resetAnswer(false))
-
-// On `done`, render the full Markdown answer (ADR-0008): markdown-it escapes raw
-// HTML, DOMPurify is defense-in-depth, then KaTeX transforms $…$/$$…$$ in the DOM.
-async function renderAnswer(generation: number, text: string) {
+// On `done`, render every completed Markdown answer (ADR-0008): markdown-it
+// escapes raw HTML, DOMPurify is defense-in-depth, then KaTeX transforms math.
+async function renderTraceAnswers(generation: number, turns: QueryTrace['turns']) {
   // Pull the render libs on demand (S11-lazy). The CSS import is a side effect
   // (injects KaTeX styles) — its module value is unused.
   const [{ renderMarkdown }, { default: DOMPurify }, { default: renderMathInElement }] =
@@ -130,9 +157,9 @@ async function renderAnswer(generation: number, text: string) {
       import('dompurify'),
       import('katex/contrib/auto-render'),
       import('katex/dist/katex.min.css'),
-    ])
+  ])
   if (generation !== requestGeneration) return
-  answerHtml.value = DOMPurify.sanitize(renderMarkdown(text))
+  traceAnswerHtml.value = turns.map((turn) => DOMPurify.sanitize(renderMarkdown(turn.answer)))
   await nextTick()
   if (generation !== requestGeneration || !renderedEl.value) return
   renderMathInElement(renderedEl.value, {
@@ -146,16 +173,35 @@ async function renderAnswer(generation: number, text: string) {
   })
 }
 
-function acceptFrame(generation: number, frame: QueryFrame) {
+function acceptFrame(
+  generation: number,
+  identity: QueryScopeIdentity,
+  askedQuestion: string,
+  frame: QueryFrame,
+) {
   if (generation !== requestGeneration) return
-  const next = reduceQueryFrame(viewState.value, frame)
+  const previous = viewState.value
+  const next = reduceQueryFrame(previous, frame)
+  if (next === previous && frame.reqId !== previous.requestId) return
   viewState.value = next
   if (frame.kind === 'done') {
     stream = null
-    void renderAnswer(generation, next.answer)
+    const completed = appendCompletedQueryTurn(
+      trace.value,
+      identity,
+      askedQuestion,
+      next.answer,
+    )
+    trace.value = completed
+    activeQuestion.value = ''
+    void renderTraceAnswers(generation, completed.turns)
   } else if (frame.kind === 'error') {
     stream = null
   }
+}
+
+function newTrace() {
+  resetTrace()
 }
 
 function ask() {
@@ -170,36 +216,52 @@ function ask() {
       }
       return
     }
+    const identity = { ...scopeIdentity.value }
+    const requestTrace =
+      alignQueryTrace(trace.value, identity) ?? startQueryTrace(identity, q)
+    trace.value = requestTrace
+    const reqId = `qf-${++requestSequence}`
     const generation = ++requestGeneration
-    viewState.value = startQueryRequest()
-    answerHtml.value = ''
+    viewState.value = startQueryRequest(reqId)
+    activeQuestion.value = q
+    question.value = ''
     stream = streamQueryFiles(
       {
+        reqId,
         filePaths: props.selectedPaths,
         question: q,
+        trace: requestTrace,
         allowWeb: props.allowWeb,
       },
       {
-        onFrame: (frame) => acceptFrame(generation, frame),
+        onFrame: (frame) => acceptFrame(generation, identity, q, frame),
       },
     )
     return
   }
-  if (!props.path) return
+  if (!props.path || !currentOrientationId.value) return
+  const identity = { ...scopeIdentity.value }
+  const requestTrace = alignQueryTrace(trace.value, identity) ?? startQueryTrace(identity, q)
+  trace.value = requestTrace
+  const reqId = `q-${++requestSequence}`
   const generation = ++requestGeneration
-  viewState.value = startQueryRequest()
-  answerHtml.value = ''
+  viewState.value = startQueryRequest(reqId)
+  activeQuestion.value = q
+  question.value = ''
   stream = streamQuery(
     {
+      reqId,
       filePath: props.path,
+      orientationId: currentOrientationId.value,
       question: q,
+      trace: requestTrace,
       roster: props.ctx.roster,
       rosterSpans: props.ctx.rosterSpans,
       capsules: props.ctx.capsules,
       allowWeb: props.allowWeb,
     },
     {
-      onFrame: (frame) => acceptFrame(generation, frame),
+      onFrame: (frame) => acceptFrame(generation, identity, q, frame),
     },
   )
 }
@@ -238,6 +300,14 @@ onBeforeUnmount(teardown)
       <div class="query-head-actions">
         <button
           class="query-tool"
+          type="button"
+          :disabled="!trace && !streaming && !errorMsg"
+          @click="newTrace"
+        >
+          新追问
+        </button>
+        <button
+          class="query-tool"
           :class="{ active: selectionMode }"
           type="button"
           :aria-pressed="selectionMode"
@@ -253,25 +323,31 @@ onBeforeUnmount(teardown)
         >
           清空
         </button>
-      <button class="query-collapse" type="button" title="收起追问器" aria-label="收起追问器" @click="emit('close')">
-        <svg
-          width="12"
-          height="12"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          stroke-width="2"
-          stroke-linecap="round"
-          aria-hidden="true"
+        <button
+          class="query-collapse"
+          type="button"
+          title="收起追问器"
+          aria-label="收起追问器"
+          @click="emit('close')"
         >
-          <path d="M6 6l12 12M18 6L6 18" />
-        </svg>
-      </button>
+          <svg
+            width="12"
+            height="12"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            aria-hidden="true"
+          >
+            <path d="M6 6l12 12M18 6L6 18" />
+          </svg>
+        </button>
       </div>
     </header>
     <div v-if="!path && scope === 'current'" class="query-vacuum">打开文件以启用追问</div>
-      <template v-else>
-        <div class="query-answer">
+    <template v-else>
+      <div class="query-answer">
           <div
             v-if="streaming && statusText"
             class="query-status"
@@ -312,12 +388,51 @@ onBeforeUnmount(teardown)
             </p>
           </div>
 
-          <div v-if="answerHtml" ref="renderedEl" class="query-answer-md" v-html="answerHtml"></div>
-          <div v-else-if="answer" class="query-answer-plain">{{ answer }}</div>
-          <span v-else-if="!streaming && !errorMsg && scope === 'selected'" class="query-hint">
+          <div v-if="completedTurns.length" ref="renderedEl" class="query-turn-list">
+            <article v-for="(turn, index) in completedTurns" :key="index" class="query-turn">
+              <div class="query-turn-question">
+                <span class="query-turn-label">问 {{ index + 1 }}</span>
+                <span>{{ turn.question }}</span>
+              </div>
+              <div class="query-turn-answer">
+                <span class="query-turn-label">答</span>
+                <div
+                  v-if="traceAnswerHtml[index]"
+                  class="query-answer-md"
+                  v-html="traceAnswerHtml[index]"
+                ></div>
+                <div v-else class="query-answer-plain">{{ turn.answer }}</div>
+              </div>
+            </article>
+          </div>
+
+          <article v-if="activeQuestion && (streaming || errorMsg)" class="query-turn active">
+            <div class="query-turn-question">
+              <span class="query-turn-label">问</span>
+              <span>{{ activeQuestion }}</span>
+            </div>
+            <div v-if="answer" class="query-turn-answer">
+              <span class="query-turn-label">答</span>
+              <div class="query-answer-plain">{{ answer }}</div>
+            </div>
+          </article>
+
+          <span
+            v-if="!completedTurns.length && !activeQuestion && !streaming && !errorMsg && scope === 'selected'"
+            class="query-hint"
+          >
             {{ selectedScopeHint }}
           </span>
-          <span v-else-if="!streaming && !errorMsg" class="query-hint">
+          <span
+            v-else-if="!completedTurns.length && !activeQuestion && !streaming && !errorMsg && !currentOrientationId"
+            class="query-hint"
+          >
+            文件定向完成后可追问当前文件
+          </span>
+          <span
+            v-else-if="!completedTurns.length && !activeQuestion && !streaming && !errorMsg"
+            class="query-hint"
+          >
             就当前文件提问，例如「这个文件做什么？」
           </span>
           <p v-if="errorMsg" class="query-error">
@@ -334,7 +449,7 @@ onBeforeUnmount(teardown)
           <button class="query-send" type="submit" :disabled="!canAsk">
             {{ streaming ? '…' : '追问' }}
           </button>
-        </form>
-      </template>
+      </form>
+    </template>
   </section>
 </template>

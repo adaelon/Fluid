@@ -192,7 +192,10 @@ mod tests {
         // chunks. Concatenation must reproduce the input exactly (no byte lost/added).
         let masked = "# Title\n\npara one is here.\n\npara two is here.\n\npara three.\n";
         let chunks = split_chunks(masked, 20);
-        assert!(chunks.len() > 1, "small budget should split into several chunks");
+        assert!(
+            chunks.len() > 1,
+            "small budget should split into several chunks"
+        );
         assert_eq!(chunks.concat(), masked, "split must be lossless");
         // Each chunk ends on a block boundary, so none starts mid-paragraph.
         for c in &chunks {
@@ -208,7 +211,10 @@ mod tests {
         let masked = format!("{big}\n\nsmall.\n");
         let chunks = split_chunks(&masked, 10);
         assert_eq!(chunks.concat(), masked);
-        assert!(chunks[0].contains(&big), "oversized block stays in one chunk");
+        assert!(
+            chunks[0].contains(&big),
+            "oversized block stays in one chunk"
+        );
     }
 
     #[test]

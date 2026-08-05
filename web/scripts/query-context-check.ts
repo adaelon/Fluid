@@ -27,7 +27,13 @@ console.log('=== empty roster → empty context ===')
 const empty = buildQueryContext([], () => 'x')
 check('no roster names', empty.roster.length === 0)
 check('no capsules', empty.capsules.length === 0)
-check('EMPTY_QUERY_CONTEXT is empty', EMPTY_QUERY_CONTEXT.roster.length === 0 && EMPTY_QUERY_CONTEXT.capsules.length === 0)
+check(
+  'EMPTY_QUERY_CONTEXT is unbound and empty',
+  EMPTY_QUERY_CONTEXT.filePath === '' &&
+    EMPTY_QUERY_CONTEXT.orientationId === '' &&
+    EMPTY_QUERY_CONTEXT.roster.length === 0 &&
+    EMPTY_QUERY_CONTEXT.capsules.length === 0,
+)
 
 console.log('\n=== full generation → every capsule, roster order ===')
 const summaries = new Map<string, string>([
@@ -35,7 +41,9 @@ const summaries = new Map<string, string>([
   ['parse#10', 'parses the source'],
   ['save#30', 'writes the cache'],
 ])
-const full = buildQueryContext(roster, (id) => summaries.get(id))
+const full = buildQueryContext(roster, (id) => summaries.get(id), 'orientation-a1', 'src/a.ts')
+check('snapshot remains bound to the file that produced it', full.filePath === 'src/a.ts')
+check('ready orientation revision crosses the Editor/App bridge', full.orientationId === 'orientation-a1')
 check('roster lists all names in order', full.roster.join(',') === 'load,parse,save')
 check('all three capsules present', full.capsules.length === 3)
 check('capsule carries name + summary', full.capsules[1].name === 'parse' && full.capsules[1].summary === 'parses the source')

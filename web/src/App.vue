@@ -63,7 +63,9 @@ function clearSelectedFiles() {
 watch(
   () => current.value,
   (c) => {
-    if (!c || c.lang === 'md') queryCtx.value = EMPTY_QUERY_CONTEXT
+    if (!c || c.lang === 'md' || queryCtx.value.filePath !== c.path) {
+      queryCtx.value = EMPTY_QUERY_CONTEXT
+    }
   },
 )
 

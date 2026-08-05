@@ -150,6 +150,24 @@ export interface SourceLink {
 
 export type QueryPhase = 'planning-web' | 'searching-web' | 'answering' | 'fallback'
 
+/** One completed question/answer pair in the in-memory follow-up trace. Code
+ * evidence ids are empty until S-QSRC-1/S-QMAP-1 supplies source anchors. */
+export interface QueryTurn {
+  question: string
+  answer: string
+  codeEvidenceIds: string[]
+}
+
+/** Replayable, scope-bound follow-up context. The original question is stored
+ * separately so backend prompt trimming can always retain it while dropping old
+ * complete turns from the middle. */
+export interface QueryTrace {
+  scopeKey: string
+  scopeRevision: string
+  originalQuestion: string
+  turns: QueryTurn[]
+}
+
 /** One inbound frame from either query WebSocket (S-QWEB-2, routes.rs
  * QueryFrame). `status` and `evidence` precede the existing free-form markdown
  * `delta` stream; terminal frames remain `done` | `error`. */

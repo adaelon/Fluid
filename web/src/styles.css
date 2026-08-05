@@ -1037,6 +1037,51 @@ body {
   color: var(--text);
 }
 
+.query-turn-list {
+  display: grid;
+  gap: 10px;
+}
+
+.query-turn {
+  padding: 9px 10px;
+  background: color-mix(in srgb, var(--bg) 78%, transparent);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+}
+
+.query-turn.active {
+  margin-top: 10px;
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+}
+
+.query-turn-question,
+.query-turn-answer {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+}
+
+.query-turn-answer {
+  margin-top: 7px;
+  padding-top: 7px;
+  border-top: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+}
+
+.query-turn-label {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.query-turn-answer .query-answer-md,
+.query-turn-answer .query-answer-plain {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .query-status {
   display: flex;
   align-items: center;

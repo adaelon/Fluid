@@ -6,6 +6,7 @@ import type {
   LineAnnotation,
   OrientationFrame,
   QueryFrame,
+  QueryTrace,
   SelectionFrame,
 } from './ghostTypes'
 import type { CapsuleSummary } from './queryContext'
@@ -363,8 +364,11 @@ export interface QueryStream {
  *  leans on the graph's file_summary backstop alone. */
 export function streamQuery(
   req: {
+    reqId: string
     filePath: string
+    orientationId: string
     question: string
+    trace: QueryTrace
     roster?: string[]
     rosterSpans?: FunctionSpan[]
     capsules?: CapsuleSummary[]
@@ -385,9 +389,11 @@ export function streamQuery(
   sock.onopen = () => {
     sock.send(
       JSON.stringify({
-        reqId: 'q',
+        reqId: req.reqId,
         filePath: req.filePath,
+        orientationId: req.orientationId,
         question: req.question,
+        trace: req.trace,
         roster: req.roster ?? [],
         rosterSpans: req.rosterSpans ?? [],
         capsules: req.capsules ?? [],
@@ -414,13 +420,13 @@ export function streamQuery(
   sock.onerror = () => {
     if (settled) return
     settled = true
-    h.onFrame({ kind: 'error', reqId: 'q', message: '连接失败' })
+    h.onFrame({ kind: 'error', reqId: req.reqId, message: '连接失败' })
     close()
   }
   sock.onclose = () => {
     if (settled) return
     settled = true
-    h.onFrame({ kind: 'error', reqId: 'q', message: '连接已关闭' })
+    h.onFrame({ kind: 'error', reqId: req.reqId, message: '连接已关闭' })
   }
   return {
     cancel: () => {
@@ -434,8 +440,10 @@ export function streamQuery(
  *  and forward the same status/evidence/delta terminal contract (S-QWEB-2). */
 export function streamQueryFiles(
   req: {
+    reqId: string
     filePaths: string[]
     question: string
+    trace: QueryTrace
     allowWeb: boolean
   },
   h: QueryHandlers,
@@ -453,9 +461,10 @@ export function streamQueryFiles(
   sock.onopen = () => {
     sock.send(
       JSON.stringify({
-        reqId: 'qf',
+        reqId: req.reqId,
         filePaths: req.filePaths,
         question: req.question,
+        trace: req.trace,
         allowWeb: req.allowWeb,
       }),
     )
@@ -479,13 +488,13 @@ export function streamQueryFiles(
   sock.onerror = () => {
     if (settled) return
     settled = true
-    h.onFrame({ kind: 'error', reqId: 'qf', message: '连接失败' })
+    h.onFrame({ kind: 'error', reqId: req.reqId, message: '连接失败' })
     close()
   }
   sock.onclose = () => {
     if (settled) return
     settled = true
-    h.onFrame({ kind: 'error', reqId: 'qf', message: '连接已关闭' })
+    h.onFrame({ kind: 'error', reqId: req.reqId, message: '连接已关闭' })
   }
   return {
     cancel: () => {

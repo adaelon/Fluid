@@ -40,7 +40,7 @@ use crate::context_assembler::{
     query_degraded_names, sample_dependency_manifests, slice_cross_file_sources,
     slice_file_set_sources, slice_orientation_sources, slice_requested_sources, slice_span,
     CrossFileTarget, FileSetContext, FileSetSourceTarget, FunctionSpan, GenContext, QueryFocus,
-    SharedContext, ORIENTATION_FETCH_BUDGET_CHARS, QUERY_FETCH_BUDGET_CHARS,
+    QueryTrace, SharedContext, ORIENTATION_FETCH_BUDGET_CHARS, QUERY_FETCH_BUDGET_CHARS,
 };
 use crate::graph_loader::{GraphCatalog, GraphNode, KnowledgeGraph};
 use crate::llm_proxy::{
@@ -2362,7 +2362,11 @@ struct QueryRequest {
     req_id: String,
     #[serde(rename = "filePath")]
     file_path: String,
+    #[serde(rename = "orientationId", default)]
+    orientation_id: String,
     question: String,
+    #[serde(default)]
+    trace: Option<QueryTrace>,
     /// The function the user is focused on (its source is zoomed in); None = file-level.
     #[serde(default)]
     focus: Option<FunctionSpan>,
@@ -2391,8 +2395,92 @@ struct QueryFilesRequest {
     #[serde(rename = "filePaths")]
     file_paths: Vec<String>,
     question: String,
+    #[serde(default)]
+    trace: Option<QueryTrace>,
     #[serde(rename = "allowWeb", default = "default_true")]
     allow_web: bool,
+}
+
+fn selected_query_scope_identity(file_paths: &[String]) -> (String, String) {
+    let mut normalized: Vec<&str> = file_paths.iter().map(String::as_str).collect();
+    // Match JavaScript Array.prototype.sort(), which compares UTF-16 code units.
+    // Rust's native str ordering differs for some non-BMP paths.
+    normalized.sort_by(|left, right| left.encode_utf16().cmp(right.encode_utf16()));
+    normalized.dedup();
+    let encoded = serde_json::to_string(&normalized).expect("selected paths are serializable");
+    (
+        format!("selected:{encoded}"),
+        format!("selected-v1:{encoded}"),
+    )
+}
+
+fn validate_query_trace(
+    trace: &QueryTrace,
+    expected_scope_key: &str,
+    expected_scope_revision: &str,
+) -> Result<(), String> {
+    if trace.scope_key != expected_scope_key {
+        return Err("query trace scopeKey does not match the requested scope".into());
+    }
+    if trace.scope_revision != expected_scope_revision {
+        return Err("query trace scopeRevision does not match the requested scope".into());
+    }
+    if trace.original_question.trim().is_empty() {
+        return Err("query trace originalQuestion must not be empty".into());
+    }
+    if trace
+        .turns
+        .iter()
+        .any(|turn| turn.question.trim().is_empty() || turn.answer.trim().is_empty())
+    {
+        return Err("query trace contains an incomplete turn".into());
+    }
+    Ok(())
+}
+
+fn verify_query_orientation(
+    project: &mut ProjectCtx,
+    config: &LlmConfig,
+    req: &QueryRequest,
+    source: &str,
+) -> Result<(), String> {
+    project.graphs.refresh();
+    let roster_fn_ids = verify_orientation_roster(source, &req.roster_spans)
+        .map_err(|error| format!("invalid rosterSpans: {error}"))?;
+    let roster_names = req
+        .roster_spans
+        .iter()
+        .map(|span| span.name.clone())
+        .collect::<Vec<_>>();
+    if !req.roster.is_empty() && req.roster != roster_names {
+        return Err("roster names do not match rosterSpans".into());
+    }
+
+    let graph_paths = [req.file_path.clone()];
+    let relevant_graph_set_hash = project.graphs.relevant_graph_set_hash(&graph_paths);
+    let identity = OrientationCacheIdentity {
+        full_file_source: source,
+        relevant_graph_set_hash: &relevant_graph_set_hash,
+        provider_base_url: &config.base_url,
+        model: &config.model,
+        prompt_version: ORIENTATION_PROMPT_VERSION,
+        schema_version: ORIENTATION_SCHEMA_VERSION,
+    };
+    if req.orientation_id != identity.key() {
+        return Err("unknown or stale orientationId; retry file orientation".into());
+    }
+    let roster_line_ranges = orientation_roster_line_ranges(&req.roster_spans);
+    let validation = OrientationValidationContext {
+        file_path: &req.file_path,
+        source,
+        roster_fn_ids: &roster_fn_ids,
+        roster_line_ranges: Some(&roster_line_ranges),
+    };
+    project
+        .cache
+        .get_orientation(&identity, &validation)
+        .ok_or_else(|| "unknown or stale orientationId; retry file orientation".to_string())?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -2492,16 +2580,18 @@ struct DegradedPlan {
 /// otherwise a direct single-call prompt.
 #[cfg(test)]
 fn prepare_query(state: &AppState, req: &QueryRequest) -> QueryPlan {
-    prepare_query_for_snapshot(state, req, state.llm_proxy().is_some())
+    let snapshot = state.llm_snapshot();
+    let config = snapshot.proxy.as_ref().map(|_| &snapshot.config);
+    prepare_query_for_snapshot(state, req, config)
 }
 
 fn prepare_query_for_snapshot(
     state: &AppState,
     req: &QueryRequest,
-    llm_available: bool,
+    llm_config: Option<&LlmConfig>,
 ) -> QueryPlan {
-    let guard = state.project.read().unwrap();
-    let Some(proj) = guard.as_ref() else {
+    let mut guard = state.project.write().unwrap();
+    let Some(proj) = guard.as_mut() else {
         return QueryPlan::Err("no project open".into());
     };
 
@@ -2521,8 +2611,22 @@ fn prepare_query_for_snapshot(
         None => None,
     };
 
-    if !llm_available {
+    let Some(llm_config) = llm_config else {
         return QueryPlan::Err("LLM not configured: set OPENCODE_API_KEY".into());
+    };
+
+    if let Some(trace) = req.trace.as_ref() {
+        if req.orientation_id.is_empty() {
+            return QueryPlan::Err("orientationId is required when query trace is present".into());
+        }
+        let expected_scope_key = format!("current:{}", req.file_path);
+        if let Err(message) = validate_query_trace(trace, &expected_scope_key, &req.orientation_id)
+        {
+            return QueryPlan::Err(message);
+        }
+        if let Err(message) = verify_query_orientation(proj, llm_config, req, &source) {
+            return QueryPlan::Err(message);
+        }
     }
 
     let snapshot = proj.graphs.graph_for_file(&req.file_path);
@@ -2545,7 +2649,13 @@ fn prepare_query_for_snapshot(
 
     // Same-file functions degraded to name-only that we can actually slice (have a
     // span) form the same-file fetchable set (S10a-追源).
-    let degraded = query_degraded_names(&req.question, &capsules, focus_ref.as_ref(), &ctx);
+    let degraded = query_degraded_names(
+        &req.question,
+        req.trace.as_ref(),
+        &capsules,
+        focus_ref.as_ref(),
+        &ctx,
+    );
     let same_file_fetchable: Vec<String> = degraded
         .into_iter()
         .filter(|name| req.roster_spans.iter().any(|s| &s.name == name))
@@ -2582,7 +2692,14 @@ fn prepare_query_for_snapshot(
     fetchable.extend(cross_targets.iter().map(|t| t.name.clone()));
 
     if fetchable.is_empty() {
-        let (system, user) = build_query_prompt(&req.question, &capsules, focus_ref, &ctx, &[]);
+        let (system, user) = build_query_prompt(
+            &req.question,
+            req.trace.as_ref(),
+            &capsules,
+            focus_ref,
+            &ctx,
+            &[],
+        );
         return QueryPlan::Direct {
             system,
             user,
@@ -2590,8 +2707,14 @@ fn prepare_query_for_snapshot(
         };
     }
 
-    let (planning_system, planning_user) =
-        build_query_planning_prompt(&req.question, &capsules, focus_ref, &ctx, &fetchable);
+    let (planning_system, planning_user) = build_query_planning_prompt(
+        &req.question,
+        req.trace.as_ref(),
+        &capsules,
+        focus_ref,
+        &ctx,
+        &fetchable,
+    );
     QueryPlan::Degraded(Box::new(DegradedPlan {
         planning_system,
         planning_user,
@@ -2616,6 +2739,13 @@ fn prepare_query_files_for_snapshot(
     req: &QueryFilesRequest,
     llm_available: bool,
 ) -> QueryFilesPlan {
+    if let Some(trace) = req.trace.as_ref() {
+        let (scope_key, scope_revision) = selected_query_scope_identity(&req.file_paths);
+        if let Err(message) = validate_query_trace(trace, &scope_key, &scope_revision) {
+            return QueryFilesPlan::Err(message);
+        }
+    }
+
     let guard = state.project.read().unwrap();
     let Some(proj) = guard.as_ref() else {
         return QueryFilesPlan::Err("no project open".into());
@@ -2653,8 +2783,12 @@ fn prepare_query_files_for_snapshot(
     }
 
     if !fetchable.is_empty() {
-        let (planning_system, planning_user) =
-            build_file_set_query_planning_prompt(&req.question, &ctx, &fetchable);
+        let (planning_system, planning_user) = build_file_set_query_planning_prompt(
+            &req.question,
+            req.trace.as_ref(),
+            &ctx,
+            &fetchable,
+        );
         return QueryFilesPlan::Degraded(Box::new(QueryFilesDegradedPlan {
             planning_system,
             planning_user,
@@ -2665,7 +2799,7 @@ fn prepare_query_files_for_snapshot(
         }));
     }
 
-    let (system, user) = build_file_set_query_prompt(&req.question, &ctx, &[]);
+    let (system, user) = build_file_set_query_prompt(&req.question, req.trace.as_ref(), &ctx, &[]);
     QueryFilesPlan::Direct {
         system,
         user,
@@ -2784,9 +2918,12 @@ where
 {
     // One Arc snapshot drives source-fetch planning, web planning/search and the
     // final stream. A settings swap can affect the next request, never this one.
-    let llm_proxy = state.llm_proxy();
+    let LlmSnapshot {
+        config: llm_config,
+        proxy: llm_proxy,
+    } = state.llm_snapshot();
     let (system, user, dependency_hints) =
-        match prepare_query_for_snapshot(state, &req, llm_proxy.is_some()) {
+        match prepare_query_for_snapshot(state, &req, llm_proxy.as_ref().map(|_| &llm_config)) {
             QueryPlan::Err(message) => {
                 emit(QueryFrame::Error { message });
                 return;
@@ -2858,8 +2995,14 @@ where
                     start_line: *start_line,
                     name: name.as_str(),
                 });
-                let (system, user) =
-                    build_query_prompt(&req.question, &capsules, focus_ref, &ctx, &extra);
+                let (system, user) = build_query_prompt(
+                    &req.question,
+                    req.trace.as_ref(),
+                    &capsules,
+                    focus_ref,
+                    &ctx,
+                    &extra,
+                );
                 (system, user, dependency_hints)
             }
         };
@@ -2919,7 +3062,8 @@ where
                     let got: Vec<&str> = extra.iter().map(|(name, _)| name.as_str()).collect();
                     eprintln!("[query-files] fetched sources: {}", got.join(", "));
                 }
-                let (system, user) = build_file_set_query_prompt(&req.question, &ctx, &extra);
+                let (system, user) =
+                    build_file_set_query_prompt(&req.question, req.trace.as_ref(), &ctx, &extra);
                 (system, user, dependency_hints)
             }
         };
@@ -4877,7 +5021,62 @@ mod tests {
         }
     }
 
-    fn query_state(root: &Path, server: &QueryMockServer, web_timeout: Duration) -> AppState {
+    fn seed_query_orientation(state: &AppState) -> String {
+        let config = state.llm_snapshot().config;
+        let roster_spans = vec![FunctionSpan {
+            id: "fa#1".into(),
+            name: "fa".into(),
+            line_range: [1, 2],
+        }];
+        let mut guard = state.project.write().unwrap();
+        let project = guard.as_mut().unwrap();
+        project.graphs.refresh();
+        let source = project.reader.read_file("a.py").unwrap();
+        let roster_fn_ids = verify_orientation_roster(&source, &roster_spans).unwrap();
+        let graph_paths = ["a.py".to_string()];
+        let graph_hash = project.graphs.relevant_graph_set_hash(&graph_paths);
+        let identity = OrientationCacheIdentity {
+            full_file_source: &source,
+            relevant_graph_set_hash: &graph_hash,
+            provider_base_url: &config.base_url,
+            model: &config.model,
+            prompt_version: ORIENTATION_PROMPT_VERSION,
+            schema_version: ORIENTATION_SCHEMA_VERSION,
+        };
+        let orientation_id = identity.key();
+        let mut card_json = generation_card_json("a.py");
+        card_json["coreFlows"][0]["steps"][0]["via"] = serde_json::json!("fa");
+        card_json["functionRoles"][0]["fnId"] = serde_json::json!("fa#1");
+        card_json["evidence"][0]["symbol"] = serde_json::json!("fa");
+        let card = parse_orientation_card(
+            &card_json.to_string(),
+            &orientation_id,
+            "a.py",
+            OrientationCoverage {
+                mode: OrientationCoverageMode::FullSource,
+                omitted_function_ids: Vec::new(),
+            },
+        )
+        .unwrap();
+        let line_ranges = orientation_roster_line_ranges(&roster_spans);
+        let validation = OrientationValidationContext {
+            file_path: "a.py",
+            source: &source,
+            roster_fn_ids: &roster_fn_ids,
+            roster_line_ranges: Some(&line_ranges),
+        };
+        project
+            .cache
+            .put_orientation(&identity, &validation, &card)
+            .unwrap();
+        orientation_id
+    }
+
+    fn query_state(
+        root: &Path,
+        server: &QueryMockServer,
+        web_timeout: Duration,
+    ) -> (AppState, String) {
         let config = LlmConfig {
             base_url: server.base_url.clone(),
             model: "fixture-model".into(),
@@ -4887,7 +5086,8 @@ mod tests {
         let proxy = LlmProxy::from_config_with_web_search_timeout(&config, web_timeout)
             .expect("fixture key enables proxy");
         state.llm.write().unwrap().proxy = Some(Arc::new(proxy));
-        state
+        let orientation_id = seed_query_orientation(&state);
+        (state, orientation_id)
     }
 
     async fn start_query_app(state: AppState) -> QueryAppServer {
@@ -4933,11 +5133,24 @@ mod tests {
         panic!("query fixture emitted no terminal frame: {frames:?}");
     }
 
-    fn query_current_json(allow_web: bool) -> serde_json::Value {
+    fn query_current_json(allow_web: bool, orientation_id: &str) -> serde_json::Value {
         serde_json::json!({
             "reqId": "q-ws",
             "filePath": "a.py",
+            "orientationId": orientation_id,
             "question": "这个函数做什么？",
+            "roster": ["fa"],
+            "rosterSpans": [{ "id": "fa#1", "name": "fa", "lineRange": [1, 2] }],
+            "trace": {
+                "scopeKey": "current:a.py",
+                "scopeRevision": orientation_id,
+                "originalQuestion": "为什么要先校验？",
+                "turns": [{
+                    "question": "为什么要先校验？",
+                    "answer": "纠正：这里不只检查格式，还阻止陈旧 revision。",
+                    "codeEvidenceIds": []
+                }]
+            },
             "allowWeb": allow_web
         })
     }
@@ -4947,6 +5160,16 @@ mod tests {
             "reqId": "qf-ws",
             "filePaths": ["a.py", "b.py"],
             "question": "这些文件怎么协作？",
+            "trace": {
+                "scopeKey": "selected:[\"a.py\",\"b.py\"]",
+                "scopeRevision": "selected-v1:[\"a.py\",\"b.py\"]",
+                "originalQuestion": "A 和 B 的职责边界是什么？",
+                "turns": [{
+                    "question": "A 和 B 的职责边界是什么？",
+                    "answer": "纠正：图谱摘要只用于导航，不是源码证据。",
+                    "codeEvidenceIds": []
+                }]
+            },
             "allowWeb": allow_web
         })
     }
@@ -4981,7 +5204,9 @@ mod tests {
         QueryRequest {
             req_id: "q1".into(),
             file_path: file_path.into(),
+            orientation_id: String::new(),
             question: "这个函数做什么？".into(),
+            trace: None,
             focus: focus.map(|lr| FunctionSpan {
                 id: "f#1".into(),
                 name: "f".into(),
@@ -5000,6 +5225,7 @@ mod tests {
             req_id: "qf1".into(),
             file_paths: file_paths.iter().map(|p| p.to_string()).collect(),
             question: "这些文件怎么协作？".into(),
+            trace: None,
             allow_web: true,
         }
     }
@@ -5090,6 +5316,47 @@ mod tests {
         assert!(files.allow_web);
     }
 
+    #[test]
+    fn query_trace_contract_is_scope_and_revision_bound() {
+        let current: QueryRequest =
+            serde_json::from_value(query_current_json(false, "orientation-a1"))
+                .expect("current trace request");
+        let trace = current.trace.as_ref().expect("current trace");
+        assert!(validate_query_trace(trace, "current:a.py", "orientation-a1").is_ok());
+        assert!(
+            validate_query_trace(trace, "current:b.py", "orientation-a1")
+                .unwrap_err()
+                .contains("scopeKey")
+        );
+        assert!(
+            validate_query_trace(trace, "current:a.py", "orientation-a2")
+                .unwrap_err()
+                .contains("scopeRevision")
+        );
+
+        let mut incomplete = trace.clone();
+        incomplete.turns[0].answer.clear();
+        assert!(
+            validate_query_trace(&incomplete, "current:a.py", "orientation-a1")
+                .unwrap_err()
+                .contains("incomplete turn")
+        );
+
+        let paths = vec!["b.py".into(), "a.py".into(), "a.py".into()];
+        let (scope_key, scope_revision) = selected_query_scope_identity(&paths);
+        assert_eq!(scope_key, "selected:[\"a.py\",\"b.py\"]");
+        assert_eq!(scope_revision, "selected-v1:[\"a.py\",\"b.py\"]");
+
+        let astral = "\u{10000}.py";
+        let private_use = "\u{e000}.py";
+        let paths = vec![private_use.into(), astral.into()];
+        let (scope_key, _) = selected_query_scope_identity(&paths);
+        assert_eq!(
+            scope_key,
+            format!("selected:[\"{astral}\",\"{private_use}\"]")
+        );
+    }
+
     #[tokio::test]
     async fn query_endpoints_web_disabled_skip_planning_and_search() {
         let tmp = TmpDir::new();
@@ -5102,10 +5369,15 @@ mod tests {
             StatusCode::OK,
         )
         .await;
-        let app = start_query_app(query_state(tmp.path(), &mock, Duration::from_secs(1))).await;
+        let (state, orientation_id) = query_state(tmp.path(), &mock, Duration::from_secs(1));
+        let app = start_query_app(state).await;
 
         for (endpoint, request, req_id) in [
-            ("/api/query", query_current_json(false), "q-ws"),
+            (
+                "/api/query",
+                query_current_json(false, &orientation_id),
+                "q-ws",
+            ),
             ("/api/query-files", query_files_json(false), "qf-ws"),
         ] {
             let frames = query_ws_frames(&app, endpoint, request).await;
@@ -5132,6 +5404,24 @@ mod tests {
             1
         );
         assert!(!kinds.iter().any(|kind| kind == "web-plan" || kind == "web"));
+
+        let requests = mock.requests.lock().unwrap();
+        let answer_prompts: Vec<&str> = requests
+            .iter()
+            .filter_map(|(kind, body)| {
+                (kind == "answer").then(|| body["messages"][1]["content"].as_str().unwrap())
+            })
+            .collect();
+        assert_eq!(answer_prompts.len(), 2);
+        assert!(answer_prompts
+            .iter()
+            .all(|prompt| prompt.contains("【追问轨迹·原始问题】")));
+        assert!(answer_prompts
+            .iter()
+            .all(|prompt| prompt.contains("纠正：")));
+        assert!(answer_prompts
+            .iter()
+            .all(|prompt| prompt.contains("不是源码证据")));
     }
 
     #[tokio::test]
@@ -5160,10 +5450,15 @@ mod tests {
                 StatusCode::OK,
             )
             .await;
-            let app = start_query_app(query_state(tmp.path(), &mock, Duration::from_secs(1))).await;
+            let (state, orientation_id) = query_state(tmp.path(), &mock, Duration::from_secs(1));
+            let app = start_query_app(state).await;
 
             for (endpoint, request, req_id) in [
-                ("/api/query", query_current_json(true), "q-ws"),
+                (
+                    "/api/query",
+                    query_current_json(true, &orientation_id),
+                    "q-ws",
+                ),
                 ("/api/query-files", query_files_json(true), "qf-ws"),
             ] {
                 let frames = query_ws_frames(&app, endpoint, request).await;
@@ -5272,10 +5567,15 @@ mod tests {
                 StatusCode::OK,
             )
             .await;
-            let app = start_query_app(query_state(tmp.path(), &mock, case.timeout)).await;
+            let (state, orientation_id) = query_state(tmp.path(), &mock, case.timeout);
+            let app = start_query_app(state).await;
 
             for (endpoint, request, req_id) in [
-                ("/api/query", query_current_json(true), "q-ws"),
+                (
+                    "/api/query",
+                    query_current_json(true, &orientation_id),
+                    "q-ws",
+                ),
                 ("/api/query-files", query_files_json(true), "qf-ws"),
             ] {
                 let frames = query_ws_frames(&app, endpoint, request).await;
@@ -5312,10 +5612,15 @@ mod tests {
             StatusCode::BAD_GATEWAY,
         )
         .await;
-        let app = start_query_app(query_state(tmp.path(), &mock, Duration::from_secs(1))).await;
+        let (state, orientation_id) = query_state(tmp.path(), &mock, Duration::from_secs(1));
+        let app = start_query_app(state).await;
 
         for (endpoint, request, req_id) in [
-            ("/api/query", query_current_json(false), "q-ws"),
+            (
+                "/api/query",
+                query_current_json(false, &orientation_id),
+                "q-ws",
+            ),
             ("/api/query-files", query_files_json(false), "qf-ws"),
         ] {
             let frames = query_ws_frames(&app, endpoint, request).await;
@@ -5384,6 +5689,35 @@ mod tests {
         match prepare_query(&state, &query_req("nope.py", None)) {
             QueryPlan::Err(msg) => assert!(msg.contains("file not found")),
             _ => panic!("expected Err for missing file"),
+        }
+    }
+
+    #[test]
+    fn prepare_query_rejects_a_trace_bound_to_a_stale_orientation() {
+        let tmp = TmpDir::new();
+        std::fs::write(tmp.path().join("a.py"), "def f():\n    return 1\n").unwrap();
+        let state = make_state(tmp.path(), "key");
+        let bound = bound_req(&state, "a.py");
+        let mut request = query_req("a.py", None);
+        request.orientation_id = bound.orientation_id.clone();
+        request.roster = bound.roster.clone();
+        request.roster_spans = bound.roster_spans.clone();
+        request.trace = Some(QueryTrace {
+            scope_key: "current:a.py".into(),
+            scope_revision: bound.orientation_id,
+            original_question: request.question.clone(),
+            turns: vec![],
+        });
+        assert!(matches!(
+            prepare_query(&state, &request),
+            QueryPlan::Direct { .. }
+        ));
+
+        request.orientation_id = "stale-orientation".into();
+        request.trace.as_mut().unwrap().scope_revision = request.orientation_id.clone();
+        match prepare_query(&state, &request) {
+            QueryPlan::Err(message) => assert!(message.contains("unknown or stale orientationId")),
+            _ => panic!("expected stale orientation rejection"),
         }
     }
 
