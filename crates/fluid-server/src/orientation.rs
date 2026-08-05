@@ -1,9 +1,9 @@
 //! File-orientation protocol types, deterministic validation, and stable
 //! identities (S-ORI-1).
 //!
-//! This module deliberately contains no LLM or route integration. A later slice
-//! may produce cards, but every producer/consumer shares this model-independent
-//! boundary first. Source remains the truth: graph data can affect the cache
+//! LLM and route integration deliberately stay outside this module, so every
+//! full-source or bounded-source producer/consumer shares one model-independent
+//! boundary. Source remains the truth: graph data can affect the cache
 //! identity, while every accepted evidence anchor must point back into the active
 //! file and its current line range.
 
@@ -174,6 +174,9 @@ pub struct OrientationValidationContext<'a> {
     pub file_path: &'a str,
     pub source: &'a str,
     pub roster_fn_ids: &'a [String],
+    /// Canonical fnId -> 1-based source span. Full-source cards do not need it;
+    /// bounded-source cards use it to reject evidence from omitted bodies.
+    pub roster_line_ranges: Option<&'a BTreeMap<String, [u32; 2]>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -433,6 +436,38 @@ impl FileOrientationCard {
         if self.coverage.mode == OrientationCoverageMode::FullSource && !omitted.is_empty() {
             return invalid("full-source coverage cannot omit functions");
         }
+        if self.coverage.mode == OrientationCoverageMode::BoundedSource {
+            let line_ranges = context.roster_line_ranges.ok_or_else(|| {
+                OrientationValidationError::new(
+                    "bounded-source validation requires verified roster line ranges",
+                )
+            })?;
+            let mut covered_ranges = Vec::new();
+            for fn_id in &roster_ids {
+                let range = line_ranges.get(*fn_id).ok_or_else(|| {
+                    OrientationValidationError::new(format!(
+                        "bounded-source roster function {fn_id:?} has no verified line range"
+                    ))
+                })?;
+                if !omitted.contains(fn_id) {
+                    covered_ranges.push(*range);
+                }
+            }
+            if covered_ranges.is_empty() {
+                return invalid("bounded-source coverage has no included function source");
+            }
+            for evidence in &self.evidence {
+                if !covered_ranges
+                    .iter()
+                    .any(|range| range[0] <= evidence.start_line && evidence.end_line <= range[1])
+                {
+                    return invalid(format!(
+                        "evidence {} is outside every included bounded-source function span",
+                        evidence.id
+                    ));
+                }
+            }
+        }
 
         Ok(())
     }
@@ -672,6 +707,7 @@ mod tests {
             file_path: "src/a.rs",
             source: validation_source(),
             roster_fn_ids: roster,
+            roster_line_ranges: None,
         }
     }
 
@@ -910,6 +946,34 @@ mod tests {
         let mut empty_walkthrough = valid_card("orientation-1".into());
         empty_walkthrough.walkthrough.steps.clear();
         assert!(empty_walkthrough.validate(&context).is_err());
+    }
+
+    #[test]
+    fn bounded_validator_accepts_only_evidence_from_non_omitted_function_spans() {
+        let roster = roster();
+        let line_ranges = BTreeMap::from([
+            ("fetch".to_string(), [1, 3]),
+            ("helper".to_string(), [4, 4]),
+        ]);
+        let context = OrientationValidationContext {
+            file_path: "src/a.rs",
+            source: validation_source(),
+            roster_fn_ids: &roster,
+            roster_line_ranges: Some(&line_ranges),
+        };
+
+        let mut invalid = valid_card("orientation-1".into());
+        invalid.coverage = OrientationCoverage {
+            mode: OrientationCoverageMode::BoundedSource,
+            omitted_function_ids: vec!["helper".into()],
+        };
+        assert!(invalid.validate(&context).is_err());
+
+        let mut valid = invalid;
+        valid.supporting_capabilities.clear();
+        valid.function_roles[1].evidence_ids.clear();
+        valid.evidence.retain(|evidence| evidence.id == "E1");
+        assert!(valid.validate(&context).is_ok());
     }
 
     #[test]

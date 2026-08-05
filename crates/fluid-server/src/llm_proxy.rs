@@ -19,8 +19,8 @@ use serde::Deserialize;
 use crate::cache_store::{Capsule, LineAnnotation, SelectionExplanation, SelectionKind};
 use crate::orientation::{
     CodeEvidenceRef, FileOrientationCard, FunctionRole, OrientationActor, OrientationCoverage,
-    OrientationCoverageMode, OrientationFlow, OrientationInvariant, OrientationType,
-    OrientationWalkthrough, SupportingCapability, ORIENTATION_SCHEMA_VERSION,
+    OrientationFlow, OrientationInvariant, OrientationType, OrientationWalkthrough,
+    SupportingCapability, ORIENTATION_SCHEMA_VERSION,
 };
 use crate::web_evidence::{
     parse_web_search_response, EvidenceStatus, SourceLink, WebSearchError, WebSearchResult,
@@ -375,13 +375,14 @@ struct RawOrientationCard {
     evidence: Vec<CodeEvidenceRef>,
 }
 
-/// Parse the model-authored semantic portion of a full-source orientation card.
-/// Cache/schema/file identity and coverage are backend facts, so the model never
-/// gets to choose or echo them into the trusted artifact.
+/// Parse the model-authored semantic portion of an orientation card. Cache,
+/// schema, file identity, and full/bounded coverage are backend facts, so the
+/// model never gets to choose or echo them into the trusted artifact.
 pub fn parse_orientation_card(
     content: &str,
     orientation_id: &str,
     file_path: &str,
+    coverage: OrientationCoverage,
 ) -> anyhow::Result<FileOrientationCard> {
     let raw: RawOrientationCard = serde_json::from_str(extract_json(content)).map_err(|error| {
         anyhow::anyhow!(
@@ -402,10 +403,7 @@ pub fn parse_orientation_card(
         walkthrough: raw.walkthrough,
         invariants: raw.invariants,
         evidence: raw.evidence,
-        coverage: OrientationCoverage {
-            mode: OrientationCoverageMode::FullSource,
-            omitted_function_ids: Vec::new(),
-        },
+        coverage,
     })
 }
 
@@ -522,6 +520,12 @@ struct RawFetchPlan {
     need: Vec<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawOrientationSourcePlan {
+    need: Vec<String>,
+}
+
 /// Parse the phase-1 planning reply of on-demand fetch (S10a-追源, ADR-0017) into
 /// the list of function names the model wants source for. Tolerates fences/prose
 /// like the other parsers; **any** failure (bad JSON, missing field) yields an
@@ -531,6 +535,20 @@ pub fn parse_fetch_plan(content: &str) -> Vec<String> {
     serde_json::from_str::<RawFetchPlan>(extract_json(content))
         .map(|p| p.need)
         .unwrap_or_default()
+}
+
+/// Parse the stricter S-ORI-3 planning contract. Unlike query source planning,
+/// malformed output is a visible orientation failure: silently treating a bad
+/// plan as an empty one would make an oversized file look successfully covered.
+/// Unknown/duplicate fnIds remain deterministic slicing concerns for the caller.
+pub fn parse_orientation_source_plan(content: &str) -> anyhow::Result<Vec<String>> {
+    serde_json::from_str::<RawOrientationSourcePlan>(extract_json(content))
+        .map(|plan| plan.need)
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "LLM did not return the expected orientation source plan: {error}; content: {content}"
+            )
+        })
 }
 
 /// Pull the JSON object out of the model's reply: strips a leading ```/```json
@@ -981,5 +999,24 @@ mod tests {
     fn parse_fetch_plan_bad_json_is_empty_not_panic() {
         assert!(parse_fetch_plan("我不需要任何源码").is_empty());
         assert!(parse_fetch_plan("{\"other\":1}").is_empty()); // missing field → default empty
+    }
+
+    #[test]
+    fn orientation_source_plan_distinguishes_valid_empty_from_protocol_failure() {
+        assert_eq!(
+            parse_orientation_source_plan("```json\n{\"need\":[]}\n```").unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            parse_orientation_source_plan("{\"need\":[\"fetch#5\",\"helper#8\"]}").unwrap(),
+            vec!["fetch#5".to_string(), "helper#8".to_string()]
+        );
+
+        assert!(parse_orientation_source_plan("not-json").is_err());
+        assert!(parse_orientation_source_plan("{\"other\":[]}").is_err());
+        assert!(
+            parse_orientation_source_plan("{\"need\":[\"fetch#5\"],\"source\":\"invented\"}")
+                .is_err()
+        );
     }
 }

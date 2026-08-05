@@ -445,6 +445,356 @@ pub fn slice_span(source: &str, line_range: [u32; 2]) -> Option<String> {
 /// source planner instead of being silently truncated.
 pub const ORIENTATION_SOURCE_BUDGET_CHARS: usize = 48_000;
 
+/// Shared character ceiling for the exact function-source slices appended after
+/// an S-ORI-3 planning call. The planner never sees or supplies source bytes;
+/// this deterministic backend budget bounds the single generation call.
+pub const ORIENTATION_FETCH_BUDGET_CHARS: usize = ORIENTATION_SOURCE_BUDGET_CHARS;
+
+const ORIENTATION_PLANNING_OUTLINE_BUDGET_CHARS: usize = 12_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrientationSourceChunk {
+    pub fn_id: String,
+    pub numbered_source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrientationSourceSelection {
+    pub sources: Vec<OrientationSourceChunk>,
+    pub omitted_function_ids: Vec<String>,
+}
+
+pub fn orientation_requires_source_planning(file_source: &str) -> bool {
+    file_source.chars().count() > ORIENTATION_SOURCE_BUDGET_CHARS
+}
+
+/// Build the first and only source-planning prompt for an oversized orientation
+/// request. Its source view is an outline: imports, top-level type declarations,
+/// and function signatures. Function bodies never cross this planning boundary.
+pub fn build_orientation_source_planning_prompt(
+    file_path: &str,
+    file_source: &str,
+    roster_spans: &[FunctionSpan],
+    ctx: &GenContext,
+) -> (String, String) {
+    let system = r#"你是 Fluid 的文件定向源码规划器。当前文件过大，后端只允许你从已经核验的函数清单中点名一次所需源码。
+只能返回一个 JSON 对象 {"need":["fnId"]}，need 的元素必须是清单中的完整 fnId；不需要时返回 {"need":[]}。
+禁止返回源码、行号、函数名别名、解释、额外字段或 Markdown 代码围栏。不要递归规划，也不要请求其他文件。"#;
+
+    let mut user = String::new();
+    user.push_str(&format!("【当前激活文件】{file_path}\n"));
+    let roster_json = serde_json::to_string(roster_spans)
+        .expect("verified function spans contain only serializable fields");
+    user.push_str(&format!("【后端核验函数清单(JSON)】{roster_json}\n"));
+    append_orientation_graph_hints(&mut user, ctx);
+    user.push_str(&render_orientation_outline(file_source, roster_spans));
+
+    (system.to_string(), user)
+}
+
+/// Honor an orientation plan by exact canonical fnId, slice each verified span
+/// with absolute line numbers, deduplicate, and enforce one shared budget. IDs
+/// absent from the roster and stale/out-of-range spans are ignored. The omitted
+/// list is the exact roster complement of the source chunks that fit.
+pub fn slice_orientation_sources(
+    file_source: &str,
+    roster_spans: &[FunctionSpan],
+    need: &[String],
+    budget: usize,
+) -> OrientationSourceSelection {
+    let mut sources = Vec::new();
+    let mut requested = HashSet::new();
+    let mut selected = HashSet::new();
+    let mut used = 0usize;
+
+    for fn_id in need {
+        if !requested.insert(fn_id.as_str()) {
+            continue;
+        }
+        let Some(span) = roster_spans.iter().find(|span| span.id == *fn_id) else {
+            continue;
+        };
+        let Some(source) = slice_span(file_source, span.line_range) else {
+            continue;
+        };
+        let numbered_source = number_lines(&source, span.line_range[0]);
+        let rendered = render_orientation_source_chunk(&span.id, &numbered_source);
+        let cost = rendered.chars().count();
+        if used.saturating_add(cost) > budget {
+            continue;
+        }
+        used += cost;
+        selected.insert(span.id.as_str());
+        sources.push(OrientationSourceChunk {
+            fn_id: span.id.clone(),
+            numbered_source,
+        });
+    }
+
+    let mut omitted_function_ids = Vec::new();
+    let mut seen_roster = HashSet::new();
+    for span in roster_spans {
+        if seen_roster.insert(span.id.as_str()) && !selected.contains(span.id.as_str()) {
+            omitted_function_ids.push(span.id.clone());
+        }
+    }
+
+    OrientationSourceSelection {
+        sources,
+        omitted_function_ids,
+    }
+}
+
+/// Build the one bounded-source card-generation prompt after planning. Coverage
+/// is a backend fact: the model receives the exact omitted IDs but does not author
+/// the coverage object that will be cached.
+pub fn build_bounded_orientation_prompt(
+    file_path: &str,
+    file_source: &str,
+    roster_spans: &[FunctionSpan],
+    ctx: &GenContext,
+    selection: &OrientationSourceSelection,
+) -> (String, String) {
+    let system = r#"你是 Fluid 的文件定向助手，面向零代码基础读者。当前激活文件过大；请只依据后端提供的文件轮廓与一轮精确源码切片生成 bounded-source 文件定向卡。
+只输出一个 JSON 对象，禁止额外文字或 Markdown 代码围栏。JSON 只能包含这些语义字段：purpose、actors、types、coreFlows、supportingCapabilities、functionRoles、walkthrough、invariants、evidence；后端会注入 schemaVersion、orientationId、filePath、bounded-source coverage 与 omittedFunctionIds。
+
+硬约束：
+1. actors 使用稳定、具名的真实参与者 ID，并标明 inside-file/project/external 边界；所有方向必须由 fromActorId -> toActorId 表达，禁止脱离参与者坐标使用“上游/下游”或 upstream/downstream。
+2. types 的 ownerActorId、coreFlows 的参与者/证据、functionRoles 的 actor/flow/evidence、walkthrough/invariants 的 evidenceIds 必须引用卡内已声明 ID，不能悬空。
+3. coreFlows 至少一个；每条 flow 至少一个 step；每个 step 必须点名真实 via、payload、why，并至少引用一个下方可见源码 evidenceId。
+4. 后端核验函数清单中的每个 fnId 必须在 functionRoles 中恰好出现一次，lane 只能是 core 或 supporting；core 角色必须引用 flow；supportingCapabilities 只能收纳 supporting 函数。禁止创造清单外 fnId。
+5. omittedFunctionIds 对应的函数实现未提供：只能依据签名给出保守角色，不得虚构其函数体行为或证据。核心链路、贯穿案例与 invariant 必须由已提供源码支持。
+6. evidence 只能指向下方后端精确源码切片中的行，路径只能是当前激活文件；文件轮廓、图谱摘要、模型记忆和其他文件都只是导航提示，不是证据。
+7. walkthrough 必须给出一个具体输入和至少一个贯穿步骤；核心链路与外围生产能力分开，并解释缺失后果。
+
+字段形状：
+{"purpose":"...","actors":[{"id":"actor_id","name":"...","role":"...","boundary":"inside-file|project|external"}],"types":[{"name":"...","ownerActorId":"actor_id","meaning":"..."}],"coreFlows":[{"id":"flow_id","name":"...","kind":"request|response|control|stats|other","why":"...","steps":[{"fromActorId":"actor_id","via":"真实函数/通道/调用","payload":"真实类型或信号","toActorId":"actor_id","why":"...","evidenceIds":["E1"]}]}],"supportingCapabilities":[{"name":"...","why":"...","functionIds":["fnId"],"evidenceIds":["E2"]}],"functionRoles":[{"fnId":"fnId","lane":"core|supporting","flowIds":["flow_id"],"stage":"...","receivesFromActorIds":["actor_id"],"consumes":["..."],"sendsToActorIds":["actor_id"],"produces":["..."],"why":"...","evidenceIds":["E1"]}],"walkthrough":{"title":"...","input":"具体输入","steps":[{"text":"...","evidenceIds":["E1"]}]},"invariants":[{"text":"...","evidenceIds":["E1"]}],"evidence":[{"id":"E1","filePath":"当前文件路径","startLine":1,"endLine":2,"symbol":"可选符号"}]}"#;
+
+    let mut user = String::new();
+    user.push_str(&format!("【当前激活文件】{file_path}\n"));
+    let roster_json = serde_json::to_string(roster_spans)
+        .expect("verified function spans contain only serializable fields");
+    user.push_str(&format!("【后端核验函数清单(JSON)】{roster_json}\n"));
+    let omitted_json = serde_json::to_string(&selection.omitted_function_ids)
+        .expect("omitted function IDs contain only serializable strings");
+    user.push_str(&format!(
+        "【后端确定的 omittedFunctionIds(JSON)】{omitted_json}\n"
+    ));
+    append_orientation_graph_hints(&mut user, ctx);
+    user.push_str("【文件轮廓说明】以下 imports/顶层类型/函数签名仅作导航提示，不是 evidence。\n");
+    user.push_str(&render_orientation_outline(file_source, roster_spans));
+    user.push_str("【后端精确源码切片(带 1-based 绝对行号；唯一函数体证据)】\n");
+    for source in &selection.sources {
+        user.push_str(&render_orientation_source_chunk(
+            &source.fn_id,
+            &source.numbered_source,
+        ));
+    }
+
+    (system.to_string(), user)
+}
+
+fn append_orientation_graph_hints(user: &mut String, ctx: &GenContext) {
+    if let Some(summary) = &ctx.file_summary {
+        user.push_str(&format!(
+            "【图谱候选文件摘要(仅导航提示，不是证据)】{summary}\n"
+        ));
+    }
+    if !ctx.edges.is_empty() {
+        let edges = ctx
+            .edges
+            .iter()
+            .map(|edge| format!("{}-{}->{}", edge.source, edge.edge_type, edge.target))
+            .collect::<Vec<_>>()
+            .join("; ");
+        user.push_str(&format!("【图谱候选关系(仅导航提示，不是证据)】{edges}\n"));
+    }
+}
+
+fn render_orientation_outline(file_source: &str, roster_spans: &[FunctionSpan]) -> String {
+    let lines = file_source.lines().collect::<Vec<_>>();
+    let mut function_ranges = roster_spans
+        .iter()
+        .map(|span| span.line_range)
+        .filter(|range| range[0] > 0 && range[0] <= range[1])
+        .collect::<Vec<_>>();
+    function_ranges.sort_by_key(|range| (range[0], range[1]));
+    let mut range_index = 0usize;
+    let mut imports = Vec::new();
+    let mut types = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        let line_number = index as u32 + 1;
+        while range_index < function_ranges.len() && function_ranges[range_index][1] < line_number {
+            range_index += 1;
+        }
+        if range_index < function_ranges.len()
+            && function_ranges[range_index][0] <= line_number
+            && line_number <= function_ranges[range_index][1]
+        {
+            continue;
+        }
+        if is_orientation_import_line(line) {
+            imports.push(numbered_outline_line(line_number, line.trim_end()));
+        } else if is_orientation_top_level_type_line(line) {
+            let (fragment, _) = signature_fragment(line);
+            types.push(numbered_outline_line(line_number, fragment));
+        }
+    }
+
+    let mut signatures = Vec::new();
+    for span in roster_spans {
+        signatures.extend(orientation_signature_lines(&lines, span));
+    }
+
+    let mut rendered = String::new();
+    let mut used = 0usize;
+    append_outline_section(&mut rendered, "imports", imports, &mut used);
+    append_outline_section(&mut rendered, "顶层类型", types, &mut used);
+    append_outline_section(&mut rendered, "函数签名", signatures, &mut used);
+    rendered
+}
+
+fn append_outline_section(
+    rendered: &mut String,
+    title: &str,
+    items: Vec<String>,
+    used: &mut usize,
+) {
+    rendered.push_str(&format!("【{title}】\n"));
+    if items.is_empty() {
+        rendered.push_str("（无）\n");
+        return;
+    }
+    let mut omitted = false;
+    for item in items {
+        let cost = item.chars().count() + 1;
+        if used.saturating_add(cost) > ORIENTATION_PLANNING_OUTLINE_BUDGET_CHARS {
+            omitted = true;
+            continue;
+        }
+        *used += cost;
+        rendered.push_str(&item);
+        rendered.push('\n');
+    }
+    if omitted {
+        rendered.push_str("…（轮廓已按后端预算省略）\n");
+    }
+}
+
+fn numbered_outline_line(line_number: u32, text: &str) -> String {
+    format!("{line_number:>4} | {text}")
+}
+
+fn is_orientation_import_line(line: &str) -> bool {
+    if line.trim_start() != line {
+        return false;
+    }
+    let value = line.trim();
+    [
+        "use ",
+        "pub use ",
+        "extern crate ",
+        "import ",
+        "from ",
+        "#include ",
+        "require(",
+    ]
+    .iter()
+    .any(|prefix| value.starts_with(prefix))
+}
+
+fn is_orientation_top_level_type_line(line: &str) -> bool {
+    if line.trim_start() != line {
+        return false;
+    }
+    let mut value = line.trim();
+    for prefix in [
+        "pub ",
+        "export ",
+        "default ",
+        "abstract ",
+        "sealed ",
+        "final ",
+        "partial ",
+    ] {
+        if let Some(rest) = value.strip_prefix(prefix) {
+            value = rest.trim_start();
+        }
+    }
+    if let Some(rest) = value.strip_prefix("pub(") {
+        if let Some(end) = rest.find(')') {
+            value = rest[end + 1..].trim_start();
+        }
+    }
+    [
+        "struct ",
+        "enum ",
+        "trait ",
+        "interface ",
+        "class ",
+        "record ",
+        "union ",
+        "type ",
+        "typedef ",
+    ]
+    .iter()
+    .any(|prefix| value.starts_with(prefix))
+}
+
+fn orientation_signature_lines(lines: &[&str], span: &FunctionSpan) -> Vec<String> {
+    let start = span.line_range[0];
+    let end = span.line_range[1];
+    if start == 0 || end < start || end as usize > lines.len() {
+        return Vec::new();
+    }
+
+    let mut rendered = Vec::new();
+    let mut parenthesis_depth = 0i32;
+    for line_number in start..=end.min(start.saturating_add(11)) {
+        let line = lines[line_number as usize - 1];
+        let (fragment, terminal) = signature_fragment(line);
+        rendered.push(numbered_outline_line(line_number, fragment));
+        parenthesis_depth += line.matches('(').count() as i32;
+        parenthesis_depth -= line.matches(')').count() as i32;
+        let trimmed = line.trim_end();
+        let continues = parenthesis_depth > 0
+            || trimmed.ends_with(',')
+            || trimmed.ends_with("where")
+            || trimmed.ends_with('\\');
+        if terminal || !continues {
+            break;
+        }
+    }
+    rendered
+}
+
+fn signature_fragment(line: &str) -> (&str, bool) {
+    let trimmed = line.trim_end();
+    if let Some(index) = trimmed.find("=>") {
+        return (&trimmed[..index + 2], true);
+    }
+    if let Some(index) = trimmed.find('{') {
+        return (&trimmed[..=index], true);
+    }
+    let value = trimmed.trim_start();
+    if value.starts_with("def ") || value.starts_with("async def ") {
+        if let Some(close) = trimmed.rfind(')') {
+            if let Some(relative) = trimmed[close + 1..].find(':') {
+                let colon = close + 1 + relative;
+                return (&trimmed[..=colon], true);
+            }
+        }
+    }
+    if trimmed.ends_with(';') || trimmed.ends_with(':') {
+        return (trimmed, true);
+    }
+    (trimmed, false)
+}
+
+fn render_orientation_source_chunk(fn_id: &str, numbered_source: &str) -> String {
+    format!("【{fn_id}】\n{numbered_source}\n")
+}
+
 /// Build the full-source file-orientation prompt (S-ORI-2). Backend-owned
 /// identity fields (`schemaVersion`, `orientationId`, `filePath`, and coverage)
 /// are deliberately absent from the requested JSON and injected after parsing.
@@ -1418,6 +1768,201 @@ mod tests {
         assert!(user.contains("\"id\":\"fetch#1\""));
         assert!(user.contains("   1 | fn fetch() {"));
         assert!(user.contains("   3 | }"));
+    }
+
+    #[test]
+    fn orientation_source_budget_boundary_counts_unicode_characters() {
+        let at_limit = "界".repeat(ORIENTATION_SOURCE_BUDGET_CHARS);
+        let over_limit = format!("{at_limit}界");
+
+        assert!(!orientation_requires_source_planning(&at_limit));
+        assert!(orientation_requires_source_planning(&over_limit));
+    }
+
+    #[test]
+    fn orientation_source_planner_sees_only_numbered_outline_and_verified_ids() {
+        let source = concat!(
+            "use crate::Request;\n",
+            "struct Envelope {\n",
+            "    request: Request,\n",
+            "}\n",
+            "fn fetch() {\n",
+            "    fetch_body_must_stay_private();\n",
+            "}\n",
+            "fn helper() { helper_body_must_stay_private(); }\n",
+        );
+        let roster = vec![
+            FunctionSpan {
+                id: "fetch#5".into(),
+                name: "fetch".into(),
+                line_range: [5, 7],
+            },
+            FunctionSpan {
+                id: "helper#8".into(),
+                name: "helper".into(),
+                line_range: [8, 8],
+            },
+        ];
+        let context = GenContext {
+            file_summary: Some("graph candidate summary".into()),
+            roster: vec!["fetch".into(), "helper".into()],
+            edges: vec![edge("function:a.rs:fetch", "external:worker", "calls")],
+            callee_summaries: BTreeMap::new(),
+        };
+
+        let (system, user) =
+            build_orientation_source_planning_prompt("a.rs", source, &roster, &context);
+
+        assert!(system.contains("{\"need\":[\"fnId\"]}"));
+        assert!(system.contains("只能返回"));
+        assert!(user.contains("【imports】"));
+        assert!(user.contains("   1 | use crate::Request;"));
+        assert!(user.contains("【顶层类型】"));
+        assert!(user.contains("   2 | struct Envelope {"));
+        assert!(user.contains("【函数签名】"));
+        assert!(user.contains("   5 | fn fetch() {"));
+        assert!(user.contains("   8 | fn helper() {"));
+        assert!(user.contains("\"id\":\"fetch#5\""));
+        assert!(user.contains("graph candidate summary"));
+        assert!(!user.contains("fetch_body_must_stay_private"));
+        assert!(!user.contains("helper_body_must_stay_private"));
+    }
+
+    #[test]
+    fn orientation_source_slicing_uses_exact_ids_unicode_lines_and_complete_omissions() {
+        let source = concat!(
+            "fn alpha() {\n",
+            "    let label = \"你好🙂\";\n",
+            "}\n",
+            "fn beta() { beta_body(); }\n",
+            "fn gamma() { gamma_body(); }\n",
+        );
+        let roster = vec![
+            FunctionSpan {
+                id: "alpha#1".into(),
+                name: "alpha".into(),
+                line_range: [1, 3],
+            },
+            FunctionSpan {
+                id: "beta#4".into(),
+                name: "beta".into(),
+                line_range: [4, 4],
+            },
+            FunctionSpan {
+                id: "gamma#5".into(),
+                name: "gamma".into(),
+                line_range: [5, 5],
+            },
+            FunctionSpan {
+                id: "stale#99".into(),
+                name: "stale".into(),
+                line_range: [99, 100],
+            },
+        ];
+        let need = vec![
+            "alpha#1".into(),
+            "alpha#1".into(),
+            "ghost#404".into(),
+            "stale#99".into(),
+            "beta#999".into(),
+            "beta#4".into(),
+        ];
+
+        let selection = slice_orientation_sources(source, &roster, &need, usize::MAX);
+
+        assert_eq!(
+            selection
+                .sources
+                .iter()
+                .map(|source| source.fn_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha#1", "beta#4"]
+        );
+        assert!(selection.sources[0]
+            .numbered_source
+            .contains("   2 |     let label = \"你好🙂\";"));
+        assert_eq!(
+            selection.omitted_function_ids,
+            vec!["gamma#5".to_string(), "stale#99".to_string()]
+        );
+    }
+
+    #[test]
+    fn orientation_source_slicing_enforces_one_shared_budget_and_can_fit_later_items() {
+        let source = concat!(
+            "fn large() {\n",
+            "    consume(\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\");\n",
+            "}\n",
+            "fn small() {}\n",
+        );
+        let roster = vec![
+            FunctionSpan {
+                id: "large#1".into(),
+                name: "large".into(),
+                line_range: [1, 3],
+            },
+            FunctionSpan {
+                id: "small#4".into(),
+                name: "small".into(),
+                line_range: [4, 4],
+            },
+        ];
+        let small_numbered = number_lines("fn small() {}", 4);
+        let budget = render_orientation_source_chunk("small#4", &small_numbered)
+            .chars()
+            .count();
+
+        let selection = slice_orientation_sources(
+            source,
+            &roster,
+            &["large#1".into(), "small#4".into()],
+            budget,
+        );
+
+        assert_eq!(selection.sources.len(), 1);
+        assert_eq!(selection.sources[0].fn_id, "small#4");
+        assert_eq!(selection.omitted_function_ids, vec!["large#1"]);
+    }
+
+    #[test]
+    fn bounded_orientation_prompt_exposes_only_selected_source_and_backend_coverage() {
+        let source = concat!(
+            "use crate::Request;\n",
+            "fn fetch() { selected_body(); }\n",
+            "fn omitted() { omitted_body_must_stay_private(); }\n",
+        );
+        let roster = vec![
+            FunctionSpan {
+                id: "fetch#2".into(),
+                name: "fetch".into(),
+                line_range: [2, 2],
+            },
+            FunctionSpan {
+                id: "omitted#3".into(),
+                name: "omitted".into(),
+                line_range: [3, 3],
+            },
+        ];
+        let selection = slice_orientation_sources(
+            source,
+            &roster,
+            &["fetch#2".into()],
+            ORIENTATION_FETCH_BUDGET_CHARS,
+        );
+        let context = GenContext {
+            file_summary: None,
+            roster: vec!["fetch".into(), "omitted".into()],
+            edges: Vec::new(),
+            callee_summaries: BTreeMap::new(),
+        };
+
+        let (system, user) =
+            build_bounded_orientation_prompt("a.rs", source, &roster, &context, &selection);
+
+        assert!(system.contains("bounded-source"));
+        assert!(user.contains("selected_body"));
+        assert!(user.contains("\"omitted#3\""));
+        assert!(!user.contains("omitted_body_must_stay_private"));
     }
 
     #[test]

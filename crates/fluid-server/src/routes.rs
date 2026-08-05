@@ -3,7 +3,7 @@
 //! - `GET /api/project/tree`        -> { files: FileNode[] }
 //! - `GET /api/file?path=<rel>`     -> { source: string }
 //! - `GET /api/project/graph`       -> KnowledgeGraph | null   (S2, optional)
-//! - `WS  /api/orient`              -> validated file-orientation card (S-ORI-2)
+//! - `WS  /api/orient`              -> validated file-orientation card (S-ORI-2/3)
 //! - `WS  /api/generate`            -> per-function streaming generation (S7)
 //!
 //! All handlers share an `Arc<AppState>` as axum state.
@@ -30,25 +30,26 @@ use crate::cache_store::{
     Translation,
 };
 use crate::context_assembler::{
-    assemble_file_set_context, assemble_gen_context, build_explain_decl_prompt,
-    build_explain_line_prompt, build_file_set_query_planning_prompt, build_file_set_query_prompt,
-    build_gen_prompt, build_orientation_prompt, build_query_planning_prompt, build_query_prompt,
+    assemble_file_set_context, assemble_gen_context, build_bounded_orientation_prompt,
+    build_explain_decl_prompt, build_explain_line_prompt, build_file_set_query_planning_prompt,
+    build_file_set_query_prompt, build_gen_prompt, build_orientation_prompt,
+    build_orientation_source_planning_prompt, build_query_planning_prompt, build_query_prompt,
     build_selection_explanation_prompt, build_selection_private_context,
     build_untrusted_web_evidence_block, cross_file_targets, extract_selection_site,
-    file_set_fetchable_targets, is_dependency_manifest_path, query_degraded_names,
-    sample_dependency_manifests, slice_cross_file_sources, slice_file_set_sources,
-    slice_requested_sources, slice_span, CrossFileTarget, FileSetContext, FileSetSourceTarget,
-    FunctionSpan, GenContext, QueryFocus, SharedContext, ORIENTATION_SOURCE_BUDGET_CHARS,
-    QUERY_FETCH_BUDGET_CHARS,
+    file_set_fetchable_targets, is_dependency_manifest_path, orientation_requires_source_planning,
+    query_degraded_names, sample_dependency_manifests, slice_cross_file_sources,
+    slice_file_set_sources, slice_orientation_sources, slice_requested_sources, slice_span,
+    CrossFileTarget, FileSetContext, FileSetSourceTarget, FunctionSpan, GenContext, QueryFocus,
+    SharedContext, ORIENTATION_FETCH_BUDGET_CHARS, QUERY_FETCH_BUDGET_CHARS,
 };
 use crate::graph_loader::{GraphCatalog, GraphNode, KnowledgeGraph};
 use crate::llm_proxy::{
     parse_fetch_plan, parse_generation, parse_line_annotation, parse_orientation_card,
-    parse_selection_explanation, LlmProxy, SseDecoder,
+    parse_orientation_source_plan, parse_selection_explanation, LlmProxy, SseDecoder,
 };
 use crate::orientation::{
-    FileOrientationCard, OrientationCacheIdentity, OrientationValidationContext,
-    ORIENTATION_PROMPT_VERSION, ORIENTATION_SCHEMA_VERSION,
+    FileOrientationCard, OrientationCacheIdentity, OrientationCoverage, OrientationCoverageMode,
+    OrientationValidationContext, ORIENTATION_PROMPT_VERSION, ORIENTATION_SCHEMA_VERSION,
 };
 use crate::project_reader::{FileNode, ProjectReader, ReadErr};
 use crate::settings::{mask_key, rewrite_env, LlmConfig};
@@ -500,7 +501,7 @@ async fn test_llm_settings(
     }
 }
 
-// — WS /api/orient — full-file orientation generation (S-ORI-2) —
+// — WS /api/orient — full/bounded file orientation generation (S-ORI-2/3) —
 
 #[derive(Deserialize)]
 struct OrientationRequest {
@@ -515,6 +516,7 @@ struct OrientationRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum OrientationPhase {
+    PlanningSource,
     Orienting,
 }
 
@@ -541,9 +543,9 @@ fn orientation_error(message: impl Into<String>) -> OrientationFrame {
     }
 }
 
-fn orientation_status(message: impl Into<String>) -> OrientationFrame {
+fn orientation_status(phase: OrientationPhase, message: impl Into<String>) -> OrientationFrame {
     OrientationFrame::Status {
-        phase: OrientationPhase::Orienting,
+        phase,
         message: message.into(),
     }
 }
@@ -590,6 +592,25 @@ fn verify_orientation_roster(
     Ok(verified)
 }
 
+fn orientation_roster_line_ranges(roster_spans: &[FunctionSpan]) -> BTreeMap<String, [u32; 2]> {
+    roster_spans
+        .iter()
+        .map(|span| (span.id.clone(), span.line_range))
+        .collect()
+}
+
+enum OrientationGenerationInput {
+    FullSource {
+        system: String,
+        user: String,
+    },
+    BoundedSource {
+        planning_system: String,
+        planning_user: String,
+        context: GenContext,
+    },
+}
+
 struct OrientationWork {
     llm: Arc<LlmProxy>,
     project_root: PathBuf,
@@ -601,8 +622,7 @@ struct OrientationWork {
     provider_base_url: String,
     model: String,
     orientation_id: String,
-    system: String,
-    user: String,
+    input: OrientationGenerationInput,
 }
 
 async fn run_orientation_emitting<F>(state: &AppState, req: OrientationRequest, mut emit: F)
@@ -650,10 +670,12 @@ where
             schema_version: ORIENTATION_SCHEMA_VERSION,
         };
         let orientation_id = identity.key();
+        let roster_line_ranges = orientation_roster_line_ranges(&req.roster_spans);
         let validation = OrientationValidationContext {
             file_path: &req.file_path,
             source: &source,
             roster_fn_ids: &roster_fn_ids,
+            roster_line_ranges: Some(&roster_line_ranges),
         };
         if let Some(card) = project.cache.get_orientation(&identity, &validation) {
             eprintln!("[orient] cache HIT {} — zero token", req.file_path);
@@ -662,10 +684,6 @@ where
                 card: Box::new(card),
             });
             emit(OrientationFrame::Done);
-            return;
-        }
-        if source.chars().count() > ORIENTATION_SOURCE_BUDGET_CHARS {
-            emit(orientation_error("source-too-large"));
             return;
         }
         let Some(llm) = llm_snapshot.proxy.clone() else {
@@ -685,8 +703,23 @@ where
             &roster_names,
             &SharedContext::default(),
         );
-        let (system, user) =
-            build_orientation_prompt(&req.file_path, &source, &req.roster_spans, &context);
+        let input = if orientation_requires_source_planning(&source) {
+            let (planning_system, planning_user) = build_orientation_source_planning_prompt(
+                &req.file_path,
+                &source,
+                &req.roster_spans,
+                &context,
+            );
+            OrientationGenerationInput::BoundedSource {
+                planning_system,
+                planning_user,
+                context,
+            }
+        } else {
+            let (system, user) =
+                build_orientation_prompt(&req.file_path, &source, &req.roster_spans, &context);
+            OrientationGenerationInput::FullSource { system, user }
+        };
 
         OrientationWork {
             llm,
@@ -699,34 +732,106 @@ where
             provider_base_url: llm_snapshot.config.base_url,
             model: llm_snapshot.config.model,
             orientation_id,
-            system,
-            user,
+            input,
         }
     };
 
-    emit(orientation_status("正在生成文件定向卡"));
+    let (system, user, coverage) = match &work.input {
+        OrientationGenerationInput::FullSource { system, user } => (
+            system.clone(),
+            user.clone(),
+            OrientationCoverage {
+                mode: OrientationCoverageMode::FullSource,
+                omitted_function_ids: Vec::new(),
+            },
+        ),
+        OrientationGenerationInput::BoundedSource {
+            planning_system,
+            planning_user,
+            context,
+        } => {
+            emit(orientation_status(
+                OrientationPhase::PlanningSource,
+                "正在规划大文件定向源码",
+            ));
+            eprintln!(
+                "[orient] bounded source plan {} — calling LLM ({})",
+                work.file_path, work.llm.model
+            );
+            let plan_content = match work.llm.complete(planning_system, planning_user).await {
+                Ok(content) => content,
+                Err(error) => {
+                    emit(orientation_error(format!(
+                        "source planning LLM error: {error}"
+                    )));
+                    return;
+                }
+            };
+            let need = match parse_orientation_source_plan(&plan_content) {
+                Ok(need) => need,
+                Err(error) => {
+                    emit(orientation_error(format!(
+                        "orientation source plan parse error: {error}"
+                    )));
+                    return;
+                }
+            };
+            let selection = slice_orientation_sources(
+                &work.source,
+                &work.roster_spans,
+                &need,
+                ORIENTATION_FETCH_BUDGET_CHARS,
+            );
+            if selection.sources.is_empty() {
+                emit(orientation_error(
+                    "orientation source plan selected no usable function source",
+                ));
+                return;
+            }
+            let coverage = OrientationCoverage {
+                mode: OrientationCoverageMode::BoundedSource,
+                omitted_function_ids: selection.omitted_function_ids.clone(),
+            };
+            let (system, user) = build_bounded_orientation_prompt(
+                &work.file_path,
+                &work.source,
+                &work.roster_spans,
+                context,
+                &selection,
+            );
+            (system, user, coverage)
+        }
+    };
+
+    emit(orientation_status(
+        OrientationPhase::Orienting,
+        "正在生成文件定向卡",
+    ));
     eprintln!(
         "[orient] cache MISS {} — calling LLM ({})",
         work.file_path, work.llm.model
     );
-    let content = match work.llm.complete(&work.system, &work.user).await {
+    let content = match work.llm.complete(&system, &user).await {
         Ok(content) => content,
         Err(error) => {
             emit(orientation_error(format!("LLM error: {error}")));
             return;
         }
     };
-    let card = match parse_orientation_card(&content, &work.orientation_id, &work.file_path) {
-        Ok(card) => card,
-        Err(error) => {
-            emit(orientation_error(format!("LLM parse error: {error}")));
-            return;
-        }
-    };
+    let card =
+        match parse_orientation_card(&content, &work.orientation_id, &work.file_path, coverage) {
+            Ok(card) => card,
+            Err(error) => {
+                emit(orientation_error(format!("LLM parse error: {error}")));
+                return;
+            }
+        };
+    let snapshot_line_ranges = orientation_roster_line_ranges(&work.roster_spans);
     let snapshot_validation = OrientationValidationContext {
         file_path: &work.file_path,
         source: &work.source,
         roster_fn_ids: &work.roster_fn_ids,
+        roster_line_ranges: Some(&snapshot_line_ranges),
     };
     if let Err(error) = card.validate(&snapshot_validation) {
         emit(orientation_error(format!(
@@ -771,10 +876,12 @@ where
         if identity.key() != work.orientation_id {
             return Err("orientation identity changed during generation; retry".into());
         }
+        let current_line_ranges = orientation_roster_line_ranges(&work.roster_spans);
         let validation = OrientationValidationContext {
             file_path: &work.file_path,
             source: &current_source,
             roster_fn_ids: &current_roster,
+            roster_line_ranges: Some(&current_line_ranges),
         };
         project
             .cache
@@ -3122,10 +3229,16 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct OrientationMockBackend {
+    struct OrientationMockReply {
         status: StatusCode,
         content: String,
         delay: Duration,
+    }
+
+    #[derive(Clone)]
+    struct OrientationMockBackend {
+        replies: Arc<Mutex<VecDeque<OrientationMockReply>>>,
+        fallback: OrientationMockReply,
         requests: Arc<Mutex<Vec<serde_json::Value>>>,
     }
 
@@ -3157,18 +3270,24 @@ mod tests {
         Json(request): Json<serde_json::Value>,
     ) -> axum::response::Response {
         state.requests.lock().unwrap().push(request);
-        if !state.delay.is_zero() {
-            tokio::time::sleep(state.delay).await;
+        let reply = state
+            .replies
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| state.fallback.clone());
+        if !reply.delay.is_zero() {
+            tokio::time::sleep(reply.delay).await;
         }
-        let body = if state.status.is_success() {
+        let body = if reply.status.is_success() {
             serde_json::json!({
-                "choices": [{ "message": { "content": state.content } }]
+                "choices": [{ "message": { "content": reply.content } }]
             })
             .to_string()
         } else {
-            serde_json::json!({ "error": { "message": state.content } }).to_string()
+            serde_json::json!({ "error": { "message": reply.content } }).to_string()
         };
-        (state.status, [("content-type", "application/json")], body).into_response()
+        (reply.status, [("content-type", "application/json")], body).into_response()
     }
 
     async fn start_orientation_mock(
@@ -3176,13 +3295,30 @@ mod tests {
         content: impl Into<String>,
         delay: Duration,
     ) -> OrientationMockServer {
+        start_orientation_sequence_mock(vec![(status, content.into(), delay)]).await
+    }
+
+    async fn start_orientation_sequence_mock(
+        replies: Vec<(StatusCode, String, Duration)>,
+    ) -> OrientationMockServer {
+        let replies = replies
+            .into_iter()
+            .map(|(status, content, delay)| OrientationMockReply {
+                status,
+                content,
+                delay,
+            })
+            .collect::<VecDeque<_>>();
+        let fallback = replies
+            .back()
+            .cloned()
+            .expect("orientation mock needs at least one response");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let state = OrientationMockBackend {
-            status,
-            content: content.into(),
-            delay,
+            replies: Arc::new(Mutex::new(replies)),
+            fallback,
             requests: Arc::clone(&requests),
         };
         let app = Router::new()
@@ -3334,6 +3470,66 @@ mod tests {
                 }
             ]
         })
+    }
+
+    fn bounded_orientation_source() -> String {
+        let mut source = concat!(
+            "use crate::Request;\n",
+            "struct Envelope { request: Request }\n",
+            "\n",
+            "// file-level routing\n",
+            "fn fetch() {\n",
+            "    fetch_body_marker();\n",
+            "}\n",
+            "fn helper() { helper_body_marker(); }\n",
+            "fn omitted() { omitted_body_marker(); }\n",
+        )
+        .to_string();
+        while source.chars().count() <= crate::context_assembler::ORIENTATION_SOURCE_BUDGET_CHARS {
+            source.push_str("// oversized-file-padding-without-source-meaning\n");
+        }
+        source
+    }
+
+    fn bounded_orientation_request_json() -> serde_json::Value {
+        serde_json::json!({
+            "reqId": "orient-large",
+            "filePath": "large.rs",
+            "rosterSpans": [
+                { "id": "fetch#5", "name": "fetch", "lineRange": [5, 7] },
+                { "id": "helper#8", "name": "helper", "lineRange": [8, 8] },
+                { "id": "omitted#9", "name": "omitted", "lineRange": [9, 9] }
+            ]
+        })
+    }
+
+    fn bounded_orientation_card_json() -> serde_json::Value {
+        let mut card = orientation_card_json();
+        card["supportingCapabilities"][0]["functionIds"] = serde_json::json!(["helper#8"]);
+        card["functionRoles"][0]["fnId"] = serde_json::json!("fetch#5");
+        card["functionRoles"][1]["fnId"] = serde_json::json!("helper#8");
+        card["evidence"][0]["startLine"] = serde_json::json!(5);
+        card["evidence"][0]["endLine"] = serde_json::json!(7);
+        card["evidence"][0]["filePath"] = serde_json::json!("large.rs");
+        card["evidence"][1]["startLine"] = serde_json::json!(8);
+        card["evidence"][1]["endLine"] = serde_json::json!(8);
+        card["evidence"][1]["filePath"] = serde_json::json!("large.rs");
+        card["functionRoles"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "fnId": "omitted#9",
+                "lane": "supporting",
+                "flowIds": [],
+                "stage": "uninspected helper",
+                "receivesFromActorIds": ["worker"],
+                "consumes": [],
+                "sendsToActorIds": ["worker"],
+                "produces": [],
+                "why": "Keeps the complete roster visible without claiming its omitted body.",
+                "evidenceIds": []
+            }));
+        card
     }
 
     async fn orientation_ws_frames(
@@ -3512,6 +3708,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn orientation_websocket_large_file_plans_once_slices_exact_ids_and_caches_bounded_card()
+    {
+        let tmp = TmpDir::new();
+        std::fs::write(tmp.path().join("large.rs"), bounded_orientation_source()).unwrap();
+        let mock = start_orientation_sequence_mock(vec![
+            (
+                StatusCode::OK,
+                serde_json::json!({
+                    "need": [
+                        "fetch#5",
+                        "fetch#5",
+                        "helper#999999",
+                        "ghost#404",
+                        "helper#8"
+                    ]
+                })
+                .to_string(),
+                Duration::ZERO,
+            ),
+            (
+                StatusCode::OK,
+                bounded_orientation_card_json().to_string(),
+                Duration::ZERO,
+            ),
+        ])
+        .await;
+        let app = start_orientation_app(orientation_state(tmp.path(), &mock)).await;
+
+        let miss = orientation_ws_frames(&app, bounded_orientation_request_json()).await;
+        assert_eq!(frame_kinds(&miss), vec!["status", "status", "card", "done"]);
+        assert_eq!(miss[0]["phase"], "planning-source");
+        assert_eq!(miss[1]["phase"], "orienting");
+        assert_eq!(miss[2]["card"]["coverage"]["mode"], "bounded-source");
+        assert_eq!(
+            miss[2]["card"]["coverage"]["omittedFunctionIds"],
+            serde_json::json!(["omitted#9"])
+        );
+
+        let hit = orientation_ws_frames(&app, bounded_orientation_request_json()).await;
+        assert_eq!(frame_kinds(&hit), vec!["cache-hit", "card", "done"]);
+        assert_eq!(
+            hit[1]["card"]["coverage"]["omittedFunctionIds"],
+            serde_json::json!(["omitted#9"])
+        );
+
+        let requests = mock.requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            2,
+            "bounded path is one plan plus one generation"
+        );
+        let planning_system = requests[0]
+            .pointer("/messages/0/content")
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        let planning_user = requests[0]
+            .pointer("/messages/1/content")
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        assert!(planning_system.contains("{\"need\":[\"fnId\"]}"));
+        assert!(planning_user.contains("\"id\":\"fetch#5\""));
+        assert!(planning_user.contains("   1 | use crate::Request;"));
+        assert!(planning_user.contains("   5 | fn fetch() {"));
+        assert!(!planning_user.contains("fetch_body_marker"));
+        assert!(!planning_user.contains("helper_body_marker"));
+        assert!(!planning_user.contains("omitted_body_marker"));
+
+        let generation_system = requests[1]
+            .pointer("/messages/0/content")
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        let generation_user = requests[1]
+            .pointer("/messages/1/content")
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        assert!(generation_system.contains("bounded-source"));
+        assert!(generation_user.contains("fetch_body_marker"));
+        assert!(generation_user.contains("helper_body_marker"));
+        assert!(generation_user.contains("\"omitted#9\""));
+        assert!(!generation_user.contains("omitted_body_marker"));
+        assert!(!generation_user.contains("oversized-file-padding"));
+    }
+
+    #[tokio::test]
+    async fn orientation_websocket_large_file_surfaces_empty_invalid_and_failed_plans() {
+        let cases = [
+            (
+                StatusCode::OK,
+                serde_json::json!({ "need": [] }).to_string(),
+                "no usable function source",
+            ),
+            (StatusCode::OK, "not-json".to_string(), "source plan parse"),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "planner unavailable".to_string(),
+                "source planning LLM error",
+            ),
+        ];
+
+        for (status, response, expected) in cases {
+            let tmp = TmpDir::new();
+            std::fs::write(tmp.path().join("large.rs"), bounded_orientation_source()).unwrap();
+            let mock = start_orientation_mock(status, response, Duration::ZERO).await;
+            let app = start_orientation_app(orientation_state(tmp.path(), &mock)).await;
+
+            let frames = orientation_ws_frames(&app, bounded_orientation_request_json()).await;
+            assert_eq!(frame_kinds(&frames), vec!["status", "error"]);
+            assert_eq!(frames[0]["phase"], "planning-source");
+            assert!(
+                frames[1]["message"].as_str().unwrap().contains(expected),
+                "expected {expected:?}, got {:?}",
+                frames[1]
+            );
+            assert_eq!(mock.requests.lock().unwrap().len(), 1);
+            assert!(!tmp.path().join(".fluid").join("orientations").exists());
+        }
+    }
+
+    #[tokio::test]
     async fn orientation_websocket_rejects_bad_json_without_caching() {
         let tmp = TmpDir::new();
         std::fs::write(tmp.path().join("a.rs"), orientation_source()).unwrap();
@@ -3575,7 +3890,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn orientation_websocket_rejects_unverified_roster_and_oversized_source_locally() {
+    async fn orientation_websocket_rejects_unverified_roster_locally() {
         let invalid_roster = TmpDir::new();
         std::fs::write(invalid_roster.path().join("a.rs"), orientation_source()).unwrap();
         let mock = start_orientation_mock(
@@ -3594,22 +3909,6 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("invalid roster"));
-        assert!(mock.requests.lock().unwrap().is_empty());
-
-        let oversized = TmpDir::new();
-        std::fs::write(oversized.path().join("large.rs"), "x\n".repeat(100_000)).unwrap();
-        let app = start_orientation_app(orientation_state(oversized.path(), &mock)).await;
-        let frames = orientation_ws_frames(
-            &app,
-            serde_json::json!({
-                "reqId": "large",
-                "filePath": "large.rs",
-                "rosterSpans": []
-            }),
-        )
-        .await;
-        assert_eq!(frame_kinds(&frames), vec!["error"]);
-        assert_eq!(frames[0]["message"], "source-too-large");
         assert!(mock.requests.lock().unwrap().is_empty());
     }
 
