@@ -364,6 +364,8 @@ struct RawLineAnnotation {
 #[serde(rename_all = "camelCase")]
 struct RawSelectionExplanation {
     #[serde(default)]
+    subject: String,
+    #[serde(default)]
     kind: String,
     #[serde(default)]
     meaning: String,
@@ -418,6 +420,12 @@ pub fn parse_selection_explanation(
                 "LLM did not return the expected selection JSON: {e}; content: {content}"
             )
         })?;
+    if raw.subject != selected_text {
+        anyhow::bail!(
+            "LLM selection subject mismatch: expected {selected_text:?}, got {:?}",
+            raw.subject
+        );
+    }
     let meaning = raw.meaning.trim();
     let role_here = raw.role_here.trim();
     if meaning.is_empty() || role_here.is_empty() {
@@ -790,6 +798,7 @@ mod tests {
     #[test]
     fn selection_parser_injects_backend_evidence_and_constrains_kind() {
         let content = r#"{
+            "subject":"from_str",
             "kind":"函数",
             "meaning":"把文本解析成 JSON 值",
             "roleHere":"读取当前配置输入",
@@ -821,7 +830,7 @@ mod tests {
     #[test]
     fn selection_parser_maps_unknown_kind_and_rejects_incomplete_text() {
         let explanation = parse_selection_explanation(
-            r#"{"kind":"mystery","meaning":"值","roleHere":"参与计算"}"#,
+            r#"{"subject":"x","kind":"mystery","meaning":"值","roleHere":"参与计算"}"#,
             "x",
             EvidenceStatus::Unverified,
             vec![],
@@ -831,13 +840,32 @@ mod tests {
         assert_eq!(explanation.kind, SelectionKind::Unknown);
 
         assert!(parse_selection_explanation(
-            r#"{"kind":"变量","meaning":"","roleHere":"参与计算"}"#,
+            r#"{"subject":"x","kind":"变量","meaning":"","roleHere":"参与计算"}"#,
             "x",
             EvidenceStatus::Unverified,
             vec![],
             None,
         )
         .is_err());
+    }
+
+    #[test]
+    fn selection_parser_rejects_reply_for_a_different_subject() {
+        let error = parse_selection_explanation(
+            r#"{
+                "subject":"output_address",
+                "kind":"变量",
+                "meaning":"Bridge 的输出地址字段",
+                "roleHere":"作为 PushSocket 的连接目标"
+            }"#,
+            "tokio",
+            EvidenceStatus::Unverified,
+            vec![],
+            None,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("selection subject mismatch"));
     }
 
     #[test]

@@ -275,7 +275,7 @@ impl CacheStore {
         web_mode: bool,
     ) -> String {
         let mut hash = FNV_OFFSET;
-        for part in ["explain-selection", full_file_source] {
+        for part in [SELECTION_PROMPT_VERSION, full_file_source] {
             hash = fnv1a_step(hash, part.as_bytes());
             hash = fnv1a_step(hash, &[0]);
         }
@@ -345,6 +345,9 @@ impl CacheStore {
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+/// Selection-only prompt/schema generation. Bump this without invalidating
+/// capsules, line annotations, or translations that share `prompt_version`.
+const SELECTION_PROMPT_VERSION: &str = "explain-selection-p2";
 
 fn fnv1a_step(mut hash: u64, bytes: &[u8]) -> u64 {
     for &b in bytes {

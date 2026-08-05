@@ -1097,8 +1097,11 @@ where
     ));
 
     let evidence_block = evidence_prompt_block(&evidence);
-    let (system, user) =
-        build_selection_explanation_prompt(&work.private_context, evidence_block.as_deref());
+    let (system, user) = build_selection_explanation_prompt(
+        &work.private_context,
+        &work.selected_text,
+        evidence_block.as_deref(),
+    );
     let content = match work.llm.complete(&system, &user).await {
         Ok(content) => content,
         Err(error) => {
@@ -1106,17 +1109,46 @@ where
             return;
         }
     };
-    let explanation = match parse_selection_explanation(
-        &content,
-        &work.selected_text,
-        evidence.status,
-        evidence.sources.clone(),
-        evidence.warning.clone(),
-    ) {
+    let parse = |candidate: &str| {
+        parse_selection_explanation(
+            candidate,
+            &work.selected_text,
+            evidence.status,
+            evidence.sources.clone(),
+            evidence.warning.clone(),
+        )
+    };
+    let explanation = match parse(&content) {
         Ok(explanation) => explanation,
-        Err(error) => {
-            emit(selection_error(format!("LLM parse error: {error}")));
-            return;
+        Err(first_error) => {
+            emit(selection_status(
+                SelectionPhase::Answering,
+                "首次回答未锚定选区，正在纠正",
+            ));
+            let encoded_target = serde_json::to_string(&work.selected_text)
+                .unwrap_or_else(|_| "\"<invalid selection>\"".to_string());
+            let retry_user = format!(
+                "{user}\n\n【结构校验反馈】\n上一回答未通过校验。重新生成完整 JSON；\
+                 subject 必须逐字等于 {encoded_target}，其余字段只能解释该 subject。"
+            );
+            let retry_content = match work.llm.complete(&system, &retry_user).await {
+                Ok(content) => content,
+                Err(error) => {
+                    emit(selection_error(format!(
+                        "LLM retry error after invalid selection answer ({first_error}): {error}"
+                    )));
+                    return;
+                }
+            };
+            match parse(&retry_content) {
+                Ok(explanation) => explanation,
+                Err(retry_error) => {
+                    emit(selection_error(format!(
+                        "LLM parse error after one retry: {retry_error}; first error: {first_error}"
+                    )));
+                    return;
+                }
+            }
         }
     };
 
@@ -2387,6 +2419,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex;
 
+    use crate::cache_store::SelectionKind;
     use crate::graph_loader::GraphLoader;
     use futures_util::SinkExt;
     use tokio_tungstenite::tungstenite::Message as ClientMessage;
@@ -2496,7 +2529,7 @@ mod tests {
                     .lock()
                     .unwrap()
                     .pop_front()
-                    .unwrap_or_else(|| selection_answer_json("fixture answer")),
+                    .unwrap_or_else(|| selection_answer_json("fixture", "fixture answer")),
             )
         };
         state
@@ -2551,8 +2584,9 @@ mod tests {
         }
     }
 
-    fn selection_answer_json(meaning: &str) -> String {
+    fn selection_answer_json(subject: &str, meaning: &str) -> String {
         serde_json::json!({
+            "subject": subject,
             "kind": "函数",
             "meaning": meaning,
             "roleHere": "在当前表达式中完成转换",
@@ -2907,7 +2941,7 @@ mod tests {
             r#"{"action":"search","query":"must not run"}"#,
             StatusCode::OK,
             include_str!("../tests/fixtures/web_search/openai_cited.json"),
-            &[selection_answer_json("项目内辅助函数")],
+            &[selection_answer_json("helper", "项目内辅助函数")],
         )
         .await;
         let state = selection_state(tmp.path(), &mock);
@@ -2957,7 +2991,7 @@ mod tests {
                 r#"{"action":"search","query":"serde_json from_str docs"}"#,
                 StatusCode::OK,
                 web_body,
-                &[selection_answer_json("解析 JSON")],
+                &[selection_answer_json("from_str", "解析 JSON")],
             )
             .await;
             let state = selection_state(tmp.path(), &mock);
@@ -2994,8 +3028,8 @@ mod tests {
             StatusCode::TOO_MANY_REQUESTS,
             include_str!("../tests/fixtures/web_search/error.json"),
             &[
-                selection_answer_json("未核验的本地解释一"),
-                selection_answer_json("未核验的本地解释二"),
+                selection_answer_json("external_api", "未核验的本地解释一"),
+                selection_answer_json("external_api", "未核验的本地解释二"),
             ],
         )
         .await;
@@ -3035,8 +3069,8 @@ mod tests {
             StatusCode::OK,
             include_str!("../tests/fixtures/web_search/openai_cited.json"),
             &[
-                selection_answer_json("first"),
-                selection_answer_json("refreshed"),
+                selection_answer_json("local_value", "first"),
+                selection_answer_json("local_value", "refreshed"),
             ],
         )
         .await;
@@ -3078,6 +3112,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn selection_retries_once_when_the_answer_targets_a_neighbor_symbol() {
+        let tmp = TmpDir::new();
+        let source = "fn fixture() {\n    let mut child_tasks = tokio::task::JoinSet::new();\n}\n";
+        std::fs::write(tmp.path().join("a.rs"), source).unwrap();
+        let wrong = serde_json::json!({
+            "subject": "output_address",
+            "kind": "变量",
+            "meaning": "Bridge 的输出地址字段",
+            "roleHere": "作为 PushSocket 的连接目标"
+        })
+        .to_string();
+        let corrected = serde_json::json!({
+            "subject": "tokio",
+            "kind": "模块",
+            "meaning": "Tokio 异步运行时 crate 的模块路径根",
+            "roleHere": "用于定位 task::JoinSet 类型"
+        })
+        .to_string();
+        let mock = start_selection_mock(
+            r#"{"action":"local"}"#,
+            StatusCode::OK,
+            include_str!("../tests/fixtures/web_search/openai_cited.json"),
+            &[wrong, corrected],
+        )
+        .await;
+        let state = selection_state(tmp.path(), &mock);
+
+        let frames =
+            run_selection(&state, selection_req("a.rs", source, "tokio", false, false)).await;
+
+        let result = result_explanation(&frames);
+        assert_eq!(result.selected_text, "tokio");
+        assert_eq!(result.kind, SelectionKind::Module);
+        assert!(result.meaning.contains("Tokio"));
+        assert_eq!(selection_request_kinds(&mock), vec!["answer", "answer"]);
+    }
+
+    #[tokio::test]
     async fn selection_websocket_fixture_emits_status_result_done() {
         let tmp = TmpDir::new();
         let source = "fn fixture() { local_value(); }\n";
@@ -3086,7 +3158,7 @@ mod tests {
             r#"{"action":"local"}"#,
             StatusCode::OK,
             include_str!("../tests/fixtures/web_search/openai_cited.json"),
-            &[selection_answer_json("ws meaning")],
+            &[selection_answer_json("local_value", "ws meaning")],
         )
         .await;
         let state = Arc::new(selection_state(tmp.path(), &mock));
