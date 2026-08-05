@@ -116,8 +116,7 @@ pub struct SelectionCacheEntry {
 #[derive(Clone)]
 pub struct CacheStore {
     dir: PathBuf,
-    // S-ORI-1 stages this store before the S-ORI-2 route consumes it.
-    #[allow(dead_code)]
+    // File-orientation artifacts are isolated from function capsules.
     orientation_dir: PathBuf,
     selection_dir: PathBuf,
     model_version: String,
@@ -353,7 +352,6 @@ impl CacheStore {
     /// Read and revalidate one file-orientation artifact. Corrupt, stale, or
     /// structurally invalid entries are ordinary misses and never reach a child
     /// prompt.
-    #[allow(dead_code)] // first production consumer lands in S-ORI-2
     pub fn get_orientation(
         &self,
         identity: &OrientationCacheIdentity<'_>,
@@ -375,7 +373,6 @@ impl CacheStore {
     /// Validate and persist one file-orientation artifact under
     /// `.fluid/orientations/<orientationKey>.json`. Validation happens before
     /// directory creation, so a rejected model product leaves no cache residue.
-    #[allow(dead_code)] // first production consumer lands in S-ORI-2
     pub fn put_orientation(
         &self,
         identity: &OrientationCacheIdentity<'_>,
@@ -407,7 +404,6 @@ impl CacheStore {
     }
 }
 
-#[allow(dead_code)] // used by the staged S-ORI-1 cache methods above
 fn invalid_cache_data(
     error: impl Into<Box<dyn std::error::Error + Send + Sync>>,
 ) -> std::io::Error {

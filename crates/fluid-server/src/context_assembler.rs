@@ -440,6 +440,62 @@ pub fn slice_span(source: &str, line_range: [u32; 2]) -> Option<String> {
     Some(lines[s..=e].join("\n"))
 }
 
+/// Raw-source character ceiling for the S-ORI-2 full-file orientation call.
+/// Files above this deterministic boundary are handed to S-ORI-3's bounded
+/// source planner instead of being silently truncated.
+pub const ORIENTATION_SOURCE_BUDGET_CHARS: usize = 48_000;
+
+/// Build the full-source file-orientation prompt (S-ORI-2). Backend-owned
+/// identity fields (`schemaVersion`, `orientationId`, `filePath`, and coverage)
+/// are deliberately absent from the requested JSON and injected after parsing.
+/// Graph material is labeled as navigation-only; every accepted fact still has
+/// to cite a line in the complete, numbered active-file source below.
+pub fn build_orientation_prompt(
+    file_path: &str,
+    file_source: &str,
+    roster_spans: &[FunctionSpan],
+    ctx: &GenContext,
+) -> (String, String) {
+    let system = r#"你是 Fluid 的文件定向助手，面向零代码基础读者。请根据当前激活文件的完整源码生成一份结构化文件定向卡。
+只输出一个 JSON 对象，禁止额外文字或 Markdown 代码围栏。JSON 必须只包含这些语义字段：purpose、actors、types、coreFlows、supportingCapabilities、functionRoles、walkthrough、invariants、evidence；后端会注入 schemaVersion、orientationId、filePath 与 full-source coverage。
+
+硬约束：
+1. actors 使用稳定、具名的真实参与者 ID，并标明 inside-file/project/external 边界；所有方向必须由 fromActorId -> toActorId 表达，禁止脱离参与者坐标使用“上游/下游”或 upstream/downstream。
+2. types 的 ownerActorId、coreFlows 的参与者/证据、functionRoles 的 actor/flow/evidence、walkthrough/invariants 的 evidenceIds 必须引用卡内已声明 ID，不能悬空。
+3. coreFlows 至少一个；每条 flow 至少一个 step；每个 step 必须点名真实 via、payload、why，并至少引用一个当前源码 evidenceId。
+4. 后端核验函数清单中的每个 fnId 必须在 functionRoles 中恰好出现一次，lane 只能是 core 或 supporting；core 角色必须引用 flow；supportingCapabilities 只能收纳 supporting 函数。禁止创造清单外 fnId。
+5. walkthrough 必须给出一个具体输入和至少一个贯穿步骤；purpose、flow、step、角色、外围能力均要解释 why（缺少它会造成什么后果），不能只复述函数名。
+6. evidence 只能指向当前激活文件，行号为 1-based inclusive，必须来自下方完整带号源码；禁止把图谱摘要、模型记忆或其他文件当作源码证据。
+7. 核心链路与外围生产能力必须分开；统计、tracing、缓存、清理、utility 等不应伪装成核心业务流。
+
+字段形状：
+{"purpose":"...","actors":[{"id":"actor_id","name":"...","role":"...","boundary":"inside-file|project|external"}],"types":[{"name":"...","ownerActorId":"actor_id","meaning":"..."}],"coreFlows":[{"id":"flow_id","name":"...","kind":"request|response|control|stats|other","why":"...","steps":[{"fromActorId":"actor_id","via":"真实函数/通道/调用","payload":"真实类型或信号","toActorId":"actor_id","why":"...","evidenceIds":["E1"]}]}],"supportingCapabilities":[{"name":"...","why":"...","functionIds":["fnId"],"evidenceIds":["E2"]}],"functionRoles":[{"fnId":"fnId","lane":"core|supporting","flowIds":["flow_id"],"stage":"...","receivesFromActorIds":["actor_id"],"consumes":["..."],"sendsToActorIds":["actor_id"],"produces":["..."],"why":"...","evidenceIds":["E1"]}],"walkthrough":{"title":"...","input":"具体输入","steps":[{"text":"...","evidenceIds":["E1"]}]},"invariants":[{"text":"...","evidenceIds":["E1"]}],"evidence":[{"id":"E1","filePath":"当前文件路径","startLine":1,"endLine":2,"symbol":"可选符号"}]}"#;
+
+    let mut user = String::new();
+    user.push_str(&format!("【当前激活文件】{file_path}\n"));
+    let roster_json = serde_json::to_string(roster_spans)
+        .expect("verified function spans contain only serializable fields");
+    user.push_str(&format!("【后端核验函数清单(JSON)】{roster_json}\n"));
+    if let Some(summary) = &ctx.file_summary {
+        user.push_str(&format!(
+            "【图谱候选文件摘要(仅导航提示，不是证据)】{summary}\n"
+        ));
+    }
+    if !ctx.edges.is_empty() {
+        let edges = ctx
+            .edges
+            .iter()
+            .map(|edge| format!("{}-{}->{}", edge.source, edge.edge_type, edge.target))
+            .collect::<Vec<_>>()
+            .join("; ");
+        user.push_str(&format!("【图谱候选关系(仅导航提示，不是证据)】{edges}\n"));
+    }
+    user.push_str("【完整源码(带 1-based 绝对行号；唯一事实证据)】\n");
+    user.push_str(&number_lines(file_source, 1));
+
+    (system.to_string(), user)
+}
+
 /// Build the (system, user) messages for a single function's generation.
 /// The function source is presented with absolute line numbers so the model can
 /// attach line annotations by number (技术方案 §7.3, key lines).
@@ -1335,6 +1391,33 @@ mod tests {
         assert_eq!(slice_span(src, [0, 1]), None);
         assert_eq!(slice_span(src, [2, 1]), None);
         assert_eq!(slice_span(src, [1, 9]), None);
+    }
+
+    #[test]
+    fn orientation_prompt_marks_graph_as_hint_and_keeps_verified_full_source() {
+        let roster = vec![FunctionSpan {
+            id: "fetch#1".into(),
+            name: "fetch".into(),
+            line_range: [1, 3],
+        }];
+        let context = GenContext {
+            file_summary: Some("graph summary".into()),
+            roster: vec!["fetch".into()],
+            edges: vec![edge("function:a.rs:fetch", "external:worker", "calls")],
+            callee_summaries: BTreeMap::new(),
+        };
+        let source = "fn fetch() {\n    send();\n}\n";
+
+        let (system, user) = build_orientation_prompt("a.rs", source, &roster, &context);
+
+        assert!(system.contains("fromActorId -> toActorId"));
+        assert!(system.contains("supportingCapabilities"));
+        assert!(system.contains("walkthrough"));
+        assert!(user.contains("【图谱候选文件摘要(仅导航提示，不是证据)】graph summary"));
+        assert!(user.contains("function:a.rs:fetch-calls->external:worker"));
+        assert!(user.contains("\"id\":\"fetch#1\""));
+        assert!(user.contains("   1 | fn fetch() {"));
+        assert!(user.contains("   3 | }"));
     }
 
     #[test]

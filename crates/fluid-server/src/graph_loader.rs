@@ -305,7 +305,6 @@ impl GraphCatalog {
     /// Hash only graph identities plus nodes/edges relevant to the supplied
     /// project files. Unrelated scopes or unrelated nodes do not invalidate a
     /// future file-orientation cache.
-    #[allow(dead_code)] // consumed by S-ORI-1; S-GRAPH-1 lands the stable identity first
     pub fn relevant_graph_set_hash(&self, project_paths: &[String]) -> String {
         let mut paths = project_paths.to_vec();
         paths.sort();

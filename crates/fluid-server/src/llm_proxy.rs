@@ -17,6 +17,11 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::cache_store::{Capsule, LineAnnotation, SelectionExplanation, SelectionKind};
+use crate::orientation::{
+    CodeEvidenceRef, FileOrientationCard, FunctionRole, OrientationActor, OrientationCoverage,
+    OrientationCoverageMode, OrientationFlow, OrientationInvariant, OrientationType,
+    OrientationWalkthrough, SupportingCapability, ORIENTATION_SCHEMA_VERSION,
+};
 use crate::web_evidence::{
     parse_web_search_response, EvidenceStatus, SourceLink, WebSearchError, WebSearchResult,
 };
@@ -350,6 +355,58 @@ pub fn parse_generation(
         .collect();
 
     Ok((capsule, lines))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawOrientationCard {
+    purpose: String,
+    actors: Vec<OrientationActor>,
+    #[serde(default)]
+    types: Vec<OrientationType>,
+    core_flows: Vec<OrientationFlow>,
+    #[serde(default)]
+    supporting_capabilities: Vec<SupportingCapability>,
+    #[serde(default)]
+    function_roles: Vec<FunctionRole>,
+    walkthrough: OrientationWalkthrough,
+    #[serde(default)]
+    invariants: Vec<OrientationInvariant>,
+    evidence: Vec<CodeEvidenceRef>,
+}
+
+/// Parse the model-authored semantic portion of a full-source orientation card.
+/// Cache/schema/file identity and coverage are backend facts, so the model never
+/// gets to choose or echo them into the trusted artifact.
+pub fn parse_orientation_card(
+    content: &str,
+    orientation_id: &str,
+    file_path: &str,
+) -> anyhow::Result<FileOrientationCard> {
+    let raw: RawOrientationCard = serde_json::from_str(extract_json(content)).map_err(|error| {
+        anyhow::anyhow!(
+            "LLM did not return the expected orientation JSON: {error}; content: {content}"
+        )
+    })?;
+
+    Ok(FileOrientationCard {
+        schema_version: ORIENTATION_SCHEMA_VERSION,
+        orientation_id: orientation_id.to_string(),
+        file_path: file_path.to_string(),
+        purpose: raw.purpose,
+        actors: raw.actors,
+        types: raw.types,
+        core_flows: raw.core_flows,
+        supporting_capabilities: raw.supporting_capabilities,
+        function_roles: raw.function_roles,
+        walkthrough: raw.walkthrough,
+        invariants: raw.invariants,
+        evidence: raw.evidence,
+        coverage: OrientationCoverage {
+            mode: OrientationCoverageMode::FullSource,
+            omitted_function_ids: Vec::new(),
+        },
+    })
 }
 
 #[derive(Deserialize)]
