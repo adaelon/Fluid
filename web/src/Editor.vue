@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue'
+import { nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue'
 import { Compartment, EditorState, type Extension } from '@codemirror/state'
 import { EditorView } from '@codemirror/view'
 import { basicSetup } from 'codemirror'
@@ -11,14 +11,24 @@ import { ghostField, foldClickHandler, retryClickHandler, refreshGhosts } from '
 import { fnGutter, explainClickHandler } from './render/gutter'
 import {
   explainLine as fetchExplainLine,
+  streamOrientation,
   streamSelectionExplanation,
+  type OrientationStream,
   type SelectionStream,
 } from './api'
 import { getParser } from './parser/browser'
 import { fluidDarkTheme } from './theme'
 import { GenScheduler, viewportDistance } from './scheduler'
 import { buildQueryContext, type QueryContext } from './queryContext'
+import OrientationCard from './OrientationCard.vue'
 import SelectionPopover from './SelectionPopover.vue'
+import {
+  idleOrientationState,
+  orientationCanActivate,
+  reduceOrientationFrame,
+  startOrientationRequest,
+  type OrientationViewState,
+} from './orientationState'
 import {
   reduceSelectionFrame,
   selectionToUtf8ByteRange,
@@ -56,6 +66,12 @@ const store = new GhostStore()
 // proximity, runs a small pool of parallel sockets, re-orders on scroll. Created
 // on mount with closures reading the live current-file state below.
 let scheduler: GenScheduler | null = null
+// File orientation is a separate, single-request activation gate. Its socket is
+// cancelled on every file switch; reducer reqId + activationToken guard writes.
+const orientationState = ref<OrientationViewState>(idleOrientationState())
+let orientationStream: OrientationStream | null = null
+let orientationRequestSeq = 0
+let capsulesStartedForToken: number | null = null
 // Guards async parser load against rapid file switches: each activation bumps the
 // token; a stale callback (parser resolved after a switch) sees a mismatch and bails.
 let activationToken = 0
@@ -241,6 +257,69 @@ function refresh(): void {
   view.value?.dispatch({ effects: refreshGhosts.of() })
 }
 
+function cancelOrientationRequest(): void {
+  orientationRequestSeq++
+  orientationStream?.cancel()
+  orientationStream = null
+}
+
+/** Render the accepted card first, then open the per-function scheduler. The
+ * nextTick is part of the gate: users see the file-level coordinate system
+ * before any child capsule socket can dispatch. */
+async function startCapsulesAfterOrientation(token: number, filePath: string): Promise<void> {
+  await nextTick()
+  if (
+    token !== activationToken ||
+    filePath !== currentPath ||
+    capsulesStartedForToken === token ||
+    !orientationCanActivate(orientationState.value, filePath) ||
+    !scheduler
+  ) {
+    return
+  }
+
+  capsulesStartedForToken = token
+  for (const fn of currentRoster) store.markPending(fn.id)
+  total.value = currentRoster.length
+  completed.value = 0
+  phase.value = currentRoster.length > 0 ? 'running' : 'idle'
+  refresh()
+
+  const ids = currentRoster.map((fn) => fn.id)
+  if (ids.length > 0) scheduler.start(ids, viewportDist())
+}
+
+function requestOrientation(token: number, filePath: string): void {
+  cancelOrientationRequest()
+  const guard = orientationRequestSeq
+  const reqId = `orientation-${token}-${guard}`
+  orientationState.value = startOrientationRequest(reqId, filePath)
+  orientationStream = streamOrientation(
+    { reqId, filePath, rosterSpans: currentRoster },
+    (frame) => {
+      if (
+        guard !== orientationRequestSeq ||
+        token !== activationToken ||
+        filePath !== currentPath
+      ) {
+        return
+      }
+      const previous = orientationState.value
+      const next = reduceOrientationFrame(previous, frame)
+      orientationState.value = next
+      if (frame.kind === 'done' || frame.kind === 'error') orientationStream = null
+      if (!orientationCanActivate(previous, filePath) && orientationCanActivate(next, filePath)) {
+        void startCapsulesAfterOrientation(token, filePath)
+      }
+    },
+  )
+}
+
+function retryOrientation(): void {
+  if (orientationState.value.mode !== 'error' || !currentPath) return
+  requestOrientation(activationToken, currentPath)
+}
+
 function cancelSelectionRequest(): void {
   selectionRequestSeq++
   selectionStream?.cancel()
@@ -405,11 +484,15 @@ async function explainLine(id: string, lineNumber: number): Promise<void> {
   }
 }
 
-// Activate a file: parse → open WS → stream per-function generation → render.
+// Activate a file: parse → orient → show card → schedule per-function generation.
 async function activate(source: string, lang: string, path: string): Promise<void> {
+  const token = ++activationToken
   scheduler?.stop()
+  cancelOrientationRequest()
   closeSelectionUi()
   store.reset()
+  orientationState.value = idleOrientationState()
+  capsulesStartedForToken = null
   currentRoster = []
   currentDecls = []
   currentPath = path
@@ -418,7 +501,6 @@ async function activate(source: string, lang: string, path: string): Promise<voi
   completed.value = 0
   refresh()
   emitContext() // vacuum the QueryPanel snapshot on every file switch (§7)
-  const token = ++activationToken
 
   if (!isParserLang(lang)) return // non py/rs: read-only source only (§7 VACUUM stays bare)
 
@@ -443,16 +525,13 @@ async function activate(source: string, lang: string, path: string): Promise<voi
   currentRoster = parsed.roster
   currentDecls = parsed.decls
   emitContext() // roster known (capsules still streaming in)
-  // Show "生成中" skeletons immediately (before the WS even opens) + arm progress.
-  for (const fn of parsed.roster) store.markPending(fn.id)
+  // The roster is visible to the orientation request, but capsule placeholders
+  // stay absent until a matching card+done opens the activation gate.
   total.value = parsed.roster.length
   completed.value = 0
-  phase.value = parsed.roster.length > 0 ? 'running' : 'idle'
+  phase.value = 'idle'
   refresh()
-
-  // Hand the roster to the scheduler, ordered by current viewport proximity (S8).
-  const ids = parsed.roster.map((fn) => fn.id)
-  scheduler?.start(ids, viewportDist())
+  requestOrientation(token, path)
 }
 
 onMounted(() => {
@@ -479,10 +558,12 @@ watch(
 )
 
 onBeforeUnmount(() => {
+  activationToken++
   window.removeEventListener('keydown', onFontKey)
   window.removeEventListener('keydown', onSelectionKey)
   window.removeEventListener('resize', updateSelectionAnchor)
   document.removeEventListener('pointerdown', onDocumentPointerDown, true)
+  cancelOrientationRequest()
   cancelSelectionRequest()
   scheduler?.stop()
   scheduler = null
@@ -493,6 +574,7 @@ onBeforeUnmount(() => {
 
 <template>
   <div ref="wrap" class="cm-wrap">
+    <OrientationCard :state="orientationState" @retry="retryOrientation" />
     <div ref="host" class="cm-host"></div>
     <button
       v-if="selectionTarget && selectionState.mode === 'idle'"

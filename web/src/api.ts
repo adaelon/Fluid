@@ -2,7 +2,12 @@
 // Requests go to /api/* and are proxied to 127.0.0.1:7878 in dev (vite.config.ts).
 
 import type { FunctionSpan } from './parser/types.ts'
-import type { LineAnnotation, QueryFrame, SelectionFrame } from './ghostTypes'
+import type {
+  LineAnnotation,
+  OrientationFrame,
+  QueryFrame,
+  SelectionFrame,
+} from './ghostTypes'
 import type { CapsuleSummary } from './queryContext'
 
 export type Lang = 'py' | 'rs' | 'md' | 'other'
@@ -139,6 +144,66 @@ export interface SelectionExplainRequest {
 
 export interface SelectionStream {
   cancel: () => void
+}
+
+export interface OrientationRequest {
+  reqId: string
+  filePath: string
+  rosterSpans: FunctionSpan[]
+}
+
+export interface OrientationStream {
+  cancel: () => void
+}
+
+/** Open one short-lived file-orientation WebSocket. Connection failures and a
+ * premature close are normalized to the same terminal `error` frame as the
+ * backend protocol. Echoed reqIds are checked here and again by the reducer. */
+export function streamOrientation(
+  req: OrientationRequest,
+  onFrame: (frame: OrientationFrame) => void,
+): OrientationStream {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws'
+  const sock = new WebSocket(`${proto}://${location.host}/api/orient`)
+  let settled = false
+  const close = () => {
+    try {
+      sock.close()
+    } catch {
+      /* already closing */
+    }
+  }
+  const fail = (message: string) => {
+    if (settled) return
+    settled = true
+    onFrame({ kind: 'error', reqId: req.reqId, message })
+    close()
+  }
+
+  sock.onopen = () => sock.send(JSON.stringify(req))
+  sock.onmessage = (event) => {
+    let frame: OrientationFrame
+    try {
+      frame = JSON.parse(event.data as string) as OrientationFrame
+    } catch {
+      return
+    }
+    if (frame.reqId !== req.reqId) return
+    onFrame(frame)
+    if (frame.kind === 'done' || frame.kind === 'error') {
+      settled = true
+      close()
+    }
+  }
+  sock.onerror = () => fail('连接失败')
+  sock.onclose = () => fail('连接已关闭')
+
+  return {
+    cancel: () => {
+      settled = true
+      close()
+    },
+  }
 }
 
 /** Open one short-lived selection WebSocket. The backend owns source truth and

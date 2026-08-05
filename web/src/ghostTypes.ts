@@ -19,6 +19,116 @@ export interface LineAnnotation {
   color: string
 }
 
+/** Source-backed file-orientation types. These mirror orientation.rs and are
+ * deliberately separate from Capsule: S-ORI-4 only gates activation and does
+ * not yet bind child products to orientationId (that is S-CAP-1). */
+export interface CodeEvidenceRef {
+  id: string
+  filePath: string
+  startLine: number
+  endLine: number
+  symbol?: string
+}
+
+export type ActorBoundary = 'inside-file' | 'project' | 'external'
+
+export interface OrientationActor {
+  id: string
+  name: string
+  role: string
+  boundary: ActorBoundary
+}
+
+export interface OrientationType {
+  name: string
+  ownerActorId: string
+  meaning: string
+}
+
+export interface OrientationFlowStep {
+  fromActorId: string
+  via: string
+  payload: string
+  toActorId: string
+  why: string
+  evidenceIds: string[]
+}
+
+export type OrientationFlowKind = 'request' | 'response' | 'control' | 'stats' | 'other'
+
+export interface OrientationFlow {
+  id: string
+  name: string
+  kind: OrientationFlowKind
+  why: string
+  steps: OrientationFlowStep[]
+}
+
+export type FunctionLane = 'core' | 'supporting'
+
+export interface FunctionRole {
+  fnId: string
+  lane: FunctionLane
+  flowIds: string[]
+  stage: string
+  receivesFromActorIds: string[]
+  consumes: string[]
+  sendsToActorIds: string[]
+  produces: string[]
+  why: string
+  evidenceIds: string[]
+}
+
+export interface SupportingCapability {
+  name: string
+  why: string
+  functionIds: string[]
+  evidenceIds: string[]
+}
+
+export interface OrientationWalkthrough {
+  title: string
+  input: string
+  steps: { text: string; evidenceIds: string[] }[]
+}
+
+export interface OrientationInvariant {
+  text: string
+  evidenceIds: string[]
+}
+
+export type OrientationCoverageMode = 'full-source' | 'bounded-source'
+
+export interface FileOrientationCard {
+  schemaVersion: number
+  orientationId: string
+  filePath: string
+  purpose: string
+  actors: OrientationActor[]
+  types: OrientationType[]
+  coreFlows: OrientationFlow[]
+  supportingCapabilities: SupportingCapability[]
+  functionRoles: FunctionRole[]
+  walkthrough: OrientationWalkthrough
+  invariants: OrientationInvariant[]
+  evidence: CodeEvidenceRef[]
+  coverage: {
+    mode: OrientationCoverageMode
+    omittedFunctionIds: string[]
+  }
+}
+
+export type OrientationPhase = 'planning-source' | 'orienting'
+
+/** One inbound frame from `WS /api/orient` (S-ORI-4). The backend echoes
+ * `reqId`; only `done` after a matching `card` opens the capsule gate. */
+export type OrientationFrame =
+  | { kind: 'cache-hit'; reqId: string }
+  | { kind: 'status'; reqId: string; phase: OrientationPhase; message: string }
+  | { kind: 'card'; reqId: string; card: FileOrientationCard }
+  | { kind: 'done'; reqId: string }
+  | { kind: 'error'; reqId: string; message: string }
+
 /** One inbound frame from `WS /api/generate` (S7a, §4). `reqId` echoes the
  *  request (= the function id); terminal frames are `done` | `error`. */
 export type GenFrame =
