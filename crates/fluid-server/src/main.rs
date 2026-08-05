@@ -24,7 +24,7 @@ use std::sync::Arc;
 use clap::Parser;
 
 use cache_store::CacheStore;
-use graph_loader::GraphLoader;
+use graph_loader::GraphCatalog;
 use project_reader::ProjectReader;
 use routes::AppState;
 use settings::LlmConfig;
@@ -86,19 +86,45 @@ async fn main() -> anyhow::Result<()> {
             let reader = ProjectReader::new(path)
                 .map_err(|e| anyhow::anyhow!("cannot open project directory: {e}"))?;
             println!("Fluid serving project: {}", reader.root().display());
-            let graph = GraphLoader::load(reader.root());
-            match graph.graph() {
-                Some(g) => println!(
-                    "Knowledge graph loaded: {} nodes, {} edges",
-                    g.nodes.len(),
-                    g.edges.len()
-                ),
-                None => println!(
-                    "No knowledge graph (.understand-anything/ absent) — running self-contained"
-                ),
+            let graphs = GraphCatalog::discover(reader.root());
+            debug_assert_eq!(graphs.project_root(), reader.root());
+            if graphs.is_empty() {
+                println!(
+                    "No knowledge graph (.ua/.understand-anything absent or invalid) — running self-contained"
+                );
+            } else {
+                let nodes: usize = graphs
+                    .snapshots()
+                    .iter()
+                    .map(|snapshot| snapshot.graph().nodes.len())
+                    .sum();
+                let edges: usize = graphs
+                    .snapshots()
+                    .iter()
+                    .map(|snapshot| snapshot.graph().edges.len())
+                    .sum();
+                println!(
+                    "Knowledge graph catalog loaded: {} scope(s), {} nodes, {} edges, freshness {}",
+                    graphs.len(),
+                    nodes,
+                    edges,
+                    graphs.freshness_hash()
+                );
+                for snapshot in graphs.snapshots() {
+                    println!(
+                        "  graph scope {} ({}) via {} at {} [{}]: {} nodes, {} edges",
+                        snapshot.scope_path(),
+                        snapshot.scope_root().display(),
+                        snapshot.origin().label(),
+                        snapshot.path().display(),
+                        snapshot.content_hash(),
+                        snapshot.graph().nodes.len(),
+                        snapshot.graph().edges.len()
+                    );
+                }
             }
             let cache = CacheStore::new(reader.root(), &llm_config.model, PROMPT_VERSION);
-            AppState::new(reader, graph, cache, llm_config, env_path, PROMPT_VERSION)
+            AppState::new(reader, graphs, cache, llm_config, env_path, PROMPT_VERSION)
         }
         None => {
             println!("No project specified — open a folder from the UI to begin");

@@ -39,7 +39,7 @@ use crate::context_assembler::{
     slice_requested_sources, slice_span, CrossFileTarget, FileSetContext, FileSetSourceTarget,
     FunctionSpan, GenContext, QueryFocus, SharedContext, QUERY_FETCH_BUDGET_CHARS,
 };
-use crate::graph_loader::{GraphLoader, GraphNode, KnowledgeGraph};
+use crate::graph_loader::{GraphCatalog, GraphNode, KnowledgeGraph};
 use crate::llm_proxy::{
     parse_fetch_plan, parse_generation, parse_line_annotation, parse_selection_explanation,
     LlmProxy, SseDecoder,
@@ -53,12 +53,12 @@ use crate::web_evidence::{
 };
 use futures_util::stream::{self, StreamExt};
 
-/// The root-bound trio: file reader + optional knowledge graph + bypass cache.
+/// The root-bound trio: file reader + optional graph catalog + bypass cache.
 /// All three are rebuilt together when the project root changes (U3 Open Folder),
 /// so they live behind one lock and swap atomically.
 struct ProjectCtx {
     reader: ProjectReader,
-    graph: GraphLoader,
+    graphs: GraphCatalog,
     cache: CacheStore,
 }
 
@@ -97,7 +97,7 @@ struct LlmSnapshot {
 impl AppState {
     pub fn new(
         reader: ProjectReader,
-        graph: GraphLoader,
+        graphs: GraphCatalog,
         cache: CacheStore,
         llm_config: LlmConfig,
         env_path: PathBuf,
@@ -106,7 +106,7 @@ impl AppState {
         Self::with_project(
             Some(ProjectCtx {
                 reader,
-                graph,
+                graphs,
                 cache,
             }),
             llm_config,
@@ -227,17 +227,15 @@ async fn file(State(state): State<Shared>, Query(q): Query<FileQuery>) -> impl I
     }
 }
 
-/// Returns the knowledge graph, or `null` when no `.understand-anything/` is
-/// present (ADR-0011: optional enhancement, never required).
+/// Refreshes graph discovery, then returns only the project-root graph. Nested
+/// scope graphs stay internal and are never merged into this compatibility view.
 async fn graph(State(state): State<Shared>) -> Json<Option<KnowledgeGraph>> {
-    Json(
-        state
-            .project
-            .read()
-            .unwrap()
-            .as_ref()
-            .and_then(|p| p.graph.graph().cloned()),
-    )
+    let mut project = state.project.write().unwrap();
+    let graph = project.as_mut().and_then(|project| {
+        project.graphs.refresh();
+        project.graphs.root_graph().cloned()
+    });
+    Json(graph)
 }
 
 #[derive(Deserialize)]
@@ -269,12 +267,12 @@ async fn open_folder(
                 .into_response()
         }
     };
-    let graph = GraphLoader::load(reader.root());
+    let graphs = GraphCatalog::discover(reader.root());
     let cache = CacheStore::new(reader.root(), state.model(), state.prompt_version);
     let root = reader.root().display().to_string();
     *state.project.write().unwrap() = Some(ProjectCtx {
         reader,
-        graph,
+        graphs,
         cache,
     });
     eprintln!("[open] switched project root to {root}");
@@ -606,8 +604,12 @@ async fn run_generation(state: &AppState, req: GenerateRequest) -> Vec<GenFrame>
             GenStep::Ready(vec![err("LLM not configured: set OPENCODE_API_KEY")])
         } else {
             // 3b. Miss → assemble the prompt while we still hold the project lock.
-            let ctx =
-                assemble_gen_context(proj.graph.graph(), &req.file_path, &req.roster, &req.shared);
+            let ctx = assemble_gen_context(
+                proj.graphs.graph_for_file(&req.file_path),
+                &req.file_path,
+                &req.roster,
+                &req.shared,
+            );
             let (system, user) = build_gen_prompt(&req.func, &fn_source, &req.key_lines, &ctx);
             GenStep::NeedLlm {
                 system,
@@ -802,12 +804,19 @@ fn selection_project_evidence(
     selected_text: &str,
     line_number: u32,
 ) -> SelectionProjectEvidence {
-    let Some(graph) = project.graph.graph() else {
+    let Some(snapshot) = project.graphs.graph_for_file(file_path) else {
         return SelectionProjectEvidence {
             candidates: Vec::new(),
             source: None,
         };
     };
+    let Some(graph_file_path) = snapshot.graph_relative_path(file_path) else {
+        return SelectionProjectEvidence {
+            candidates: Vec::new(),
+            source: None,
+        };
+    };
+    let graph = snapshot.graph();
     let selected_text = selected_text.trim();
     let mut matches: Vec<(&GraphNode, u8)> = graph
         .nodes
@@ -816,7 +825,7 @@ fn selection_project_evidence(
         .map(|node| {
             (
                 node,
-                selection_graph_match_score(graph, node, file_path, line_number),
+                selection_graph_match_score(graph, node, &graph_file_path, line_number),
             )
         })
         .collect();
@@ -831,7 +840,7 @@ fn selection_project_evidence(
     let candidates = matches
         .iter()
         .take(8)
-        .map(|(node, _)| format_selection_graph_candidate(node))
+        .map(|(node, _)| format_selection_graph_candidate(snapshot, node))
         .collect();
     let code_candidate_count = matches
         .iter()
@@ -853,11 +862,12 @@ fn selection_project_evidence(
 
     let source = target.and_then(|(node, _)| {
         let range = node.line_range?;
-        let full_source = project.reader.read_file(&node.file_path).ok()?;
+        let project_path = snapshot.project_relative_path(&node.file_path)?;
+        let full_source = project.reader.read_file(&project_path).ok()?;
         let sliced = slice_span(&full_source, range)?;
         Some(format!(
             "【项目源码: {}:{}-{} ({})】\n{}",
-            node.file_path,
+            project_path,
             range[0],
             range[1],
             node.name,
@@ -871,17 +881,17 @@ fn selection_project_evidence(
 fn selection_graph_match_score(
     graph: &KnowledgeGraph,
     node: &GraphNode,
-    file_path: &str,
+    graph_file_path: &str,
     line_number: u32,
 ) -> u8 {
-    if node.file_path == file_path
+    if node.file_path == graph_file_path
         && node
             .line_range
             .is_some_and(|[start, end]| line_number >= start && line_number <= end)
     {
         return 0;
     }
-    if node.file_path == file_path {
+    if node.file_path == graph_file_path {
         return 1;
     }
     let linked_from_current_file = graph.edges.iter().any(|edge| {
@@ -889,7 +899,7 @@ fn selection_graph_match_score(
             && graph
                 .nodes
                 .iter()
-                .any(|source| source.id == edge.source && source.file_path == file_path)
+                .any(|source| source.id == edge.source && source.file_path == graph_file_path)
     });
     if linked_from_current_file {
         2
@@ -898,7 +908,10 @@ fn selection_graph_match_score(
     }
 }
 
-fn format_selection_graph_candidate(node: &GraphNode) -> String {
+fn format_selection_graph_candidate(
+    snapshot: &crate::graph_loader::GraphSnapshot,
+    node: &GraphNode,
+) -> String {
     let range = node
         .line_range
         .map(|[start, end]| format!(":{start}-{end}"))
@@ -908,9 +921,12 @@ fn format_selection_graph_candidate(node: &GraphNode) -> String {
     } else {
         format!(" — {}", node.summary.trim())
     };
+    let project_path = snapshot
+        .project_relative_path(&node.file_path)
+        .unwrap_or_else(|| node.file_path.clone());
     format!(
         "{} ({}, {}{}){}",
-        node.name, node.node_type, node.file_path, range, summary
+        node.name, node.node_type, project_path, range, summary
     )
 }
 
@@ -1033,8 +1049,12 @@ where
             .iter()
             .map(|span| span.name.clone())
             .collect();
-        let context =
-            assemble_gen_context(project.graph.graph(), &req.file_path, &roster, &req.shared);
+        let context = assemble_gen_context(
+            project.graphs.graph_for_file(&req.file_path),
+            &req.file_path,
+            &roster,
+            &req.shared,
+        );
         let project_match = selection_project_evidence(
             project,
             &req.file_path,
@@ -1339,8 +1359,12 @@ async fn run_explain_line(
                 "LLM not configured: set OPENCODE_API_KEY".into(),
             ));
         } else {
-            let ctx =
-                assemble_gen_context(proj.graph.graph(), &req.file_path, &req.roster, &req.shared);
+            let ctx = assemble_gen_context(
+                proj.graphs.graph_for_file(&req.file_path),
+                &req.file_path,
+                &req.roster,
+                &req.shared,
+            );
             let (system, user) = match &req.decl_kind {
                 // Module-level declaration (S-TS-3): fn_source is the decl span.
                 Some(kind) => build_explain_decl_prompt(
@@ -1884,7 +1908,8 @@ fn prepare_query_for_snapshot(
         return QueryPlan::Err("LLM not configured: set OPENCODE_API_KEY".into());
     }
 
-    let ctx = assemble_gen_context(proj.graph.graph(), &req.file_path, &req.roster, &req.shared);
+    let snapshot = proj.graphs.graph_for_file(&req.file_path);
+    let ctx = assemble_gen_context(snapshot, &req.file_path, &req.roster, &req.shared);
     let dependency_hints = if req.allow_web {
         project_dependency_hints(proj)
     } else {
@@ -1914,7 +1939,7 @@ fn prepare_query_for_snapshot(
     // after the lock drops (mirroring `file_source` — no lock across await). A
     // target whose file can't be read is dropped (never offer a name we can't
     // honor). Pure read: no cache write, no activation — 目标文件事后仍真空.
-    let cross_all = cross_file_targets(proj.graph.graph(), &req.file_path, &req.roster);
+    let cross_all = cross_file_targets(snapshot, &req.file_path, &req.roster);
     let mut cross_sources: BTreeMap<String, String> = BTreeMap::new();
     let mut cross_targets: Vec<CrossFileTarget> = Vec::new();
     for t in cross_all {
@@ -1979,7 +2004,7 @@ fn prepare_query_files_for_snapshot(
         return QueryFilesPlan::Err("no project open".into());
     };
 
-    let ctx = match assemble_file_set_context(proj.graph.graph(), &req.file_paths) {
+    let ctx = match assemble_file_set_context(&proj.graphs, &req.file_paths) {
         Ok(ctx) => ctx,
         Err(e) => return QueryFilesPlan::Err(e),
     };
@@ -2420,7 +2445,7 @@ mod tests {
     use std::sync::Mutex;
 
     use crate::cache_store::SelectionKind;
-    use crate::graph_loader::GraphLoader;
+    use crate::graph_loader::GraphCatalog;
     use futures_util::SinkExt;
     use tokio_tungstenite::tungstenite::Message as ClientMessage;
 
@@ -2482,12 +2507,62 @@ mod tests {
     fn make_state_with_config(root: &Path, cfg: LlmConfig) -> AppState {
         AppState::new(
             ProjectReader::new(root.to_path_buf()).unwrap(),
-            GraphLoader::load(root),
+            GraphCatalog::discover(root),
             CacheStore::new(root, &cfg.model, "p1"),
             cfg,
             root.join(".env"),
             "p1",
         )
+    }
+
+    fn write_file_graph(scope: &Path, directory: &str, file_path: &str, summary: &str) {
+        let graph_dir = scope.join(directory);
+        std::fs::create_dir_all(&graph_dir).unwrap();
+        std::fs::write(
+            graph_dir.join("knowledge-graph.json"),
+            serde_json::json!({
+                "nodes": [{
+                    "id": format!("file:{file_path}"),
+                    "type": "file",
+                    "name": file_path,
+                    "filePath": file_path,
+                    "summary": summary
+                }],
+                "edges": []
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn graph_endpoint_projects_only_root_scope_and_never_merges_child() {
+        let project = TmpDir::new();
+        write_file_graph(project.path(), ".understand-anything", "root.rs", "root");
+        write_file_graph(&project.path().join("child"), ".ua", "nested.rs", "nested");
+        let state = Arc::new(make_state(project.path(), ""));
+
+        let Json(projected) = super::graph(State(Arc::clone(&state))).await;
+        let projected = projected.expect("root graph compatibility view");
+
+        assert_eq!(
+            state.project.read().unwrap().as_ref().unwrap().graphs.len(),
+            2
+        );
+        assert_eq!(projected.nodes.len(), 1);
+        assert_eq!(projected.nodes[0].file_path, "root.rs");
+        assert!(!projected.nodes.iter().any(|node| node.summary == "nested"));
+
+        let nested_only = TmpDir::new();
+        write_file_graph(
+            &nested_only.path().join("child"),
+            ".ua",
+            "nested.rs",
+            "nested",
+        );
+        let state = Arc::new(make_state(nested_only.path(), ""));
+        let Json(projected) = super::graph(State(state)).await;
+        assert!(projected.is_none());
     }
 
     #[derive(Clone)]
@@ -2659,11 +2734,11 @@ mod tests {
     /// Swap the project root in place, the way `POST /api/project/open` does.
     fn swap_root(state: &AppState, root: &Path) {
         let reader = ProjectReader::new(root.to_path_buf()).unwrap();
-        let graph = GraphLoader::load(root);
+        let graphs = GraphCatalog::discover(root);
         let cache = CacheStore::new(root, state.model(), state.prompt_version);
         *state.project.write().unwrap() = Some(ProjectCtx {
             reader,
-            graph,
+            graphs,
             cache,
         });
     }
@@ -3910,8 +3985,10 @@ mod tests {
                 assert!(user.contains("- b.py: 文件 B"));
                 assert!(user.contains("fa 摘要"));
                 assert!(user.contains("fb 摘要"));
-                assert!(user.contains("function:a.py:fa -calls-> function:b.py:fb"));
-                assert!(user.contains("function:a.py:fa -imports-> function:c.py:fc"));
+                assert!(user.contains("::function:a.py:fa -calls->"));
+                assert!(user.contains("::function:b.py:fb"));
+                assert!(user.contains("::function:a.py:fa -imports->"));
+                assert!(user.contains("::function:c.py:fc"));
             }
             _ => panic!("expected Direct plan"),
         }

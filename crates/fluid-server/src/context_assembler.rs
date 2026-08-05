@@ -13,12 +13,12 @@
 //! simply omitted so S6 stays a single LLM call per function.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::graph_loader::{GraphEdge, GraphNode, KnowledgeGraph};
+use crate::graph_loader::{GraphCatalog, GraphEdge, GraphNode, GraphSnapshot, KnowledgeGraph};
 
 /// A function as located by the frontend's tree-sitter pass (技术方案 §3).
 /// `lineRange` is 1-based inclusive `[start, end]`.
@@ -58,6 +58,7 @@ pub struct FileSetFile {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FileSetSymbol {
+    pub graph_id: String,
     pub id: String,
     pub node_type: String,
     pub name: String,
@@ -79,6 +80,7 @@ pub struct FileSetContext {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FileSetSourceTarget {
+    pub graph_id: String,
     pub id: String,
     pub name: String,
     pub node_type: String,
@@ -89,19 +91,27 @@ pub struct FileSetSourceTarget {
 /// Assemble generation context: request value wins, else graph, else empty/omitted
 /// (技术方案 §5, S6 minimal — no extra LLM calls).
 pub fn assemble_gen_context(
-    graph: Option<&KnowledgeGraph>,
+    snapshot: Option<&GraphSnapshot>,
     file_path: &str,
     roster: &[String],
     shared: &SharedContext,
 ) -> GenContext {
-    let file_summary = shared
-        .file_summary
-        .clone()
-        .or_else(|| graph.and_then(|g| file_summary_from_graph(g, file_path)));
+    let scoped_path = snapshot.and_then(|graph| graph.graph_relative_path(file_path));
+    let file_summary = shared.file_summary.clone().or_else(|| {
+        snapshot.and_then(|snapshot| {
+            scoped_path
+                .as_deref()
+                .and_then(|path| file_summary_from_graph(snapshot.graph(), path))
+        })
+    });
 
     let edges = shared.edges.clone().unwrap_or_else(|| {
-        graph
-            .map(|g| edges_for_file(g, file_path))
+        snapshot
+            .and_then(|snapshot| {
+                scoped_path
+                    .as_deref()
+                    .map(|path| edges_for_file(snapshot.graph(), path))
+            })
             .unwrap_or_default()
     });
 
@@ -116,64 +126,109 @@ pub fn assemble_gen_context(
 }
 
 pub fn assemble_file_set_context(
-    graph: Option<&KnowledgeGraph>,
+    catalog: &GraphCatalog,
     file_paths: &[String],
 ) -> Result<FileSetContext, String> {
     let selected_paths = dedup_file_paths(file_paths);
     if selected_paths.len() < 2 {
         return Err("select at least 2 files".into());
     }
-    let Some(g) = graph else {
+    if catalog.is_empty() {
         return Err("knowledge graph not found; generate understand-anything graph first".into());
-    };
-
-    let mut files = Vec::new();
-    for path in &selected_paths {
-        let Some(n) = g
-            .nodes
-            .iter()
-            .find(|n| n.node_type == "file" && n.file_path == *path)
-        else {
-            return Err(format!("selected file not found in graph: {path}"));
-        };
-        files.push(FileSetFile {
-            path: path.clone(),
-            name: n.name.clone(),
-            summary: n.summary.clone(),
-        });
     }
 
-    let selected: HashSet<&str> = selected_paths.iter().map(String::as_str).collect();
-    let symbols = g
-        .nodes
-        .iter()
-        .filter(|n| selected.contains(n.file_path.as_str()))
-        .filter(|n| matches!(n.node_type.as_str(), "class" | "function"))
-        .map(|n| FileSetSymbol {
-            id: n.id.clone(),
-            node_type: n.node_type.clone(),
-            name: n.name.clone(),
-            file_path: n.file_path.clone(),
-            summary: n.summary.clone(),
-            line_range: n.line_range,
-        })
-        .collect();
-
+    let mut files = Vec::new();
+    let mut symbols = Vec::new();
     let mut internal_edges = Vec::new();
     let mut boundary_edges = Vec::new();
-    for e in &g.edges {
-        let Some(src) = find_node(g, &e.source) else {
-            continue;
+    let mut resolved = Vec::new();
+    for project_path in &selected_paths {
+        let Some(snapshot) = catalog.graph_for_file(project_path) else {
+            return Err(format!(
+                "selected file has no owning knowledge graph: {project_path}"
+            ));
         };
-        let Some(tgt) = find_node(g, &e.target) else {
-            continue;
+        let Some(graph_path) = snapshot.graph_relative_path(project_path) else {
+            return Err(format!(
+                "selected file path is outside graph scope: {project_path}"
+            ));
         };
-        let src_selected = selected.contains(src.file_path.as_str());
-        let tgt_selected = selected.contains(tgt.file_path.as_str());
-        if src_selected && tgt_selected {
-            internal_edges.push(e.clone());
-        } else if src_selected && !tgt_selected {
-            boundary_edges.push(e.clone());
+        let Some(node) = snapshot
+            .graph()
+            .nodes
+            .iter()
+            .find(|node| node.node_type == "file" && node.file_path == graph_path)
+        else {
+            return Err(format!("selected file not found in graph: {project_path}"));
+        };
+        files.push(FileSetFile {
+            path: project_path.clone(),
+            name: node.name.clone(),
+            summary: node.summary.clone(),
+        });
+        resolved.push((project_path, snapshot, graph_path));
+    }
+
+    let graph_ids: BTreeSet<&str> = resolved
+        .iter()
+        .map(|(_, snapshot, _)| snapshot.identity())
+        .collect();
+    for graph_id in graph_ids {
+        let snapshot = resolved
+            .iter()
+            .find(|(_, snapshot, _)| snapshot.identity() == graph_id)
+            .map(|(_, snapshot, _)| *snapshot)
+            .expect("graph identity came from resolved selections");
+        let selected_in_graph: HashSet<&str> = resolved
+            .iter()
+            .filter(|(_, candidate, _)| candidate.identity() == graph_id)
+            .map(|(_, _, graph_path)| graph_path.as_str())
+            .collect();
+
+        symbols.extend(
+            snapshot
+                .graph()
+                .nodes
+                .iter()
+                .filter(|node| selected_in_graph.contains(node.file_path.as_str()))
+                .filter(|node| matches!(node.node_type.as_str(), "class" | "function"))
+                .filter_map(|node| {
+                    Some(FileSetSymbol {
+                        graph_id: graph_id.to_string(),
+                        id: qualify_graph_node_id(graph_id, &node.id),
+                        node_type: node.node_type.clone(),
+                        name: node.name.clone(),
+                        file_path: snapshot.project_relative_path(&node.file_path)?,
+                        summary: node.summary.clone(),
+                        line_range: node.line_range,
+                    })
+                }),
+        );
+
+        for edge in &snapshot.graph().edges {
+            let Some(source) = find_node(snapshot.graph(), &edge.source) else {
+                continue;
+            };
+            let Some(target) = find_node(snapshot.graph(), &edge.target) else {
+                continue;
+            };
+            let source_selected = selected_in_graph.contains(source.file_path.as_str());
+            let target_selected = selected_in_graph.contains(target.file_path.as_str());
+            if !source_selected {
+                continue;
+            }
+            let scoped_edge = GraphEdge {
+                source: qualify_graph_node_id(graph_id, &edge.source),
+                target: qualify_graph_node_id(graph_id, &edge.target),
+                edge_type: edge.edge_type.clone(),
+                direction: edge.direction.clone(),
+                weight: edge.weight,
+            };
+            if target_selected {
+                internal_edges.push(scoped_edge);
+            } else {
+                boundary_edges.push(scoped_edge);
+            }
         }
     }
 
@@ -183,6 +238,10 @@ pub fn assemble_file_set_context(
         internal_edges,
         boundary_edges,
     })
+}
+
+fn qualify_graph_node_id(graph_id: &str, node_id: &str) -> String {
+    format!("{graph_id}::{node_id}")
 }
 
 fn dedup_file_paths(file_paths: &[String]) -> Vec<String> {
@@ -260,6 +319,7 @@ pub fn file_set_fetchable_targets(ctx: &FileSetContext) -> Vec<FileSetSourceTarg
         .iter()
         .filter_map(|s| {
             s.line_range.map(|line_range| FileSetSourceTarget {
+                graph_id: s.graph_id.clone(),
                 id: s.id.clone(),
                 name: s.name.clone(),
                 node_type: s.node_type.clone(),
@@ -284,8 +344,8 @@ pub fn build_file_set_query_planning_prompt(
     user.push_str("\n【可按需索取源码的图谱节点】\n");
     for t in fetchable {
         user.push_str(&format!(
-            "- {} | {} | {} | {}\n",
-            t.id, t.name, t.node_type, t.file_path
+            "- {} | {} | {} | {} | {}\n",
+            t.graph_id, t.id, t.name, t.node_type, t.file_path
         ));
     }
     (system.to_string(), user)
@@ -1110,32 +1170,38 @@ pub struct CrossFileTarget {
 /// single target. Empty without a graph, or when nodes are too sparse to locate
 /// (no `line_range`) — the natural bound that keeps this from "opening everything".
 pub fn cross_file_targets(
-    graph: Option<&KnowledgeGraph>,
+    snapshot: Option<&GraphSnapshot>,
     file_path: &str,
     roster: &[String],
 ) -> Vec<CrossFileTarget> {
-    let Some(g) = graph else { return Vec::new() };
-    let local_ids: HashSet<&str> = g
+    let Some(snapshot) = snapshot else {
+        return Vec::new();
+    };
+    let Some(graph_file_path) = snapshot.graph_relative_path(file_path) else {
+        return Vec::new();
+    };
+    let graph = snapshot.graph();
+    let local_ids: HashSet<&str> = graph
         .nodes
         .iter()
-        .filter(|n| n.file_path == file_path)
+        .filter(|node| node.file_path == graph_file_path)
         .map(|n| n.id.as_str())
         .collect();
 
     let mut out: Vec<CrossFileTarget> = Vec::new();
     let mut seen: HashSet<&str> = HashSet::new();
-    for e in &g.edges {
+    for e in &graph.edges {
         if e.edge_type != "calls" || !local_ids.contains(e.source.as_str()) {
             continue;
         }
-        let Some(t) = g.nodes.iter().find(|n| n.id == e.target) else {
+        let Some(t) = graph.nodes.iter().find(|n| n.id == e.target) else {
             continue; // dangling edge target
         };
         // Accept both `function` and `class` definitions: `understand-anything`
         // models a Python class instantiation as a `calls` edge to a `class` node,
         // and classes are the majority node type — restricting to `function` here
         // silently dropped most cross-file "show me the implementation" callees.
-        if !matches!(t.node_type.as_str(), "function" | "class") || t.file_path == file_path {
+        if !matches!(t.node_type.as_str(), "function" | "class") || t.file_path == graph_file_path {
             continue; // only cross-file code definitions (function/class)
         }
         let Some(line_range) = t.line_range else {
@@ -1147,9 +1213,12 @@ pub fn cross_file_targets(
         if !seen.insert(t.name.as_str()) {
             continue; // dedup by name so the model's plan resolves to one target
         }
+        let Some(project_file_path) = snapshot.project_relative_path(&t.file_path) else {
+            continue;
+        };
         out.push(CrossFileTarget {
             name: t.name.clone(),
-            file_path: t.file_path.clone(),
+            file_path: project_file_path,
             line_range,
         });
     }
@@ -1210,7 +1279,11 @@ fn number_lines(src: &str, start_line: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph_loader::{GraphNode, KnowledgeGraph};
+    use crate::graph_loader::{GraphCatalog, GraphNode, KnowledgeGraph};
+
+    fn catalog(graph: KnowledgeGraph) -> GraphCatalog {
+        GraphCatalog::from_root_graph_for_test(graph)
+    }
 
     fn node(id: &str, ty: &str, file: &str, summary: &str) -> GraphNode {
         GraphNode {
@@ -1483,7 +1556,8 @@ mod tests {
             edges: None,
             callee_summaries: None,
         };
-        let ctx = assemble_gen_context(Some(&g), "a.py", &["f".into()], &shared);
+        let catalog = catalog(g);
+        let ctx = assemble_gen_context(catalog.root_snapshot(), "a.py", &["f".into()], &shared);
         assert_eq!(ctx.file_summary.as_deref(), Some("请求给的摘要"));
     }
 
@@ -1501,7 +1575,13 @@ mod tests {
                 edge("function:a.py:f", "file:a.py", "contains"),    // wrong type → dropped
             ],
         };
-        let ctx = assemble_gen_context(Some(&g), "a.py", &[], &SharedContext::default());
+        let catalog = catalog(g);
+        let ctx = assemble_gen_context(
+            catalog.root_snapshot(),
+            "a.py",
+            &[],
+            &SharedContext::default(),
+        );
         assert_eq!(ctx.file_summary.as_deref(), Some("执行模块的配置类"));
         assert_eq!(ctx.edges.len(), 1);
         assert_eq!(ctx.edges[0].edge_type, "calls");
@@ -1523,14 +1603,15 @@ mod tests {
 
     #[test]
     fn file_set_context_requires_two_files_and_graph() {
+        let empty = GraphCatalog::empty_for_test();
         let one = vec!["a.py".to_string()];
         assert_eq!(
-            assemble_file_set_context(None, &one).unwrap_err(),
+            assemble_file_set_context(&empty, &one).unwrap_err(),
             "select at least 2 files"
         );
 
         let two = vec!["a.py".to_string(), "b.py".to_string()];
-        assert!(assemble_file_set_context(None, &two)
+        assert!(assemble_file_set_context(&empty, &two)
             .unwrap_err()
             .contains("knowledge graph not found"));
     }
@@ -1542,8 +1623,9 @@ mod tests {
             edges: vec![],
         };
         let paths = vec!["a.py".to_string(), "b.py".to_string()];
+        let catalog = catalog(g);
         assert_eq!(
-            assemble_file_set_context(Some(&g), &paths).unwrap_err(),
+            assemble_file_set_context(&catalog, &paths).unwrap_err(),
             "selected file not found in graph: b.py"
         );
     }
@@ -1567,7 +1649,8 @@ mod tests {
             ],
         };
         let paths = vec!["a.py".to_string(), "b.py".to_string(), "a.py".to_string()];
-        let ctx = assemble_file_set_context(Some(&g), &paths).unwrap();
+        let catalog = catalog(g);
+        let ctx = assemble_file_set_context(&catalog, &paths).unwrap();
 
         assert_eq!(
             ctx.files
@@ -1581,12 +1664,55 @@ mod tests {
             .symbols
             .iter()
             .any(|s| s.name == "function:a.py:fa" && s.summary == "fa 摘要"));
-        assert!(ctx
-            .internal_edges
-            .iter()
-            .any(|e| e.source == "function:a.py:fa" && e.target == "class:b.py:B"));
+        assert!(ctx.internal_edges.iter().any(|edge| {
+            edge.source.ends_with("::function:a.py:fa") && edge.target.ends_with("::class:b.py:B")
+        }));
         assert_eq!(ctx.boundary_edges.len(), 1);
-        assert_eq!(ctx.boundary_edges[0].target, "function:c.py:fc");
+        assert!(ctx.boundary_edges[0].target.ends_with("::function:c.py:fc"));
+    }
+
+    #[test]
+    fn file_set_context_keeps_sibling_graph_identities_and_paths_isolated() {
+        let root = KnowledgeGraph {
+            nodes: vec![
+                node("file:root.rs", "file", "root.rs", "root file"),
+                ranged_node("function:shared", "function", "root.rs", "root fn", [1, 2]),
+            ],
+            edges: vec![],
+        };
+        let child = KnowledgeGraph {
+            nodes: vec![
+                node("file:nested.rs", "file", "nested.rs", "child file"),
+                ranged_node(
+                    "function:shared",
+                    "function",
+                    "nested.rs",
+                    "child fn",
+                    [3, 4],
+                ),
+            ],
+            edges: vec![],
+        };
+        let catalog = GraphCatalog::from_scoped_graphs_for_test(vec![
+            (".".into(), root),
+            ("child".into(), child),
+        ]);
+
+        let ctx =
+            assemble_file_set_context(&catalog, &["root.rs".into(), "child/nested.rs".into()])
+                .unwrap();
+
+        assert_eq!(ctx.files[0].path, "root.rs");
+        assert_eq!(ctx.files[1].path, "child/nested.rs");
+        assert_eq!(ctx.symbols.len(), 2);
+        assert_ne!(ctx.symbols[0].graph_id, ctx.symbols[1].graph_id);
+        assert_ne!(ctx.symbols[0].id, ctx.symbols[1].id);
+        assert!(ctx
+            .symbols
+            .iter()
+            .any(|symbol| symbol.file_path == "child/nested.rs"));
+        assert!(ctx.internal_edges.is_empty());
+        assert!(ctx.boundary_edges.is_empty());
     }
 
     #[test]
@@ -1605,6 +1731,7 @@ mod tests {
                 },
             ],
             symbols: vec![FileSetSymbol {
+                graph_id: "test".into(),
                 id: "function:a.py:fa".into(),
                 node_type: "function".into(),
                 name: "fa".into(),
@@ -1633,6 +1760,7 @@ mod tests {
             files: vec![],
             symbols: vec![
                 FileSetSymbol {
+                    graph_id: "test".into(),
                     id: "function:a.py:fa".into(),
                     node_type: "function".into(),
                     name: "fa".into(),
@@ -1641,6 +1769,7 @@ mod tests {
                     line_range: Some([1, 2]),
                 },
                 FileSetSymbol {
+                    graph_id: "test".into(),
                     id: "function:b.py:fb".into(),
                     node_type: "function".into(),
                     name: "fb".into(),
@@ -1671,6 +1800,7 @@ mod tests {
             boundary_edges: vec![],
         };
         let fetchable = vec![FileSetSourceTarget {
+            graph_id: "test".into(),
             id: "function:a.py:fa".into(),
             name: "fa".into(),
             node_type: "function".into(),
@@ -1689,6 +1819,7 @@ mod tests {
     fn slice_file_set_sources_guards_ids_dedups_numbers_and_caps_budget() {
         let targets = vec![
             FileSetSourceTarget {
+                graph_id: "test".into(),
                 id: "function:a.py:fa".into(),
                 name: "fa".into(),
                 node_type: "function".into(),
@@ -1696,6 +1827,7 @@ mod tests {
                 line_range: [2, 3],
             },
             FileSetSourceTarget {
+                graph_id: "test".into(),
                 id: "function:b.py:fb".into(),
                 name: "fb".into(),
                 node_type: "function".into(),
@@ -1781,8 +1913,9 @@ mod tests {
             nodes: vec![node("file:a.py", "file", "a.py", "配置加载模块")],
             edges: vec![],
         };
+        let catalog = catalog(g);
         let ctx = assemble_gen_context(
-            Some(&g),
+            catalog.root_snapshot(),
             "a.py",
             &["load".into(), "save".into()],
             &SharedContext::default(),
@@ -2072,7 +2205,8 @@ mod tests {
                 edge("function:a.py:caller", "function:b.py:encrypt", "contains"), // wrong type
             ],
         };
-        let targets = cross_file_targets(Some(&g), "a.py", &[]);
+        let catalog = catalog(g);
+        let targets = cross_file_targets(catalog.root_snapshot(), "a.py", &[]);
         let names: Vec<&str> = targets.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, vec!["encrypt", "sign"]);
         let enc = targets.iter().find(|t| t.name == "encrypt").unwrap();
@@ -2110,11 +2244,42 @@ mod tests {
                 "calls",
             )],
         };
-        let targets = cross_file_targets(Some(&g), "engine.py", &[]);
+        let catalog = catalog(g);
+        let targets = cross_file_targets(catalog.root_snapshot(), "engine.py", &[]);
         let names: Vec<&str> = targets.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, vec!["NewtonSchulzLowRankDecay"]);
         assert_eq!(targets[0].file_path, "alphagpt.py");
         assert_eq!(targets[0].line_range, [8, 67]);
+    }
+
+    #[test]
+    fn cross_file_targets_maps_nested_scope_paths_back_to_project_paths() {
+        let graph = KnowledgeGraph {
+            nodes: vec![
+                fn_node("function:src/main.rs:run", "run", "src/main.rs", [1, 4]),
+                fn_node(
+                    "function:src/helper.rs:help",
+                    "help",
+                    "src/helper.rs",
+                    [2, 3],
+                ),
+            ],
+            edges: vec![edge(
+                "function:src/main.rs:run",
+                "function:src/helper.rs:help",
+                "calls",
+            )],
+        };
+        let catalog = GraphCatalog::from_scoped_graphs_for_test(vec![("child".into(), graph)]);
+
+        let targets = cross_file_targets(
+            catalog.graph_for_file("child/src/main.rs"),
+            "child/src/main.rs",
+            &[],
+        );
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].file_path, "child/src/helper.rs");
     }
 
     #[test]
@@ -2134,7 +2299,8 @@ mod tests {
         };
         // Local function also named "helper" (roster) → cross-file helper excluded;
         // "encrypt" deduped to the first target (b.py).
-        let targets = cross_file_targets(Some(&g), "a.py", &["helper".to_string()]);
+        let catalog = catalog(g);
+        let targets = cross_file_targets(catalog.root_snapshot(), "a.py", &["helper".to_string()]);
         let names: Vec<&str> = targets.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, vec!["encrypt"]);
         assert_eq!(targets[0].file_path, "b.py");
