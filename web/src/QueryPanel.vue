@@ -5,12 +5,21 @@
 // projects the backend QueryMap before evidence/token deltas from the matching
 // query WebSocket, and turns only known E# citations into source navigation.
 // Switching files or scope vacuums the in-flight Q&A.
-import { computed, ref, watch, nextTick, onBeforeUnmount } from 'vue'
+import { computed, ref, watch, nextTick, onMounted, onBeforeUnmount } from 'vue'
 import { streamQuery, streamQueryFiles, type QueryStream } from './api'
 import type { CodeEvidenceRef, QueryFrame, QueryMap, QueryTrace } from './ghostTypes'
 import { EMPTY_QUERY_CONTEXT, type QueryContext } from './queryContext'
+import CodeEvidencePeek from './CodeEvidencePeek.vue'
 import QueryMapView from './QueryMapView.vue'
 import { queryAnswerEvidenceCitations, queryEvidenceById } from './queryEvidence'
+import {
+  QUERY_PEEK_STORAGE_KEY,
+  clampCodePeekWidth,
+  codePeekWidthBounds,
+  codePeekWidthFromPointer,
+  loadCodePeekWidth,
+  type QueryPresentation,
+} from './queryLayout'
 import {
   alignQueryTrace,
   appendCompletedQueryTurn,
@@ -35,6 +44,7 @@ const props = withDefaults(
     selectedCount?: number
     selectedPaths?: string[]
     allowWeb?: boolean
+    presentation?: QueryPresentation
   }>(),
   {
     ctx: () => EMPTY_QUERY_CONTEXT,
@@ -42,6 +52,7 @@ const props = withDefaults(
     selectedCount: 0,
     selectedPaths: () => [],
     allowWeb: true,
+    presentation: 'dock',
   },
 )
 // Visibility is owned by the parent (App) via the status-bar toggle — default
@@ -52,6 +63,8 @@ const emit = defineEmits<{
   toggleSelectionMode: []
   clearSelected: []
   openEvidence: [CodeEvidenceRef]
+  maximize: []
+  restore: []
 }>()
 
 type QueryScope = 'current' | 'selected'
@@ -64,9 +77,27 @@ const traceAnswerHtml = ref<string[]>([])
 const activeQuestion = ref('')
 const renderedEl = ref<HTMLElement | null>(null)
 const scope = ref<QueryScope>('current')
+const codePeekTarget = ref<CodeEvidenceRef | null>(null)
+const codePeekViewportWidth = ref(window.innerWidth)
+let codePeekPreferredWidth = loadCodePeekWidth(
+  localStorage.getItem(QUERY_PEEK_STORAGE_KEY),
+  codePeekViewportWidth.value,
+)
+const codePeekWidth = ref(codePeekPreferredWidth)
+const codePeekBounds = computed(() => codePeekWidthBounds(codePeekViewportWidth.value))
+const codePeekDragging = ref(false)
 let stream: QueryStream | null = null
 let requestGeneration = 0
 let requestSequence = 0
+
+interface CodePeekResize {
+  pointerId: number
+  startX: number
+  startWidth: number
+  startPreferredWidth: number
+}
+
+let codePeekResize: CodePeekResize | null = null
 
 const answer = computed(() => viewState.value.answer)
 const completedTurns = computed(() => trace.value?.turns ?? [])
@@ -141,8 +172,87 @@ function resetTrace(clearQuestion = true) {
   traceMaps.value = []
   traceAnswerHtml.value = []
   activeQuestion.value = ''
+  closeCodePeek()
   viewState.value = idleQueryState()
   if (clearQuestion) question.value = ''
+}
+
+function closeCodePeek(): void {
+  codePeekTarget.value = null
+}
+
+function startCodePeekResize(e: PointerEvent): void {
+  if (e.button !== 0 || codePeekResize) return
+  e.preventDefault()
+  codePeekResize = {
+    pointerId: e.pointerId,
+    startX: e.clientX,
+    startWidth: codePeekWidth.value,
+    startPreferredWidth: codePeekPreferredWidth,
+  }
+  codePeekDragging.value = true
+  const handle = e.currentTarget as HTMLElement
+  handle.setPointerCapture(e.pointerId)
+}
+
+function moveCodePeekResize(e: PointerEvent): void {
+  const resize = codePeekResize
+  if (!resize || resize.pointerId !== e.pointerId) return
+  const width = codePeekWidthFromPointer(
+    resize.startWidth,
+    resize.startX,
+    e.clientX,
+    codePeekViewportWidth.value,
+  )
+  codePeekPreferredWidth = width
+  codePeekWidth.value = width
+}
+
+function finishCodePeekResize(e: PointerEvent, persist: boolean): void {
+  const resize = codePeekResize
+  if (!resize || resize.pointerId !== e.pointerId) return
+  codePeekResize = null
+  codePeekDragging.value = false
+  if (persist) {
+    codePeekPreferredWidth = codePeekWidth.value
+    localStorage.setItem(QUERY_PEEK_STORAGE_KEY, String(codePeekWidth.value))
+  } else {
+    codePeekPreferredWidth = resize.startPreferredWidth
+    codePeekWidth.value = clampCodePeekWidth(
+      resize.startPreferredWidth,
+      codePeekViewportWidth.value,
+    )
+  }
+  const handle = e.currentTarget as HTMLElement
+  if (handle.hasPointerCapture(e.pointerId)) handle.releasePointerCapture(e.pointerId)
+}
+
+function endCodePeekResize(e: PointerEvent): void {
+  finishCodePeekResize(e, true)
+}
+
+function cancelCodePeekResize(e: PointerEvent): void {
+  finishCodePeekResize(e, false)
+}
+
+function loseCodePeekPointer(e: PointerEvent): void {
+  const resize = codePeekResize
+  if (!resize || resize.pointerId !== e.pointerId) return
+  codePeekResize = null
+  codePeekDragging.value = false
+  codePeekPreferredWidth = resize.startPreferredWidth
+  codePeekWidth.value = clampCodePeekWidth(
+    resize.startPreferredWidth,
+    codePeekViewportWidth.value,
+  )
+}
+
+function resizeCodePeekForViewport(): void {
+  codePeekViewportWidth.value = window.innerWidth
+  codePeekWidth.value = clampCodePeekWidth(
+    codePeekPreferredWidth,
+    codePeekViewportWidth.value,
+  )
 }
 
 function teardown() {
@@ -234,8 +344,20 @@ function acceptFrame(
 }
 
 function openEvidence(reference: CodeEvidenceRef) {
+  if (props.presentation === 'focus') {
+    codePeekTarget.value = { ...reference }
+    return
+  }
   emit('openEvidence', reference)
 }
+
+function handleEscape(): boolean {
+  if (props.presentation !== 'focus' || !codePeekTarget.value) return false
+  closeCodePeek()
+  return true
+}
+
+defineExpose({ handleEscape })
 
 function onAnswerClick(event: MouseEvent) {
   const target = event.target
@@ -321,14 +443,42 @@ function ask() {
   )
 }
 
-onBeforeUnmount(teardown)
+watch(
+  () => props.presentation,
+  (presentation) => {
+    if (presentation === 'focus') resizeCodePeekForViewport()
+    else {
+      codePeekResize = null
+      codePeekDragging.value = false
+      closeCodePeek()
+    }
+  },
+)
+
+onMounted(() => window.addEventListener('resize', resizeCodePeekForViewport))
+onBeforeUnmount(() => {
+  window.removeEventListener('resize', resizeCodePeekForViewport)
+  teardown()
+})
 </script>
 
 <template>
-  <section class="query-panel" :class="{ disabled: !path }">
+  <section
+    class="query-panel"
+    :class="{
+      disabled: !path,
+      focus: presentation === 'focus',
+      'peek-open': presentation === 'focus' && codePeekTarget,
+      'peek-dragging': codePeekDragging,
+    }"
+    :data-presentation="presentation"
+    data-testid="query-panel"
+  >
     <header class="query-head">
       <div class="query-head-left">
-        <span class="query-title">追问器{{ path ? '' : ' · 未激活' }}</span>
+        <span class="query-title">
+          追问器{{ path ? '' : ' · 未激活' }}{{ presentation === 'focus' ? ' · 专注' : '' }}
+        </span>
         <div class="query-scope" role="tablist" aria-label="追问范围">
           <button
             class="query-scope-btn"
@@ -379,10 +529,54 @@ onBeforeUnmount(teardown)
           清空
         </button>
         <button
+          v-if="presentation === 'dock'"
+          class="query-presentation-toggle"
+          type="button"
+          title="进入追问专注模式"
+          aria-label="进入追问专注模式"
+          @click="emit('maximize')"
+        >
+          <svg
+            width="13"
+            height="13"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M8 3H3v5M16 3h5v5M8 21H3v-5M16 21h5v-5" />
+          </svg>
+        </button>
+        <button
+          v-else
+          class="query-presentation-toggle"
+          type="button"
+          title="还原追问 dock"
+          aria-label="还原追问 dock"
+          @click="emit('restore')"
+        >
+          <svg
+            width="13"
+            height="13"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5" />
+          </svg>
+        </button>
+        <button
           class="query-collapse"
           type="button"
-          title="收起追问器"
-          aria-label="收起追问器"
+          title="关闭追问器"
+          aria-label="关闭追问器"
           @click="emit('close')"
         >
           <svg
@@ -402,7 +596,9 @@ onBeforeUnmount(teardown)
     </header>
     <div v-if="!path && scope === 'current'" class="query-vacuum">打开文件以启用追问</div>
     <template v-else>
-      <div class="query-answer" @click="onAnswerClick">
+      <div class="query-content">
+        <div class="query-answer" @click="onAnswerClick">
+          <div class="query-answer-content">
           <div
             v-if="streaming && statusText"
             class="query-status"
@@ -520,17 +716,41 @@ onBeforeUnmount(teardown)
           <p v-if="errorMsg" class="query-error">
             {{ answer ? `回答中断：${errorMsg}` : errorMsg }}
           </p>
+          </div>
         </div>
-        <form class="query-form" @submit.prevent="ask">
-          <input
-            v-model="question"
-            class="query-input"
-            :placeholder="scope === 'selected' ? '追问已选文件…' : '追问当前文件…'"
-            :disabled="streaming"
-          />
-          <button class="query-send" type="submit" :disabled="!canAsk">
-            {{ streaming ? '…' : '追问' }}
-          </button>
+        <div
+          v-if="presentation === 'focus' && codePeekTarget"
+          class="query-peek-resizer"
+          role="separator"
+          aria-label="调整代码证据预览宽度"
+          aria-orientation="vertical"
+          :aria-valuemin="codePeekBounds.min"
+          :aria-valuemax="codePeekBounds.max"
+          :aria-valuenow="codePeekWidth"
+          @pointerdown="startCodePeekResize"
+          @pointermove="moveCodePeekResize"
+          @pointerup="endCodePeekResize"
+          @pointercancel="cancelCodePeekResize"
+          @lostpointercapture="loseCodePeekPointer"
+        ></div>
+        <div
+          v-if="presentation === 'focus' && codePeekTarget"
+          class="query-peek-pane"
+          :style="{ width: codePeekWidth + 'px' }"
+        >
+          <CodeEvidencePeek :target="codePeekTarget" @close="closeCodePeek" />
+        </div>
+      </div>
+      <form class="query-form" @submit.prevent="ask">
+        <input
+          v-model="question"
+          class="query-input"
+          :placeholder="scope === 'selected' ? '追问已选文件…' : '追问当前文件…'"
+          :disabled="streaming"
+        />
+        <button class="query-send" type="submit" :disabled="!canAsk">
+          {{ streaming ? '…' : '追问' }}
+        </button>
       </form>
     </template>
   </section>

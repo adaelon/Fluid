@@ -18,6 +18,7 @@ import {
   loadQueryDockHeight,
   queryDockHeightBounds,
   queryDockHeightFromPointer,
+  type QueryPresentation,
 } from './queryLayout'
 
 type OpenFile = { path: string; lang: string; source: string }
@@ -91,6 +92,16 @@ watch(
 // the code area until the user opens it from the status-bar 「💬 追问」 toggle
 // (S10b dock revision). Sticky across file switches; auto-hidden when no file.
 const queryPanelOpen = ref(false)
+const queryPresentation = ref<QueryPresentation>('dock')
+const queryFocusActive = computed(
+  () => queryPanelOpen.value && Boolean(current.value) && queryPresentation.value === 'focus',
+)
+
+interface QueryPanelHandle {
+  handleEscape(): boolean
+}
+
+const queryPanelComponent = ref<QueryPanelHandle | null>(null)
 
 // S-QDOCK-1: App owns the dock geometry so opening/closing the panel does not
 // discard the last user-selected size. The preferred value survives temporary
@@ -187,6 +198,35 @@ function resizeQueryDockForViewport(): void {
   )
 }
 
+function maximizeQueryPanel(): void {
+  if (!queryPanelOpen.value || !current.value) return
+  queryPresentation.value = 'focus'
+}
+
+function restoreQueryDock(): void {
+  queryPresentation.value = 'dock'
+}
+
+function closeQueryPanel(): void {
+  queryPresentation.value = 'dock'
+  queryPanelOpen.value = false
+}
+
+function toggleQueryPanel(): void {
+  if (queryPanelOpen.value) closeQueryPanel()
+  else {
+    queryPresentation.value = 'dock'
+    queryPanelOpen.value = true
+  }
+}
+
+watch(
+  () => current.value,
+  (file) => {
+    if (!file) closeQueryPanel()
+  },
+)
+
 // LLM backend settings modal (U5b, ADR-0018), opened from the activity-bar gear.
 const settingsOpen = ref(false)
 
@@ -226,7 +266,7 @@ const paletteItems = computed<PaletteItem[]>(() => {
       cmds.push({
         id: 'toggle-query',
         label: '切换追问器',
-        run: () => (queryPanelOpen.value = !queryPanelOpen.value),
+        run: toggleQueryPanel,
       })
     }
     if (activePath.value) {
@@ -241,6 +281,15 @@ const paletteItems = computed<PaletteItem[]>(() => {
 // Global shortcut: Ctrl/Cmd+P opens quick-open, +Shift opens the command palette.
 // preventDefault stops the browser's native print/quick-find on those chords.
 function onGlobalKey(e: KeyboardEvent) {
+  if (e.key === 'Escape' && queryFocusActive.value) {
+    // Settings and command palette own Escape while their higher layers are open.
+    if (settingsOpen.value || paletteMode.value) return
+    e.preventDefault()
+    e.stopImmediatePropagation()
+    if (queryPanelComponent.value?.handleEscape()) return
+    restoreQueryDock()
+    return
+  }
   if (!(e.ctrlKey || e.metaKey)) return
   if (e.key.toLowerCase() === 'p') {
     e.preventDefault()
@@ -279,7 +328,7 @@ function endResize(e: PointerEvent): void {
 }
 
 onMounted(async () => {
-  window.addEventListener('keydown', onGlobalKey)
+  window.addEventListener('keydown', onGlobalKey, true)
   window.addEventListener('resize', resizeQueryDockForViewport)
   try {
     files.value = await fetchTree()
@@ -296,7 +345,7 @@ onMounted(async () => {
   }
 })
 onBeforeUnmount(() => {
-  window.removeEventListener('keydown', onGlobalKey)
+  window.removeEventListener('keydown', onGlobalKey, true)
   window.removeEventListener('resize', resizeQueryDockForViewport)
 })
 
@@ -392,7 +441,11 @@ function closeTab(path: string) {
 
 <template>
   <div class="ide-shell">
-    <div class="ide-body">
+    <div
+      class="ide-body"
+      :aria-hidden="queryFocusActive ? 'true' : undefined"
+      :inert="queryFocusActive"
+    >
       <ActivityBar @open-settings="settingsOpen = true" />
       <aside class="sidebar" :style="{ width: sidebarWidth + 'px' }">
         <div class="sidebar-title">资源管理器</div>
@@ -460,11 +513,16 @@ function closeTab(path: string) {
     </div>
     <div
       v-if="queryPanelOpen && current"
-      class="query-dock"
-      :class="{ dragging: queryDockDragging }"
-      :style="{ height: queryDockHeight + 'px' }"
+      class="query-surface"
+      :class="{
+        'query-dock': queryPresentation === 'dock',
+        'query-focus-shell': queryPresentation === 'focus',
+        dragging: queryPresentation === 'dock' && queryDockDragging,
+      }"
+      :style="queryPresentation === 'dock' ? { height: queryDockHeight + 'px' } : undefined"
     >
       <div
+        v-show="queryPresentation === 'dock'"
         class="query-dock-resizer"
         role="separator"
         aria-label="调整追问器高度"
@@ -479,13 +537,17 @@ function closeTab(path: string) {
         @lostpointercapture="loseQueryDockPointer"
       ></div>
       <QueryPanel
+        ref="queryPanelComponent"
         :path="current.path"
         :ctx="queryCtx"
         :selection-mode="fileSelectionMode"
         :selected-count="selectedFileCount"
         :selected-paths="selectedFilePathList"
         :allow-web="allowWeb"
-        @close="queryPanelOpen = false"
+        :presentation="queryPresentation"
+        @close="closeQueryPanel"
+        @maximize="maximizeQueryPanel"
+        @restore="restoreQueryDock"
         @toggle-selection-mode="fileSelectionMode = !fileSelectionMode"
         @clear-selected="clearSelectedFiles"
         @open-evidence="openCodeEvidence"
@@ -496,7 +558,9 @@ function closeTab(path: string) {
       :lang="current?.lang ?? null"
       :progress="genProgress"
       :query-open="queryPanelOpen"
-      @toggle-query="queryPanelOpen = !queryPanelOpen"
+      :aria-hidden="queryFocusActive ? 'true' : undefined"
+      :inert="queryFocusActive"
+      @toggle-query="toggleQueryPanel"
     />
     <SettingsModal
       v-if="settingsOpen"
