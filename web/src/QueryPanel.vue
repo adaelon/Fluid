@@ -7,11 +7,11 @@
 // Switching files or scope vacuums the in-flight Q&A.
 import { computed, ref, watch, nextTick, onMounted, onBeforeUnmount } from 'vue'
 import { streamQuery, streamQueryFiles, type QueryStream } from './api'
-import type { CodeEvidenceRef, QueryFrame, QueryMap, QueryTrace } from './ghostTypes'
+import type { CodeEvidenceRef, QueryFrame, QueryTrace } from './ghostTypes'
 import { EMPTY_QUERY_CONTEXT, type QueryContext } from './queryContext'
 import CodeEvidencePeek from './CodeEvidencePeek.vue'
 import QueryMapView from './QueryMapView.vue'
-import { queryAnswerEvidenceCitations, queryEvidenceById } from './queryEvidence'
+import { queryAnswerEvidenceCitations } from './queryEvidence'
 import {
   QUERY_PEEK_STORAGE_KEY,
   clampCodePeekWidth,
@@ -21,6 +21,20 @@ import {
   type QueryPresentation,
 } from './queryLayout'
 import {
+  activeQueryTurnSelection,
+  appendQueryTurnPresentationSnapshot,
+  completedQueryTurnSelection,
+  defaultQueryTurnSelection,
+  normalizeQueryTurnSelection,
+  queryTurnEvidenceById,
+  queryTurnSelectionFromKey,
+  queryTurnSelectionKey,
+  resetQueryTurnPresentation,
+  setQueryTurnAnswerHtml,
+  type QueryTurnPresentationSnapshot,
+  type QueryTurnSelection,
+} from './queryPresentation'
+import {
   alignQueryTrace,
   appendCompletedQueryTurn,
   currentQueryScope,
@@ -29,6 +43,7 @@ import {
   selectedQueryScope,
   startQueryRequest,
   startQueryTrace,
+  type QueryEvidenceState,
   type QueryScopeIdentity,
 } from './queryState'
 // S11-lazy: markdown-it / DOMPurify / KaTeX (+ its CSS) are heavy and only needed
@@ -72,8 +87,8 @@ type QueryScope = 'current' | 'selected'
 const question = ref('')
 const viewState = ref(idleQueryState())
 const trace = ref<QueryTrace | null>(null)
-const traceMaps = ref<QueryMap[]>([])
-const traceAnswerHtml = ref<string[]>([])
+const traceSnapshots = ref<QueryTurnPresentationSnapshot[]>([])
+const selectedTurn = ref<QueryTurnSelection>(null)
 const activeQuestion = ref('')
 const renderedEl = ref<HTMLElement | null>(null)
 const scope = ref<QueryScope>('current')
@@ -89,6 +104,8 @@ const codePeekDragging = ref(false)
 let stream: QueryStream | null = null
 let requestGeneration = 0
 let requestSequence = 0
+let answerRenderGeneration = 0
+let mathRenderGeneration = 0
 
 interface CodePeekResize {
   pointerId: number
@@ -104,18 +121,22 @@ const completedTurns = computed(() => trace.value?.turns ?? [])
 const streaming = computed(() => viewState.value.mode === 'streaming')
 const errorMsg = computed(() => viewState.value.errorMessage)
 const evidenceState = computed(() => viewState.value.evidence)
+const hasActiveTurn = computed(
+  () => Boolean(activeQuestion.value) && (streaming.value || Boolean(errorMsg.value)),
+)
 const activeUnknownEvidenceIds = computed(() => {
   const map = viewState.value.map
   return map ? queryAnswerEvidenceCitations(answer.value, map.evidence).unknownIds : []
 })
 const traceUnknownEvidenceIds = computed(() =>
   completedTurns.value.map((turn, index) => {
-    const map = traceMaps.value[index]
+    const map = traceSnapshots.value[index]?.map
     return map ? queryAnswerEvidenceCitations(turn.answer, map.evidence).unknownIds : []
   }),
 )
-const evidenceDisplay = computed(() => {
-  switch (evidenceState.value?.status) {
+
+function evidenceDisplayFor(evidence: QueryEvidenceState | null) {
+  switch (evidence?.status) {
     case 'project-source':
       return { label: '项目源码', tone: 'project' }
     case 'web-cited':
@@ -125,7 +146,9 @@ const evidenceDisplay = computed(() => {
     default:
       return { label: '未核验', tone: 'unverified' }
   }
-})
+}
+
+const evidenceDisplay = computed(() => evidenceDisplayFor(evidenceState.value))
 const statusText = computed(() => {
   switch (viewState.value.phase) {
     case 'connecting':
@@ -165,12 +188,57 @@ const canAsk = computed(() => {
   if (scope.value === 'current') return Boolean(props.path && currentOrientationId.value)
   return selectedReady.value
 })
+const focusedSelection = computed(() =>
+  normalizeQueryTurnSelection(
+    selectedTurn.value,
+    completedTurns.value.length,
+    hasActiveTurn.value,
+  ),
+)
+const focusedSelectionKey = computed(() => queryTurnSelectionKey(focusedSelection.value))
+const focusedIsActive = computed(() => focusedSelection.value?.kind === 'active')
+const focusedCompletedIndex = computed(() =>
+  focusedSelection.value?.kind === 'completed' ? focusedSelection.value.index : null,
+)
+const focusedCompletedTurn = computed(() => {
+  const index = focusedCompletedIndex.value
+  return index === null ? null : completedTurns.value[index] ?? null
+})
+const focusedSnapshot = computed(() => {
+  const index = focusedCompletedIndex.value
+  return index === null ? null : traceSnapshots.value[index] ?? null
+})
+const focusedQuestion = computed(() =>
+  focusedIsActive.value ? activeQuestion.value : focusedCompletedTurn.value?.question ?? '',
+)
+const focusedAnswer = computed(() =>
+  focusedIsActive.value ? answer.value : focusedCompletedTurn.value?.answer ?? '',
+)
+const focusedAnswerHtml = computed(() =>
+  focusedIsActive.value ? '' : focusedSnapshot.value?.answerHtml ?? '',
+)
+const focusedMap = computed(() =>
+  focusedIsActive.value ? viewState.value.map : focusedSnapshot.value?.map ?? null,
+)
+const focusedEvidence = computed(() =>
+  focusedIsActive.value ? evidenceState.value : focusedSnapshot.value?.evidence ?? null,
+)
+const focusedEvidenceDisplay = computed(() => evidenceDisplayFor(focusedEvidence.value))
+const focusedUnknownEvidenceIds = computed(() => {
+  if (focusedIsActive.value) return activeUnknownEvidenceIds.value
+  const index = focusedCompletedIndex.value
+  return index === null ? [] : traceUnknownEvidenceIds.value[index] ?? []
+})
+const hasFocusHistory = computed(() => completedTurns.value.length > 0 || hasActiveTurn.value)
 
 function resetTrace(clearQuestion = true) {
   teardown()
+  answerRenderGeneration++
+  mathRenderGeneration++
   trace.value = null
-  traceMaps.value = []
-  traceAnswerHtml.value = []
+  const presentation = resetQueryTurnPresentation()
+  selectedTurn.value = presentation.selection
+  traceSnapshots.value = presentation.snapshots
   activeQuestion.value = ''
   closeCodePeek()
   viewState.value = idleQueryState()
@@ -274,29 +342,17 @@ watch(
   },
 )
 
-// On `done`, render every completed Markdown answer (ADR-0008): markdown-it
-// escapes raw HTML, DOMPurify is defense-in-depth, then KaTeX transforms math.
-async function renderTraceAnswers(
-  generation: number,
-  turns: QueryTrace['turns'],
-  maps: QueryMap[],
-) {
-  // Pull the render libs on demand (S11-lazy). The CSS import is a side effect
-  // (injects KaTeX styles) — its module value is unused.
-  const [{ renderQueryMarkdown }, { default: DOMPurify }, { default: renderMathInElement }] =
-    await Promise.all([
-      import('./render/markdown'),
-      import('dompurify'),
-      import('katex/contrib/auto-render'),
-      import('katex/dist/katex.min.css'),
-  ])
-  if (generation !== requestGeneration) return
-  traceAnswerHtml.value = turns.map((turn, index) =>
-    DOMPurify.sanitize(renderQueryMarkdown(turn.answer, maps[index]?.evidence ?? [])),
-  )
+async function renderVisibleMath(): Promise<void> {
+  const generation = ++mathRenderGeneration
   await nextTick()
-  if (generation !== requestGeneration || !renderedEl.value) return
-  renderMathInElement(renderedEl.value, {
+  const element = renderedEl.value
+  if (!element?.querySelector('.query-answer-md')) return
+  const [{ default: renderMathInElement }] = await Promise.all([
+    import('katex/contrib/auto-render'),
+    import('katex/dist/katex.min.css'),
+  ])
+  if (generation !== mathRenderGeneration || renderedEl.value !== element) return
+  renderMathInElement(element, {
     delimiters: [
       { left: '$$', right: '$$', display: true },
       { left: '$', right: '$', display: false },
@@ -305,6 +361,30 @@ async function renderTraceAnswers(
     ],
     throwOnError: false,
   })
+}
+
+// On `done`, render every completed Markdown answer once into its presentation
+// snapshot. KaTeX is applied only to the currently mounted dock/focus view.
+async function renderTraceAnswers(
+  turns: QueryTrace['turns'],
+  snapshots: QueryTurnPresentationSnapshot[],
+): Promise<void> {
+  const generation = ++answerRenderGeneration
+  // Pull the render libs on demand (S11-lazy). The CSS import is a side effect
+  // performed by renderVisibleMath when a rendered answer is actually mounted.
+  const [{ renderQueryMarkdown }, { default: DOMPurify }] = await Promise.all([
+    import('./render/markdown'),
+    import('dompurify'),
+  ])
+  if (generation !== answerRenderGeneration) return
+  const htmlByTurn = turns.map((turn, index) =>
+    DOMPurify.sanitize(
+      renderQueryMarkdown(turn.answer, snapshots[index]?.map.evidence ?? []),
+    ),
+  )
+  if (generation !== answerRenderGeneration) return
+  traceSnapshots.value = setQueryTurnAnswerHtml(snapshots, htmlByTurn)
+  await renderVisibleMath()
 }
 
 function acceptFrame(
@@ -334,10 +414,15 @@ function acceptFrame(
       citations.knownIds,
     )
     trace.value = completed
-    const maps = [...traceMaps.value, next.map]
-    traceMaps.value = maps
+    const snapshots = appendQueryTurnPresentationSnapshot(
+      traceSnapshots.value,
+      next.map,
+      next.evidence,
+    )
+    traceSnapshots.value = snapshots
     activeQuestion.value = ''
-    void renderTraceAnswers(generation, completed.turns, maps)
+    selectedTurn.value = defaultQueryTurnSelection(completed.turns.length, false)
+    void renderTraceAnswers(completed.turns, snapshots)
   } else if (frame.kind === 'error') {
     stream = null
   }
@@ -370,11 +455,39 @@ function onAnswerClick(event: MouseEvent) {
   const turn = anchor.closest<HTMLElement>('[data-query-turn-index]')
   const index = Number(turn?.dataset.queryTurnIndex)
   if (!Number.isInteger(index)) return
-  const map = traceMaps.value[index]
-  const reference = map && queryEvidenceById(map.evidence, href.slice(prefix.length))
+  const reference = queryTurnEvidenceById(
+    traceSnapshots.value,
+    index,
+    href.slice(prefix.length),
+  )
   if (!reference) return
   event.preventDefault()
   openEvidence(reference)
+}
+
+function selectFocusedTurn(selection: QueryTurnSelection): void {
+  if (!selection) return
+  if (queryTurnSelectionKey(selection) !== focusedSelectionKey.value) closeCodePeek()
+  selectedTurn.value = selection
+}
+
+function selectCompletedTurn(index: number): void {
+  selectFocusedTurn(completedQueryTurnSelection(index, completedTurns.value.length))
+}
+
+function selectActiveTurn(): void {
+  if (hasActiveTurn.value) selectFocusedTurn(activeQueryTurnSelection())
+}
+
+function selectTurnFromPicker(event: Event): void {
+  const value = (event.currentTarget as HTMLSelectElement).value
+  selectFocusedTurn(
+    queryTurnSelectionFromKey(
+      value,
+      completedTurns.value.length,
+      hasActiveTurn.value,
+    ),
+  )
 }
 
 function newTrace() {
@@ -393,6 +506,8 @@ function ask() {
       }
       return
     }
+    selectedTurn.value = activeQueryTurnSelection()
+    closeCodePeek()
     const identity = { ...scopeIdentity.value }
     const requestTrace =
       alignQueryTrace(trace.value, identity) ?? startQueryTrace(identity, q)
@@ -417,6 +532,8 @@ function ask() {
     return
   }
   if (!props.path || !currentOrientationId.value) return
+  selectedTurn.value = activeQueryTurnSelection()
+  closeCodePeek()
   const identity = { ...scopeIdentity.value }
   const requestTrace = alignQueryTrace(trace.value, identity) ?? startQueryTrace(identity, q)
   trace.value = requestTrace
@@ -446,7 +563,13 @@ function ask() {
 watch(
   () => props.presentation,
   (presentation) => {
-    if (presentation === 'focus') resizeCodePeekForViewport()
+    if (presentation === 'focus') {
+      selectedTurn.value = defaultQueryTurnSelection(
+        completedTurns.value.length,
+        hasActiveTurn.value,
+      )
+      resizeCodePeekForViewport()
+    }
     else {
       codePeekResize = null
       codePeekDragging.value = false
@@ -455,9 +578,17 @@ watch(
   },
 )
 
+watch(
+  () => [props.presentation, focusedSelectionKey.value] as const,
+  () => void renderVisibleMath(),
+  { flush: 'post' },
+)
+
 onMounted(() => window.addEventListener('resize', resizeCodePeekForViewport))
 onBeforeUnmount(() => {
   window.removeEventListener('resize', resizeCodePeekForViewport)
+  answerRenderGeneration++
+  mathRenderGeneration++
   teardown()
 })
 </script>
@@ -597,7 +728,229 @@ onBeforeUnmount(() => {
     <div v-if="!path && scope === 'current'" class="query-vacuum">打开文件以启用追问</div>
     <template v-else>
       <div class="query-content">
-        <div class="query-answer" @click="onAnswerClick">
+        <template v-if="presentation === 'focus'">
+          <nav v-if="hasFocusHistory" class="query-turn-history" aria-label="问题历史">
+            <div class="query-turn-history-head">
+              <strong>问题历史</strong>
+              <span>{{ completedTurns.length + (hasActiveTurn ? 1 : 0) }} 轮</span>
+            </div>
+            <div class="query-turn-history-list">
+              <button
+                v-for="(turn, index) in completedTurns"
+                :key="index"
+                class="query-turn-history-item"
+                :class="{ selected: focusedCompletedIndex === index }"
+                type="button"
+                :aria-current="focusedCompletedIndex === index ? 'true' : undefined"
+                @click="selectCompletedTurn(index)"
+              >
+                <span class="query-turn-history-label">问 {{ index + 1 }}</span>
+                <span class="query-turn-history-question">{{ turn.question }}</span>
+              </button>
+              <button
+                v-if="hasActiveTurn"
+                class="query-turn-history-item active-turn"
+                :class="{ selected: focusedIsActive }"
+                type="button"
+                :aria-current="focusedIsActive ? 'true' : undefined"
+                @click="selectActiveTurn"
+              >
+                <span class="query-turn-history-label">
+                  {{ streaming ? '回答中' : '已中断' }}
+                </span>
+                <span class="query-turn-history-question">{{ activeQuestion }}</span>
+              </button>
+            </div>
+          </nav>
+
+          <div class="query-focus-reader">
+            <label v-if="hasFocusHistory" class="query-turn-picker">
+              <span>问题历史</span>
+              <select :value="focusedSelectionKey" @change="selectTurnFromPicker">
+                <option
+                  v-for="(turn, index) in completedTurns"
+                  :key="index"
+                  :value="`completed:${index}`"
+                >
+                  问 {{ index + 1 }} · {{ turn.question }}
+                </option>
+                <option v-if="hasActiveTurn" value="active">
+                  {{ streaming ? '回答中' : '已中断' }} · {{ activeQuestion }}
+                </option>
+              </select>
+            </label>
+
+            <div ref="renderedEl" class="query-answer" @click="onAnswerClick">
+              <div class="query-answer-content">
+                <article
+                  v-if="focusedSelection"
+                  class="query-focus-turn"
+                  :class="{ active: focusedIsActive }"
+                  :data-query-turn-index="focusedCompletedIndex ?? undefined"
+                >
+                  <header class="query-focus-question">
+                    <span class="query-focus-eyebrow">
+                      {{
+                        focusedIsActive
+                          ? streaming
+                            ? '正在回答'
+                            : '回答中断'
+                          : `问题 ${(focusedCompletedIndex ?? 0) + 1}`
+                      }}
+                    </span>
+                    <h2>{{ focusedQuestion }}</h2>
+                  </header>
+
+                  <div
+                    v-if="focusedIsActive && streaming && statusText"
+                    class="query-status"
+                    :class="{ fallback: viewState.phase === 'fallback' }"
+                    role="status"
+                  >
+                    <span
+                      v-if="viewState.phase !== 'fallback'"
+                      class="query-status-spinner"
+                      aria-hidden="true"
+                    ></span>
+                    <span>{{ statusText }}</span>
+                  </div>
+
+                  <template v-if="focusedIsActive">
+                    <QueryMapView
+                      v-if="focusedMap"
+                      :map="focusedMap"
+                      @open-evidence="openEvidence"
+                    />
+                    <div v-if="focusedEvidence" class="query-evidence-block">
+                      <div class="query-evidence-summary">
+                        <span
+                          class="query-evidence-badge"
+                          :class="`tone-${focusedEvidenceDisplay.tone}`"
+                        >
+                          {{ focusedEvidenceDisplay.label }}
+                        </span>
+                        <span v-if="focusedEvidence.sources.length" class="query-source-count">
+                          {{ focusedEvidence.sources.length }} 个来源
+                        </span>
+                      </div>
+                      <ul v-if="focusedEvidence.sources.length" class="query-sources">
+                        <li v-for="source in focusedEvidence.sources" :key="source.url">
+                          <a :href="source.url" target="_blank" rel="noopener noreferrer">
+                            {{ source.title }}
+                          </a>
+                        </li>
+                      </ul>
+                      <p
+                        v-else-if="focusedEvidence.status === 'web-uncited'"
+                        class="query-warning"
+                      >
+                        供应商返回了联网整理内容，但没有可追溯 URL。
+                      </p>
+                      <p
+                        v-else-if="
+                          focusedEvidence.status === 'unverified' && !focusedEvidence.warning
+                        "
+                        class="query-warning"
+                      >
+                        本次回答仅依据本地上下文，未由外部来源核验。
+                      </p>
+                      <p v-if="focusedEvidence.warning" class="query-warning">
+                        {{ focusedEvidence.warning }}
+                      </p>
+                    </div>
+                  </template>
+
+                  <div v-if="focusedAnswer" class="query-focus-answer">
+                    <div
+                      v-if="focusedAnswerHtml"
+                      class="query-answer-md"
+                      v-html="focusedAnswerHtml"
+                    ></div>
+                    <div v-else class="query-answer-plain">{{ focusedAnswer }}</div>
+                  </div>
+
+                  <details
+                    v-if="!focusedIsActive && (focusedMap || focusedEvidence)"
+                    :key="`query-support-${focusedCompletedIndex}`"
+                    class="query-focus-support"
+                  >
+                    <summary>
+                      <span>方向图与证据</span>
+                      <small>展开核验</small>
+                    </summary>
+                    <div class="query-focus-support-body">
+                      <QueryMapView
+                        v-if="focusedMap"
+                        :map="focusedMap"
+                        @open-evidence="openEvidence"
+                      />
+                      <div v-if="focusedEvidence" class="query-evidence-block">
+                        <div class="query-evidence-summary">
+                          <span
+                            class="query-evidence-badge"
+                            :class="`tone-${focusedEvidenceDisplay.tone}`"
+                          >
+                            {{ focusedEvidenceDisplay.label }}
+                          </span>
+                          <span v-if="focusedEvidence.sources.length" class="query-source-count">
+                            {{ focusedEvidence.sources.length }} 个来源
+                          </span>
+                        </div>
+                        <ul v-if="focusedEvidence.sources.length" class="query-sources">
+                          <li v-for="source in focusedEvidence.sources" :key="source.url">
+                            <a :href="source.url" target="_blank" rel="noopener noreferrer">
+                              {{ source.title }}
+                            </a>
+                          </li>
+                        </ul>
+                        <p
+                          v-else-if="focusedEvidence.status === 'web-uncited'"
+                          class="query-warning"
+                        >
+                          供应商返回了联网整理内容，但没有可追溯 URL。
+                        </p>
+                        <p
+                          v-else-if="
+                            focusedEvidence.status === 'unverified' && !focusedEvidence.warning
+                          "
+                          class="query-warning"
+                        >
+                          本次回答仅依据本地上下文，未由外部来源核验。
+                        </p>
+                        <p v-if="focusedEvidence.warning" class="query-warning">
+                          {{ focusedEvidence.warning }}
+                        </p>
+                      </div>
+                    </div>
+                  </details>
+
+                  <p v-if="focusedUnknownEvidenceIds.length" class="query-warning" role="alert">
+                    回答引用了未知代码证据：{{ focusedUnknownEvidenceIds.join('、') }}。
+                    这些编号不可跳转。
+                  </p>
+                  <p v-if="focusedIsActive && errorMsg" class="query-error">
+                    {{ focusedAnswer ? `回答中断：${errorMsg}` : errorMsg }}
+                  </p>
+                </article>
+
+                <div v-else class="query-focus-empty">
+                  <span v-if="scope === 'selected'" class="query-hint">
+                    {{ selectedScopeHint }}
+                  </span>
+                  <span v-else-if="!currentOrientationId" class="query-hint">
+                    文件定向完成后可追问当前文件
+                  </span>
+                  <span v-else class="query-hint">
+                    就当前文件提问，例如「这个文件做什么？」
+                  </span>
+                  <p v-if="errorMsg" class="query-error">{{ errorMsg }}</p>
+                </div>
+              </div>
+            </div>
+          </div>
+        </template>
+
+        <div v-else ref="renderedEl" class="query-answer" @click="onAnswerClick">
           <div class="query-answer-content">
           <div
             v-if="streaming && statusText"
@@ -645,7 +998,7 @@ onBeforeUnmount(() => {
             </p>
           </div>
 
-          <div v-if="completedTurns.length" ref="renderedEl" class="query-turn-list">
+          <div v-if="completedTurns.length" class="query-turn-list">
             <article
               v-for="(turn, index) in completedTurns"
               :key="index"
@@ -658,18 +1011,18 @@ onBeforeUnmount(() => {
               </div>
               <QueryMapView
                 v-if="
-                  traceMaps[index] &&
+                  traceSnapshots[index]?.map &&
                   !(viewState.mode === 'done' && index === completedTurns.length - 1)
                 "
-                :map="traceMaps[index]"
+                :map="traceSnapshots[index].map"
                 @open-evidence="openEvidence"
               />
               <div class="query-turn-answer">
                 <span class="query-turn-label">答</span>
                 <div
-                  v-if="traceAnswerHtml[index]"
+                  v-if="traceSnapshots[index]?.answerHtml"
                   class="query-answer-md"
-                  v-html="traceAnswerHtml[index]"
+                  v-html="traceSnapshots[index].answerHtml"
                 ></div>
                   <div v-else class="query-answer-plain">{{ turn.answer }}</div>
               </div>
