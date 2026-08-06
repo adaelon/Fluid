@@ -14,6 +14,7 @@ mod orientation;
 mod project_reader;
 mod routes;
 mod settings;
+mod startup;
 mod static_assets;
 mod translate;
 // S-WEB-1 intentionally lands the stable protocol layer before S-WEB-2 adds
@@ -21,7 +22,6 @@ mod translate;
 #[allow(dead_code)]
 mod web_evidence;
 
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -31,7 +31,10 @@ use cache_store::CacheStore;
 use graph_loader::GraphCatalog;
 use project_reader::ProjectReader;
 use routes::AppState;
+#[cfg(windows)]
+use settings::windows_env_path;
 use settings::LlmConfig;
+use startup::{select_listener, StartupSelection};
 
 /// Prompt template version — bump when the generation prompt changes (invalidates
 /// cache, ADR-0003). The model version is now the real model id (S6); both feed the
@@ -45,38 +48,75 @@ struct Args {
     /// project and pick one from the UI (Open Folder).
     project: Option<PathBuf>,
 
-    /// Port to bind on 127.0.0.1.
-    #[arg(long, default_value_t = 7878)]
-    port: u16,
+    /// Port to bind on 127.0.0.1. When omitted, Fluid reuses a compatible server
+    /// on 7878 or selects a free port if another program owns 7878.
+    #[arg(long)]
+    port: Option<u16>,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    // Load `.env` (LLM config) from the CWD/ancestors into the process env before
-    // any env read. Real environment variables take precedence (dotenvy default).
-    // Run fluid from its own repo root, not from inside a served project that has
-    // its own .env. Absent .env is fine (env vars alone still work).
-    // Capture the resolved `.env` path so the settings panel (U5a) can write
-    // changes back to the same file. When absent, default to `.env` in the CWD.
+#[cfg(windows)]
+fn load_llm_config() -> anyhow::Result<(PathBuf, LlmConfig)> {
+    let local_app_data = std::env::var_os("LOCALAPPDATA");
+    let env_path = windows_env_path(local_app_data.as_deref())?;
+    let config = match LlmConfig::from_env_file(&env_path) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!(
+                "warning: Fluid config is unreadable ({}): {error}; using explicit environment variables/defaults",
+                env_path.display()
+            );
+            LlmConfig::from_env()
+        }
+    };
+    println!("Fluid config: {}", env_path.display());
+    Ok((env_path, config))
+}
+
+#[cfg(not(windows))]
+fn load_llm_config() -> anyhow::Result<(PathBuf, LlmConfig)> {
+    // Preserve the existing non-Windows behavior: search CWD/ancestors and load
+    // the first `.env`, while explicit process variables retain precedence.
     let env_path = match dotenvy::dotenv() {
         Ok(path) => {
             println!("Loaded .env: {}", path.display());
             path
         }
-        Err(e) if e.not_found() => PathBuf::from(".env"),
-        Err(e) => {
-            eprintln!("warning: .env present but unreadable: {e}");
+        Err(error) if error.not_found() => PathBuf::from(".env"),
+        Err(error) => {
+            eprintln!("warning: .env present but unreadable: {error}");
             PathBuf::from(".env")
         }
     };
+    Ok((env_path, LlmConfig::from_env()))
+}
 
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    let startup = select_listener(args.port).await?;
+    let (listener, url) = match startup {
+        StartupSelection::Reuse { url } => {
+            println!("Fluid 已在运行,复用现有实例 → {url}");
+            if let Some(project) = args.project.as_deref() {
+                startup::handoff_project(&url, project).await?;
+                println!("已将项目交给现有实例: {}", project.display());
+            }
+            let _ = open::that(&url);
+            return Ok(());
+        }
+        StartupSelection::Serve(server) => {
+            if let Some(port) = server.fallback_from {
+                println!("默认端口 {port} 已被其他程序占用,Fluid 改用 {}", server.url);
+            }
+            (server.listener, server.url)
+        }
+    };
+    let (env_path, llm_config) = load_llm_config()?;
 
     // The model id drives both the LLM call and the cache key, so they stay in
     // lock-step (a model switch invalidates the cache). All three values live in a
     // runtime-editable LlmConfig (U5a, ADR-0018); env-overridable, default glm-5.1
     // via the opencode zen gateway (S6 decision, see docs/代码链路.md).
-    let llm_config = LlmConfig::from_env();
     if llm_config.key_set() {
         println!("LLM proxy ready: model {}", llm_config.model);
     } else {
@@ -140,9 +180,6 @@ async fn main() -> anyhow::Result<()> {
 
     let app = routes::router(Arc::new(state));
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], args.port));
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    let url = format!("http://{addr}");
     println!("\n  Fluid 已启动 → {url}\n  (后端 + 前端同端口;Ctrl+C 退出)\n");
 
     // Best-effort: open the default browser. Ignored on headless/unsupported hosts —
@@ -151,4 +188,23 @@ async fn main() -> anyhow::Result<()> {
 
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_argument_launch_uses_automatic_port_selection() {
+        let args = Args::try_parse_from(["fluid"]).unwrap();
+        assert_eq!(args.project, None);
+        assert_eq!(args.port, None);
+    }
+
+    #[test]
+    fn explicit_port_remains_distinguishable_and_strict() {
+        let args = Args::try_parse_from(["fluid", "project", "--port", "7879"]).unwrap();
+        assert_eq!(args.project, Some(PathBuf::from("project")));
+        assert_eq!(args.port, Some(7879));
+    }
 }

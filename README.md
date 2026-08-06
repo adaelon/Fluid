@@ -63,7 +63,7 @@ curl -fsSL https://github.com/adaelon/Fluid/releases/latest/download/install.sh 
 fluid /path/to/your/project        # 或直接 fluid,启动后在界面里「打开文件夹」
 ```
 
-**Windows** — 从 [Releases](https://github.com/adaelon/Fluid/releases) 下载 `fluid-windows-x86_64.exe` 放到任意文件夹。它是**命令行程序,要在 PowerShell / cmd 里运行,不要双击**(双击会一闪而过):
+**Windows** — 从 [Releases](https://github.com/adaelon/Fluid/releases) 下载 `fluid-windows-x86_64.exe` 放到任意文件夹。可以直接双击:无参数启动会保留控制台、自动打开网页,再从页面选择项目文件夹。控制台承载运行日志,关闭它或按 `Ctrl+C` 即退出 Fluid。
 
 ```powershell
 # 形态: <exe 路径>  <要阅读的项目目录>
@@ -75,11 +75,11 @@ fluid /path/to/your/project        # 或直接 fluid,启动后在界面里「打
 # 换端口: --port 7879
 ```
 
-启动后后端+前端在同一端口,默认自动打开 **http://127.0.0.1:7878**(没自动开就手动访问)。
+未传 `--port` 时优先使用 **http://127.0.0.1:7878**:若该端口已有 Fluid,新启动会复用并打开现有页面;若被其他程序占用,Fluid 会自动选择空闲端口并在控制台打印实际 URL。显式 `--port N` 保持严格,N 被占用时直接报错,不会静默换端口。
 
 > **最佳体验:先对目标项目跑一遍 [understand-anything](https://github.com/Understand-Anything)**,生成现行 `.ua/knowledge-graph.json`(旧 `.understand-anything/knowledge-graph.json` 仍兼容)。Fluid 没有它也能跑(纯只读浏览 + 单文件定向/生成/追问),但有了图谱才解锁:文件级摘要、调用/导入关系导航、文件集关系追问,以及追问时**跨文件取被调函数/类的实现**;嵌套子项目可各自持有图谱。
 >
-> 别在被服务项目自带 `.env` 的目录里启动 fluid(会读错 LLM 配置);从其他目录启动即可。
+> Windows 配置已与启动目录解耦,不会再误读被服务项目自带的 `.env`;固定位置与旧版迁移方式见「配置 LLM 后端」。
 
 ## 从源码运行 / 开发
 
@@ -99,10 +99,13 @@ cd web && npm install && npm run dev                # Vite 5173,/api 代理到 7
 
 ## 配置 LLM 后端
 
-三个值:`OPENCODE_API_KEY`(必需)、`OPENCODE_BASE_URL`(默认 `https://opencode.ai/zen/go/v1`)、`FLUID_LLM_MODEL`(默认 `glm-5.1`)。两种方式:
+三个值:`OPENCODE_API_KEY`(必需)、`OPENCODE_BASE_URL`(默认 `https://opencode.ai/zen/go/v1`)、`FLUID_LLM_MODEL`(默认 `glm-5.1`)。启动优先级是**显式进程环境变量 > Fluid 配置文件 > 内置默认值**。
 
-- **`.env` 文件**(复制 `.env.example`):启动时由 `dotenvy` 加载。
-- **运行时设置面板**:活动栏底部齿轮 → 居中模态,改 base/model/key → 保存即热生效(无需重启)并回写 `.env`。密钥 **write-only**:只显示掩码末 4 位,留空即保持原值。可「测试连接」做一次最小探针。
+- **Windows 配置文件**:`%LOCALAPPDATA%\Fluid\.env`。可把 `.env.example` 的三项复制过去,也可直接在设置面板首次保存(目录和文件会自动创建)。Fluid 不再搜索启动目录或其祖先的 `.env`。
+- **macOS / Linux 配置文件**:保留既有行为,从启动目录及其祖先查找 `.env`。
+- **运行时设置面板**:活动栏底部齿轮 → 居中模态,改 base/model/key → 保存即热生效(无需重启)并回写上述平台配置路径。密钥 **write-only**:只显示掩码末 4 位,留空即保持原值。可「测试连接」做一次最小探针。
+
+从旧版 Windows Fluid 升级时,启动目录附近的旧 `.env` **不会自动复制或继续读取**,以免再次误用项目自己的配置。请一次性把其中三项复制到 `%LOCALAPPDATA%\Fluid\.env`,或启动后在设置面板重新保存;若一直使用系统/终端显式环境变量,无需迁移文件。
 
 常规生成要求 OpenAI 兼容 `/chat/completions`;选区解释与追问器还会在当前供应商/模型支持时调用 `/responses` 的 `web_search` 工具。联网请求只接收先行规划得到的公开检索请求,不直接附加原始源码;供应商不支持、认证失败、限流或超时时显式降级为本地回答。设置面板可关闭联网检索。
 
@@ -117,7 +120,7 @@ cd web && npm install && npm run dev                # Vite 5173,/api 代理到 7
 
 ## 主要端点
 
-`GET /api/project/tree`、`GET /api/file`、`GET /api/project/graph`、`POST /api/project/open|pick`、`GET|POST /api/settings/llm`、`POST /api/settings/llm/test`、`POST /api/explain-line`、`WS /api/orient`、`WS /api/generate`、`WS /api/explain-selection`、`WS /api/query`、`WS /api/query-files`。
+`GET /api/identity`、`GET /api/project/tree`、`GET /api/file`、`GET /api/project/graph`、`POST /api/project/open|pick`、`GET|POST /api/settings/llm`、`POST /api/settings/llm/test`、`POST /api/explain-line`、`WS /api/orient`、`WS /api/generate`、`WS /api/explain-selection`、`WS /api/query`、`WS /api/query-files`。
 
 ## 开发与验证
 

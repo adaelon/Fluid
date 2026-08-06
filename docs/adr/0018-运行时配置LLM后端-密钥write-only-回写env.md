@@ -1,5 +1,7 @@
 # 运行时配置 LLM 后端:面板可改三项,密钥 write-only 不回显,回写 .env
 
+> Windows 的落盘位置与加载优先级自 ADR-0022 起修订为 `%LOCALAPPDATA%\Fluid\.env`;本 ADR 保留运行时热换与 write-only 决策。
+
 LLM 后端(`OPENCODE_API_KEY` / `OPENCODE_BASE_URL` / `FLUID_LLM_MODEL`)此前只能在启动前经 `.env`/环境变量配置、改一次须重启(`main.rs` 启动读一次,`LlmProxy` 与 `model` 存进 `AppState` 后不可变)。本 ADR 加一个**设置面板(U5)**让用户运行时改这三项:保存后**热重建内存 `LlmProxy` 立即生效**,**并回写 fluid 仓库根的 `.env`** 使重启保留。三项里 `api_key` 在面板里可输入——这跨越了既有「密钥永不发给前端」的安全姿态(`llm_proxy.rs` 注释),用户(2026-06-16)明确知悉并接受,缓释手段是 **write-only**:后端 `GET` 永不回显完整 key,只给 masked 状态(`···`+末 4 位)与「已配置/未配置」;面板输入框留空即保持原 key,填了才覆盖。仅支持 OpenAI 兼容 `/chat/completions`(现有抽象,够覆盖切 provider/模型/key 的主诉求),不引入多协议适配。
 
 ## Considered Options

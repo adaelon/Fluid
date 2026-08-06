@@ -63,6 +63,9 @@ jobs:
       - name: Build backend
         run: cargo build --release -p fluid-server --target ${{ matrix.target }}
 
+      - name: Verify embedded frontend
+        run: cargo test --release -p fluid-server --target ${{ matrix.target }} static_assets::tests::release_profile_embeds_the_built_spa_and_entry_script -- --exact
+
       # 3) Stage the binary under its public asset name.
       - name: Package
         shell: bash

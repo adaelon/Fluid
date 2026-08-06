@@ -4,11 +4,21 @@
 //! masking used for write-only display (the full key is never sent to the
 //! frontend), and the pure `.env` write-back used to persist a change.
 
+use std::collections::HashMap;
+use std::ffi::OsStr;
+use std::io;
+use std::path::{Path, PathBuf};
+
 use crate::llm_proxy::{DEFAULT_BASE_URL, DEFAULT_MODEL};
 
+const API_KEY_ENV: &str = "OPENCODE_API_KEY";
+const BASE_URL_ENV: &str = "OPENCODE_BASE_URL";
+const MODEL_ENV: &str = "FLUID_LLM_MODEL";
+
 /// The three values that define which LLM backend Fluid talks to. `api_key` is a
-/// secret: it lives in memory + the gitignored `.env`, and is *never* serialized
-/// out to the frontend (see `mask_key` for the only thing the UI ever sees).
+/// secret: it lives in memory plus the platform config file/process environment,
+/// and is *never* serialized out to the frontend (see `mask_key` for the only
+/// thing the UI ever sees).
 #[derive(Clone)]
 pub struct LlmConfig {
     pub base_url: String,
@@ -17,15 +27,50 @@ pub struct LlmConfig {
 }
 
 impl LlmConfig {
-    /// Read the three values from the process env (`.env` already loaded by main).
-    /// Missing/empty base_url and model fall back to the built-in defaults; an
-    /// absent key yields an empty string (proxy stays disabled until configured).
+    /// Read only the process environment. On non-Windows, main may have loaded a
+    /// discovered `.env` first; Windows uses `from_env_file` for its fixed path.
+    /// Missing/empty base_url and model fall back to the built-in defaults.
     pub fn from_env() -> Self {
         let nonempty = |k: &str| std::env::var(k).ok().filter(|s| !s.is_empty());
         Self {
-            base_url: nonempty("OPENCODE_BASE_URL").unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
-            model: nonempty("FLUID_LLM_MODEL").unwrap_or_else(|| DEFAULT_MODEL.to_string()),
-            api_key: std::env::var("OPENCODE_API_KEY").ok().unwrap_or_default(),
+            base_url: nonempty(BASE_URL_ENV).unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
+            model: nonempty(MODEL_ENV).unwrap_or_else(|| DEFAULT_MODEL.to_string()),
+            api_key: std::env::var(API_KEY_ENV).ok().unwrap_or_default(),
+        }
+    }
+
+    /// Read a specific `.env` file without mutating the process environment.
+    /// A process variable wins whenever it is explicitly present, including an
+    /// explicitly empty value; the file is only consulted when that variable is
+    /// absent. Missing files are equivalent to an empty file.
+    pub fn from_env_file(path: &Path) -> Result<Self, dotenvy::Error> {
+        let file_values = match dotenvy::from_path_iter(path) {
+            Ok(iter) => iter.collect::<Result<HashMap<_, _>, _>>()?,
+            Err(error) if error.not_found() => HashMap::new(),
+            Err(error) => return Err(error),
+        };
+        Ok(Self::from_sources(
+            |key| std::env::var(key).ok(),
+            &file_values,
+        ))
+    }
+
+    fn from_sources(
+        env: impl Fn(&str) -> Option<String>,
+        file_values: &HashMap<String, String>,
+    ) -> Self {
+        let value = |key: &str| match env(key) {
+            Some(explicit) => Some(explicit),
+            None => file_values.get(key).cloned(),
+        };
+        Self {
+            base_url: value(BASE_URL_ENV)
+                .filter(|item| !item.is_empty())
+                .unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
+            model: value(MODEL_ENV)
+                .filter(|item| !item.is_empty())
+                .unwrap_or_else(|| DEFAULT_MODEL.to_string()),
+            api_key: value(API_KEY_ENV).unwrap_or_default(),
         }
     }
 
@@ -33,6 +78,18 @@ impl LlmConfig {
     pub fn key_set(&self) -> bool {
         !self.api_key.trim().is_empty()
     }
+}
+
+/// Resolve the fixed Windows config location from `%LOCALAPPDATA%`.
+/// Kept parameterized so the path contract is covered on every test platform.
+pub fn windows_env_path(local_app_data: Option<&OsStr>) -> io::Result<PathBuf> {
+    let Some(base) = local_app_data.filter(|value| !value.is_empty()) else {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "LOCALAPPDATA is not set; cannot resolve Fluid config path",
+        ));
+    };
+    Ok(PathBuf::from(base).join("Fluid").join(".env"))
 }
 
 /// The masked key hint shown to the frontend: `···` + the last 4 chars, or `None`
@@ -92,9 +149,33 @@ pub fn rewrite_env(existing: &str, cfg: &LlmConfig) -> String {
     result
 }
 
+/// Persist the runtime settings to the selected `.env`, creating its parent
+/// directory on first save. Existing unrelated lines and comments are retained.
+pub fn persist_env(path: &Path, cfg: &LlmConfig) -> io::Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let existing = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error),
+    };
+    std::fs::write(path, rewrite_env(&existing, cfg))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn file_values(items: &[(&str, &str)]) -> HashMap<String, String> {
+        items
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect()
+    }
 
     fn cfg(base: &str, model: &str, key: &str) -> LlmConfig {
         LlmConfig {
@@ -111,6 +192,79 @@ mod tests {
         assert_eq!(mask_key("sk-abcd1234").as_deref(), Some("···1234"));
         // Shorter than 4 → shows what's there.
         assert_eq!(mask_key("ab").as_deref(), Some("···ab"));
+    }
+
+    #[test]
+    fn windows_config_path_is_fixed_below_local_app_data() {
+        let base = PathBuf::from("local-app-data");
+        assert_eq!(
+            windows_env_path(Some(base.as_os_str())).unwrap(),
+            base.join("Fluid").join(".env")
+        );
+        assert_eq!(
+            windows_env_path(None).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn explicit_environment_values_override_the_fixed_file() {
+        let file = file_values(&[
+            (API_KEY_ENV, "file-key"),
+            (BASE_URL_ENV, "https://file/v1"),
+            (MODEL_ENV, "file-model"),
+        ]);
+        let cfg = LlmConfig::from_sources(
+            |key| match key {
+                API_KEY_ENV => Some("env-key".into()),
+                BASE_URL_ENV => Some("https://env/v1".into()),
+                MODEL_ENV => Some("env-model".into()),
+                _ => None,
+            },
+            &file,
+        );
+        assert_eq!(cfg.api_key, "env-key");
+        assert_eq!(cfg.base_url, "https://env/v1");
+        assert_eq!(cfg.model, "env-model");
+
+        // An explicitly empty process value still suppresses the file. Base/model
+        // then use built-in defaults; the key remains unset.
+        let empty = LlmConfig::from_sources(|_| Some(String::new()), &file);
+        assert_eq!(empty.api_key, "");
+        assert_eq!(empty.base_url, DEFAULT_BASE_URL);
+        assert_eq!(empty.model, DEFAULT_MODEL);
+    }
+
+    #[test]
+    fn fixed_file_values_are_used_when_environment_is_absent() {
+        let file = file_values(&[
+            (API_KEY_ENV, "file-key"),
+            (BASE_URL_ENV, "https://file/v1"),
+            (MODEL_ENV, "file-model"),
+        ]);
+        let cfg = LlmConfig::from_sources(|_| None, &file);
+        assert_eq!(cfg.api_key, "file-key");
+        assert_eq!(cfg.base_url, "https://file/v1");
+        assert_eq!(cfg.model, "file-model");
+    }
+
+    #[test]
+    fn persist_env_creates_the_fixed_directory_on_first_save() {
+        let root = std::env::temp_dir().join(format!(
+            "fluid-settings-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = root.join("Fluid").join(".env");
+        persist_env(&path, &cfg("https://b/v1", "m", "k")).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("OPENCODE_API_KEY=k\n"));
+        assert!(written.contains("OPENCODE_BASE_URL=https://b/v1\n"));
+        assert!(written.contains("FLUID_LLM_MODEL=m\n"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

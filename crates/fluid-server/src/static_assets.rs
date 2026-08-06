@@ -65,6 +65,26 @@ mod tests {
         assert!(Assets::get("index.html").is_some());
     }
 
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn release_profile_embeds_the_built_spa_and_entry_script() {
+        let index = Assets::get("index.html").expect("release index is embedded");
+        let html = std::str::from_utf8(index.data.as_ref()).expect("index is UTF-8");
+        assert!(html.contains("id=\"app\""));
+        assert!(!html.contains("Fluid 前端尚未构建"));
+
+        let script = html
+            .split("src=\"/")
+            .nth(1)
+            .and_then(|tail| tail.split('"').next())
+            .expect("Vite entry script path");
+        assert!(script.starts_with("assets/") && script.ends_with(".js"));
+        assert!(
+            Assets::get(script).is_some(),
+            "index entry script must be embedded beside index.html"
+        );
+    }
+
     #[tokio::test]
     async fn serves_index_html_at_root() {
         let r = static_handler(Uri::from_static("/")).await;

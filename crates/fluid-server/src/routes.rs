@@ -3,6 +3,7 @@
 //! - `GET /api/project/tree`        -> { files: FileNode[] }
 //! - `GET /api/file?path=<rel>`     -> { source: string }
 //! - `GET /api/project/graph`       -> KnowledgeGraph | null   (S2, optional)
+//! - `GET /api/identity`            -> stable local-instance identity
 //! - `WS  /api/orient`              -> validated file-orientation card (S-ORI-2/3)
 //! - `WS  /api/generate`            -> per-function streaming generation (S7)
 //!
@@ -56,7 +57,8 @@ use crate::orientation::{
     ORIENTATION_PROMPT_VERSION, ORIENTATION_SCHEMA_VERSION,
 };
 use crate::project_reader::{FileNode, ProjectReader, ReadErr};
-use crate::settings::{mask_key, rewrite_env, LlmConfig};
+use crate::settings::{mask_key, persist_env, LlmConfig};
+use crate::startup::{FluidIdentity, IDENTITY_PATH};
 use crate::translate::{build_translate_prompt, protect_code, restore_code, split_chunks};
 use crate::web_evidence::{
     resolve_web_evidence_with_progress, EvidenceOutcome, EvidenceProgress, EvidenceRequest,
@@ -178,6 +180,7 @@ type Shared = Arc<AppState>;
 
 pub fn router(state: Shared) -> Router {
     Router::new()
+        .route(IDENTITY_PATH, get(identity))
         .route("/api/project/tree", get(tree))
         .route("/api/file", get(file))
         .route("/api/project/graph", get(graph))
@@ -198,6 +201,10 @@ pub fn router(state: Shared) -> Router {
         // Anything else → the embedded frontend SPA (packaging: one binary = whole app).
         .fallback(crate::static_assets::static_handler)
         .with_state(state)
+}
+
+async fn identity() -> Json<FluidIdentity> {
+    Json(FluidIdentity::current())
 }
 
 #[derive(Serialize)]
@@ -373,11 +380,10 @@ async fn put_llm_settings(
     }
     let cfg = apply_llm_settings(&state, req.base_url, req.model, req.api_key);
 
-    // Persist to `.env` (best-effort: a write failure must not fail the request —
-    // the change is already live in memory). Reads the current file so unrelated
-    // lines/comments survive; absent file → write just the three lines.
-    let existing = std::fs::read_to_string(&state.env_path).unwrap_or_default();
-    if let Err(e) = std::fs::write(&state.env_path, rewrite_env(&existing, &cfg)) {
+    // Persist to the selected `.env` (best-effort: a write failure must not fail
+    // the request — the change is already live in memory). On Windows this is the
+    // fixed `%LOCALAPPDATA%\Fluid\.env`; first save creates its parent directory.
+    if let Err(e) = persist_env(&state.env_path, &cfg) {
         eprintln!(
             "[settings] warning: .env write-back failed ({}): {e}",
             state.env_path.display()
