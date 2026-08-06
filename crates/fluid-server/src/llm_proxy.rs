@@ -827,6 +827,132 @@ mod tests {
     }
 
     #[test]
+    fn orientation_parser_defaults_missing_supporting_flow_ids() {
+        let content = serde_json::json!({
+            "purpose": "Receive one request and prepare local state.",
+            "actors": [
+                {
+                    "id": "caller",
+                    "name": "Caller",
+                    "role": "Starts one request.",
+                    "boundary": "project"
+                },
+                {
+                    "id": "worker",
+                    "name": "Worker",
+                    "role": "Handles the request in this file.",
+                    "boundary": "inside-file"
+                }
+            ],
+            "types": [{
+                "name": "Request",
+                "ownerActorId": "caller",
+                "meaning": "One concrete unit of requested work."
+            }],
+            "coreFlows": [{
+                "id": "request-flow",
+                "name": "Request delivery",
+                "kind": "request",
+                "why": "The worker needs a concrete request to do useful work.",
+                "steps": [{
+                    "fromActorId": "caller",
+                    "via": "fetch",
+                    "payload": "Request",
+                    "toActorId": "worker",
+                    "why": "Transfers the request into the worker.",
+                    "evidenceIds": ["E1"]
+                }]
+            }],
+            "supportingCapabilities": [{
+                "name": "Local preparation",
+                "why": "Keeps setup separate from request delivery.",
+                "functionIds": ["helper#2"],
+                "evidenceIds": ["E2"]
+            }],
+            "functionRoles": [
+                {
+                    "fnId": "fetch#1",
+                    "lane": "core",
+                    "flowIds": ["request-flow"],
+                    "stage": "dispatch request",
+                    "receivesFromActorIds": ["caller"],
+                    "consumes": ["Request"],
+                    "sendsToActorIds": ["worker"],
+                    "produces": ["Work"],
+                    "why": "Moves the request into the worker.",
+                    "evidenceIds": ["E1"]
+                },
+                {
+                    "fnId": "helper#2",
+                    "lane": "supporting",
+                    "stage": "prepare local state",
+                    "receivesFromActorIds": ["worker"],
+                    "consumes": ["Work"],
+                    "sendsToActorIds": ["worker"],
+                    "produces": ["Prepared work"],
+                    "why": "Supports the worker without owning the core flow.",
+                    "evidenceIds": ["E2"]
+                }
+            ],
+            "walkthrough": {
+                "title": "One request",
+                "input": "request-1",
+                "steps": [{
+                    "text": "Caller invokes fetch with request-1.",
+                    "evidenceIds": ["E1"]
+                }]
+            },
+            "invariants": [{
+                "text": "Request delivery stays grounded in the active file.",
+                "evidenceIds": ["E1"]
+            }],
+            "evidence": [
+                {
+                    "id": "E1",
+                    "filePath": "a.rs",
+                    "startLine": 1,
+                    "endLine": 1,
+                    "symbol": "fetch"
+                },
+                {
+                    "id": "E2",
+                    "filePath": "a.rs",
+                    "startLine": 2,
+                    "endLine": 2,
+                    "symbol": "helper"
+                }
+            ]
+        })
+        .to_string();
+
+        let card = parse_orientation_card(
+            &content,
+            "orientation-1",
+            "a.rs",
+            OrientationCoverage {
+                mode: crate::orientation::OrientationCoverageMode::FullSource,
+                omitted_function_ids: Vec::new(),
+            },
+        )
+        .unwrap();
+        let roster = vec!["fetch#1".to_string(), "helper#2".to_string()];
+        card.validate(&crate::orientation::OrientationValidationContext {
+            file_path: "a.rs",
+            source: "fn fetch() {}\nfn helper() {}\n",
+            roster_fn_ids: &roster,
+            roster_line_ranges: None,
+        })
+        .unwrap();
+
+        let helper = card
+            .function_roles
+            .iter()
+            .find(|role| role.fn_id == "helper#2")
+            .unwrap();
+        assert!(helper.flow_ids.is_empty());
+    }
+
+    #[test]
     fn parses_plain_json_and_injects_fn_id() {
         let content = r##"{"capsule":{"signature":"def f(x)","summary":"加一","complexity":"simple","io":"x:int->int"},"lines":[{"lineNumber":2,"text":"返回 x+1","color":"#abcdef"}]}"##;
         let (cap, lines) = parse_fixture(content, "f#1").unwrap();

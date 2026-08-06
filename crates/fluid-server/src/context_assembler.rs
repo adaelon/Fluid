@@ -795,11 +795,13 @@ pub fn build_bounded_orientation_prompt(
     let system = r#"你是 Fluid 的文件定向助手，面向零代码基础读者。当前激活文件过大；请只依据后端提供的文件轮廓与一轮精确源码切片生成 bounded-source 文件定向卡。
 只输出一个 JSON 对象，禁止额外文字或 Markdown 代码围栏。JSON 只能包含这些语义字段：purpose、actors、types、coreFlows、supportingCapabilities、functionRoles、walkthrough、invariants、evidence；后端会注入 schemaVersion、orientationId、filePath、bounded-source coverage 与 omittedFunctionIds。
 
+语言约束：所有面向读者的自然语言说明必须使用简体中文。源码中的函数名、类型名、变量名、参与者 ID、文件路径，以及库名、协议名、产品名和通行技术术语可以保留必要英文；不要把这些标识符强行翻译，也不要用英文整句替代中文说明。
+
 硬约束：
 1. actors 使用稳定、具名的真实参与者 ID，并标明 inside-file/project/external 边界；所有方向必须由 fromActorId -> toActorId 表达，禁止脱离参与者坐标使用“上游/下游”或 upstream/downstream。
 2. types 的 ownerActorId、coreFlows 的参与者/证据、functionRoles 的 actor/flow/evidence、walkthrough/invariants 的 evidenceIds 必须引用卡内已声明 ID，不能悬空。
 3. coreFlows 至少一个；每条 flow 至少一个 step；每个 step 必须点名真实 via、payload、why，并至少引用一个下方可见源码 evidenceId。
-4. 后端核验函数清单中的每个 fnId 必须在 functionRoles 中恰好出现一次，lane 只能是 core 或 supporting；core 角色必须引用 flow；supportingCapabilities 只能收纳 supporting 函数。禁止创造清单外 fnId。
+4. 后端核验函数清单中的每个 fnId 必须在 functionRoles 中恰好出现一次，且每个角色对象都必须输出字段形状列出的全部字段；lane 只能是 core 或 supporting；core 角色必须引用至少一个 flow，supporting 角色必须输出空数组 flowIds: []；supportingCapabilities 只能收纳 supporting 函数。禁止创造清单外 fnId。
 5. omittedFunctionIds 对应的函数实现未提供：只能依据签名给出保守角色，不得虚构其函数体行为或证据。核心链路、贯穿案例与 invariant 必须由已提供源码支持。
 6. evidence 只能指向下方后端精确源码切片中的行，路径只能是当前激活文件；文件轮廓、图谱摘要、模型记忆和其他文件都只是导航提示，不是证据。
 7. walkthrough 必须给出一个具体输入和至少一个贯穿步骤；核心链路与外围生产能力分开，并解释缺失后果。
@@ -1088,11 +1090,13 @@ pub fn build_orientation_prompt(
     let system = r#"你是 Fluid 的文件定向助手，面向零代码基础读者。请根据当前激活文件的完整源码生成一份结构化文件定向卡。
 只输出一个 JSON 对象，禁止额外文字或 Markdown 代码围栏。JSON 必须只包含这些语义字段：purpose、actors、types、coreFlows、supportingCapabilities、functionRoles、walkthrough、invariants、evidence；后端会注入 schemaVersion、orientationId、filePath 与 full-source coverage。
 
+语言约束：所有面向读者的自然语言说明必须使用简体中文。源码中的函数名、类型名、变量名、参与者 ID、文件路径，以及库名、协议名、产品名和通行技术术语可以保留必要英文；不要把这些标识符强行翻译，也不要用英文整句替代中文说明。
+
 硬约束：
 1. actors 使用稳定、具名的真实参与者 ID，并标明 inside-file/project/external 边界；所有方向必须由 fromActorId -> toActorId 表达，禁止脱离参与者坐标使用“上游/下游”或 upstream/downstream。
 2. types 的 ownerActorId、coreFlows 的参与者/证据、functionRoles 的 actor/flow/evidence、walkthrough/invariants 的 evidenceIds 必须引用卡内已声明 ID，不能悬空。
 3. coreFlows 至少一个；每条 flow 至少一个 step；每个 step 必须点名真实 via、payload、why，并至少引用一个当前源码 evidenceId。
-4. 后端核验函数清单中的每个 fnId 必须在 functionRoles 中恰好出现一次，lane 只能是 core 或 supporting；core 角色必须引用 flow；supportingCapabilities 只能收纳 supporting 函数。禁止创造清单外 fnId。
+4. 后端核验函数清单中的每个 fnId 必须在 functionRoles 中恰好出现一次，且每个角色对象都必须输出字段形状列出的全部字段；lane 只能是 core 或 supporting；core 角色必须引用至少一个 flow，supporting 角色必须输出空数组 flowIds: []；supportingCapabilities 只能收纳 supporting 函数。禁止创造清单外 fnId。
 5. walkthrough 必须给出一个具体输入和至少一个贯穿步骤；purpose、flow、step、角色、外围能力均要解释 why（缺少它会造成什么后果），不能只复述函数名。
 6. evidence 只能指向当前激活文件，行号为 1-based inclusive，必须来自下方完整带号源码；禁止把图谱摘要、模型记忆或其他文件当作源码证据。
 7. 核心链路与外围生产能力必须分开；统计、tracing、缓存、清理、utility 等不应伪装成核心业务流。
@@ -2765,6 +2769,8 @@ mod tests {
 
         assert!(system.contains("fromActorId -> toActorId"));
         assert!(system.contains("supportingCapabilities"));
+        assert!(system.contains("supporting 角色必须输出空数组 flowIds: []"));
+        assert!(system.contains("自然语言说明必须使用简体中文"));
         assert!(system.contains("walkthrough"));
         assert!(user.contains("【图谱候选文件摘要(仅导航提示，不是证据)】graph summary"));
         assert!(user.contains("function:a.rs:fetch-calls->external:worker"));
@@ -2963,6 +2969,8 @@ mod tests {
             build_bounded_orientation_prompt("a.rs", source, &roster, &context, &selection);
 
         assert!(system.contains("bounded-source"));
+        assert!(system.contains("supporting 角色必须输出空数组 flowIds: []"));
+        assert!(system.contains("自然语言说明必须使用简体中文"));
         assert!(user.contains("selected_body"));
         assert!(user.contains("\"omitted#3\""));
         assert!(!user.contains("omitted_body_must_stay_private"));

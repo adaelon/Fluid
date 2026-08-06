@@ -14,7 +14,7 @@ use std::path::{Component, Path};
 use serde::{Deserialize, Serialize};
 
 pub const ORIENTATION_SCHEMA_VERSION: u32 = 1;
-pub const ORIENTATION_PROMPT_VERSION: &str = "orientation-p1";
+pub const ORIENTATION_PROMPT_VERSION: &str = "orientation-p3";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -95,6 +95,7 @@ pub enum FunctionLane {
 pub struct FunctionRole {
     pub fn_id: String,
     pub lane: FunctionLane,
+    #[serde(default)]
     pub flow_ids: Vec<String>,
     pub stage: String,
     pub receives_from_actor_ids: Vec<String>,
@@ -937,6 +938,10 @@ mod tests {
         empty_flow.core_flows[0].steps.clear();
         assert!(empty_flow.validate(&context).is_err());
 
+        let mut core_role_without_flow = valid_card("orientation-1".into());
+        core_role_without_flow.function_roles[0].flow_ids.clear();
+        assert!(core_role_without_flow.validate(&context).is_err());
+
         let mut step_without_evidence = valid_card("orientation-1".into());
         step_without_evidence.core_flows[0].steps[0]
             .evidence_ids
@@ -1037,7 +1042,7 @@ mod tests {
                 ..base
             },
             OrientationCacheIdentity {
-                prompt_version: "orientation-p2",
+                prompt_version: "orientation-p-other",
                 ..base
             },
             OrientationCacheIdentity {
