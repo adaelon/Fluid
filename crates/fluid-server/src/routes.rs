@@ -5552,9 +5552,8 @@ mod tests {
         let requests = mock.requests.lock().unwrap();
         let answer_prompts: Vec<&str> = requests
             .iter()
-            .filter_map(|(kind, body)| {
-                (kind == "answer").then(|| body["messages"][1]["content"].as_str().unwrap())
-            })
+            .filter(|(kind, _)| kind == "answer")
+            .map(|(_, body)| body["messages"][1]["content"].as_str().unwrap())
             .collect();
         assert_eq!(answer_prompts.len(), 2);
         assert!(answer_prompts
