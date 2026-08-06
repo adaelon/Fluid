@@ -3,6 +3,7 @@
 // Node 24 strips the TypeScript annotations; no test framework or browser needed.
 
 import { reduceQueryFrame, startQueryRequest } from '../src/queryState.ts'
+import type { QueryMap } from '../src/ghostTypes.ts'
 
 let failures = 0
 function check(label: string, condition: boolean): void {
@@ -11,6 +12,19 @@ function check(label: string, condition: boolean): void {
     console.error(`  FAIL  ${label}`)
     failures++
   }
+}
+
+const map: QueryMap = {
+  actors: [{ id: 'file', name: '当前文件', role: '本次追问范围。', boundary: 'inside-file' }],
+  direction: [],
+  coreFunctionIds: [],
+  supportingFunctionIds: [],
+  walkthrough: {
+    title: '直接作用',
+    input: 'fixture',
+    steps: [{ text: '核对当前源码。', evidenceIds: [] }],
+  },
+  evidence: [],
 }
 
 console.log('=== cited query status -> evidence -> delta -> done ===')
@@ -29,16 +43,21 @@ state = reduceQueryFrame(state, {
 })
 check('searching status is visible', state.mode === 'streaming' && state.phase === 'searching-web')
 state = reduceQueryFrame(state, {
-  kind: 'evidence',
-  reqId: 'q',
-  status: 'web-cited',
-  sources: [{ title: 'Rust docs', url: 'https://doc.rust-lang.org/' }],
-})
-state = reduceQueryFrame(state, {
   kind: 'status',
   reqId: 'q',
   phase: 'answering',
   message: '作答中',
+})
+state = reduceQueryFrame(state, {
+  kind: 'map',
+  reqId: 'q',
+  map,
+})
+state = reduceQueryFrame(state, {
+  kind: 'evidence',
+  reqId: 'q',
+  status: 'web-cited',
+  sources: [{ title: 'Rust docs', url: 'https://doc.rust-lang.org/' }],
 })
 state = reduceQueryFrame(state, { kind: 'delta', reqId: 'q', text: '第一段' })
 state = reduceQueryFrame(state, { kind: 'delta', reqId: 'q', text: '第二段' })
@@ -53,6 +72,7 @@ check(
 
 console.log('\n=== uncited and fallback evidence states ===')
 let uncited = startQueryRequest()
+uncited = reduceQueryFrame(uncited, { kind: 'map', reqId: 'qf', map })
 uncited = reduceQueryFrame(uncited, {
   kind: 'evidence',
   reqId: 'qf',
@@ -71,6 +91,11 @@ fallback = reduceQueryFrame(fallback, {
   message: '改用本地上下文',
 })
 fallback = reduceQueryFrame(fallback, {
+  kind: 'map',
+  reqId: 'q',
+  map,
+})
+fallback = reduceQueryFrame(fallback, {
   kind: 'evidence',
   reqId: 'q',
   status: 'unverified',
@@ -84,6 +109,7 @@ check(
 
 console.log('\n=== terminal error preserves partial answer ===')
 let failed = startQueryRequest()
+failed = reduceQueryFrame(failed, { kind: 'map', reqId: 'q', map })
 failed = reduceQueryFrame(failed, { kind: 'delta', reqId: 'q', text: '已经收到的回答' })
 failed = reduceQueryFrame(failed, { kind: 'error', reqId: 'q', message: '连接中断' })
 check('error is terminal and visible', failed.mode === 'error' && failed.errorMessage === '连接中断')

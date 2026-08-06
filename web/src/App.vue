@@ -11,6 +11,7 @@ import Tabs from './shell/Tabs.vue'
 import SettingsModal from './shell/SettingsModal.vue'
 import CommandPalette, { type PaletteItem } from './shell/CommandPalette.vue'
 import { EMPTY_QUERY_CONTEXT, type QueryContext } from './queryContext'
+import type { CodeEvidenceRef } from './ghostTypes'
 
 type OpenFile = { path: string; lang: string; source: string }
 
@@ -37,6 +38,16 @@ const genProgress = ref<{ phase: 'idle' | 'running' | 'done'; completed: number;
 // fresh snapshot on switch/capsule arrival; we still null it out when no file is
 // open (Editor is v-if'd away then and can't emit).
 const queryCtx = ref<QueryContext>(EMPTY_QUERY_CONTEXT)
+
+interface EvidenceReveal extends CodeEvidenceRef {
+  revealKey: number
+}
+
+let evidenceRevealSequence = 0
+const evidenceReveal = ref<EvidenceReveal | null>(null)
+const activeEvidenceReveal = computed(() =>
+  evidenceReveal.value?.filePath === current.value?.path ? evidenceReveal.value : null,
+)
 
 // S-FSQ-1: selected file set is an explicit query scope, independent from open
 // tabs. Hiding checkbox mode must not clear this set; switching project root does.
@@ -186,6 +197,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onGlobalKey))
 // Open a file from the tree: if already open just activate its tab; otherwise
 // fetch the source once, append a tab, and activate it (U2).
 async function open(node: FileNode) {
+  evidenceReveal.value = null
   if (openFiles.value.some((f) => f.path === node.path)) {
     activePath.value = node.path
     return
@@ -199,7 +211,22 @@ async function open(node: FileNode) {
   }
 }
 
+async function openCodeEvidence(reference: CodeEvidenceRef) {
+  const node = files.value.find((file) => file.path === reference.filePath)
+  if (!node) {
+    loadError.value = `代码证据文件不在当前项目中：${reference.filePath}`
+    return
+  }
+  await open(node)
+  if (activePath.value !== reference.filePath) return
+  evidenceReveal.value = {
+    ...reference,
+    revealKey: ++evidenceRevealSequence,
+  }
+}
+
 function activate(path: string) {
+  evidenceReveal.value = null
   activePath.value = path
 }
 
@@ -216,6 +243,7 @@ async function doSwitch(path: string) {
     await openFolder(path)
     openFiles.value = []
     activePath.value = null
+    evidenceReveal.value = null
     fileSelectionMode.value = false
     clearSelectedFiles()
     files.value = await fetchTree()
@@ -317,6 +345,7 @@ function closeTab(path: string) {
           :lang="current.lang"
           :path="current.path"
           :allow-web="allowWeb"
+          :reveal-evidence="activeEvidenceReveal"
           @progress="genProgress = $event"
           @context="queryCtx = $event"
         />
@@ -334,6 +363,7 @@ function closeTab(path: string) {
       @close="queryPanelOpen = false"
       @toggle-selection-mode="fileSelectionMode = !fileSelectionMode"
       @clear-selected="clearSelectedFiles"
+      @open-evidence="openCodeEvidence"
     />
     <StatusBar
       :path="current?.path ?? null"

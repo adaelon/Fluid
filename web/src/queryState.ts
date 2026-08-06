@@ -1,6 +1,7 @@
 import type {
   EvidenceStatus,
   QueryFrame,
+  QueryMap,
   QueryPhase,
   QueryTrace,
   SourceLink,
@@ -87,6 +88,7 @@ export interface QueryViewState {
   requestId: string | null
   phase: QueryPhase | 'connecting' | null
   statusMessage: string
+  map: QueryMap | null
   evidence: QueryEvidenceState | null
   answer: string
   errorMessage: string
@@ -98,6 +100,7 @@ export function idleQueryState(): QueryViewState {
     requestId: null,
     phase: null,
     statusMessage: '',
+    map: null,
     evidence: null,
     answer: '',
     errorMessage: '',
@@ -119,8 +122,10 @@ export function startQueryRequest(requestId: string | null = null): QueryViewSta
  * in particular, a stream error can be shown without erasing partial output. */
 export function reduceQueryFrame(state: QueryViewState, frame: QueryFrame): QueryViewState {
   if (state.requestId !== null && frame.reqId !== state.requestId) return state
+  if (state.mode === 'done' || state.mode === 'error') return state
   switch (frame.kind) {
     case 'status':
+      if (state.map) return queryProtocolError(state, '状态帧晚于方向图到达')
       return {
         ...state,
         mode: 'streaming',
@@ -128,7 +133,19 @@ export function reduceQueryFrame(state: QueryViewState, frame: QueryFrame): Quer
         statusMessage: frame.message,
         errorMessage: '',
       }
+    case 'map':
+      if (state.map || state.answer) return queryProtocolError(state, '方向图重复或晚于回答到达')
+      return {
+        ...state,
+        mode: 'streaming',
+        map: frame.map,
+        errorMessage: '',
+      }
     case 'evidence':
+      if (!state.map) return queryProtocolError(state, '代码/网页证据早于方向图到达')
+      if (state.evidence || state.answer) {
+        return queryProtocolError(state, '代码/网页证据重复或晚于回答到达')
+      }
       return {
         ...state,
         evidence: {
@@ -138,12 +155,14 @@ export function reduceQueryFrame(state: QueryViewState, frame: QueryFrame): Quer
         },
       }
     case 'delta':
+      if (!state.map) return queryProtocolError(state, '回答早于方向图到达')
       return {
         ...state,
         mode: 'streaming',
         answer: state.answer + frame.text,
       }
     case 'done':
+      if (!state.map) return queryProtocolError(state, '回答结束前未收到方向图')
       return {
         ...state,
         mode: 'done',
@@ -158,5 +177,15 @@ export function reduceQueryFrame(state: QueryViewState, frame: QueryFrame): Quer
         statusMessage: '',
         errorMessage: frame.message,
       }
+  }
+}
+
+function queryProtocolError(state: QueryViewState, detail: string): QueryViewState {
+  return {
+    ...state,
+    mode: 'error',
+    phase: null,
+    statusMessage: '',
+    errorMessage: `追问协议错误：${detail}`,
   }
 }

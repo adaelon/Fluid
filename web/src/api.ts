@@ -346,7 +346,8 @@ export function streamTranslate(filePath: string, h: TranslateHandlers): Transla
   }
 }
 
-/** Ordered frame callback shared by both streaming follow-up scopes. */
+/** Ordered frame callback shared by both streaming follow-up scopes. The backend
+ * guarantees status* -> map -> evidence? -> delta* -> done | error. */
 export interface QueryHandlers {
   onFrame: (frame: QueryFrame) => void
 }
@@ -356,8 +357,8 @@ export interface QueryStream {
   cancel: () => void
 }
 
-/** Open `WS /api/query`, send one question, and forward optional status/evidence
- *  frames followed by delta×N → done | error. One socket per question; it is
+/** Open `WS /api/query`, send one question, and forward status* -> map ->
+ *  evidence? -> delta×N → done | error. One socket per question; it is
  *  closed on the terminal frame or on `cancel` (file switch / unmount). The S10a
  *  backend treats roster/capsules/focus as optional; S10b-cap layers in the
  *  current file's roster + generated capsule summaries so the answer no longer
@@ -437,7 +438,7 @@ export function streamQuery(
 }
 
 /** Open `WS /api/query-files`, send one selected-file-set relationship question,
- *  and forward the same status/evidence/delta terminal contract (S-QWEB-2). */
+ *  and forward the same map-before-delta terminal contract (S-QMAP-1). */
 export function streamQueryFiles(
   req: {
     reqId: string

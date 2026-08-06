@@ -37,9 +37,19 @@ import {
   type SelectionViewState,
 } from './selectionState'
 import type { DeclSpan, FunctionSpan, ParserLang } from './parser/types.ts'
-import type { GenFrame } from './ghostTypes'
+import type { CodeEvidenceRef, GenFrame } from './ghostTypes'
 
-const props = defineProps<{ source: string; lang: string; path: string; allowWeb: boolean }>()
+interface EvidenceReveal extends CodeEvidenceRef {
+  revealKey: number
+}
+
+const props = defineProps<{
+  source: string
+  lang: string
+  path: string
+  allowWeb: boolean
+  revealEvidence?: EvidenceReveal | null
+}>()
 // Generation progress surfaces to the status bar (U1) via @progress; the
 // per-file query context (roster + generated capsules) surfaces to QueryPanel
 // via @context (S10b-cap), lifted through App as a sibling-component bridge.
@@ -573,6 +583,29 @@ watch(
   () => {
     view.value?.setState(buildState(props.source, props.lang))
     void activate(props.source, props.lang, props.path)
+  },
+)
+
+watch(
+  () => props.revealEvidence,
+  async (reference) => {
+    if (!reference || reference.filePath !== props.path) return
+    await nextTick()
+    window.requestAnimationFrame(() => {
+      const editor = view.value
+      if (!editor || reference.filePath !== currentPath) return
+      const lineNumber = Math.min(
+        Math.max(1, reference.startLine),
+        editor.state.doc.lines,
+      )
+      const position = editor.state.doc.line(lineNumber).from
+      closeSelectionUi()
+      editor.dispatch({
+        selection: { anchor: position },
+        effects: EditorView.scrollIntoView(position, { y: 'center' }),
+      })
+      editor.focus()
+    })
   },
 )
 

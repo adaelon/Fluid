@@ -2,12 +2,15 @@
 // S10b: the follow-up query terminal, docked as a bottom panel (ADR-0015/0016
 // PENDING resolved — out of the right edge so it never fights trailing line
 // notes). Asks the current file or selected file set a free-form question and
-// projects status/evidence plus token deltas from the matching query WebSocket.
+// projects the backend QueryMap before evidence/token deltas from the matching
+// query WebSocket, and turns only known E# citations into source navigation.
 // Switching files or scope vacuums the in-flight Q&A.
 import { computed, ref, watch, nextTick, onBeforeUnmount } from 'vue'
 import { streamQuery, streamQueryFiles, type QueryStream } from './api'
-import type { QueryFrame, QueryTrace } from './ghostTypes'
+import type { CodeEvidenceRef, QueryFrame, QueryMap, QueryTrace } from './ghostTypes'
 import { EMPTY_QUERY_CONTEXT, type QueryContext } from './queryContext'
+import QueryMapView from './QueryMapView.vue'
+import { queryAnswerEvidenceCitations, queryEvidenceById } from './queryEvidence'
 import {
   alignQueryTrace,
   appendCompletedQueryTurn,
@@ -48,6 +51,7 @@ const emit = defineEmits<{
   close: []
   toggleSelectionMode: []
   clearSelected: []
+  openEvidence: [CodeEvidenceRef]
 }>()
 
 type QueryScope = 'current' | 'selected'
@@ -55,6 +59,7 @@ type QueryScope = 'current' | 'selected'
 const question = ref('')
 const viewState = ref(idleQueryState())
 const trace = ref<QueryTrace | null>(null)
+const traceMaps = ref<QueryMap[]>([])
 const traceAnswerHtml = ref<string[]>([])
 const activeQuestion = ref('')
 const renderedEl = ref<HTMLElement | null>(null)
@@ -68,6 +73,16 @@ const completedTurns = computed(() => trace.value?.turns ?? [])
 const streaming = computed(() => viewState.value.mode === 'streaming')
 const errorMsg = computed(() => viewState.value.errorMessage)
 const evidenceState = computed(() => viewState.value.evidence)
+const activeUnknownEvidenceIds = computed(() => {
+  const map = viewState.value.map
+  return map ? queryAnswerEvidenceCitations(answer.value, map.evidence).unknownIds : []
+})
+const traceUnknownEvidenceIds = computed(() =>
+  completedTurns.value.map((turn, index) => {
+    const map = traceMaps.value[index]
+    return map ? queryAnswerEvidenceCitations(turn.answer, map.evidence).unknownIds : []
+  }),
+)
 const evidenceDisplay = computed(() => {
   switch (evidenceState.value?.status) {
     case 'project-source':
@@ -84,6 +99,8 @@ const statusText = computed(() => {
   switch (viewState.value.phase) {
     case 'connecting':
       return '正在连接追问服务…'
+    case 'planning-source':
+      return '正在规划相关源码证据…'
     case 'planning-web':
       return '正在规划联网检索…'
     case 'searching-web':
@@ -121,6 +138,7 @@ const canAsk = computed(() => {
 function resetTrace(clearQuestion = true) {
   teardown()
   trace.value = null
+  traceMaps.value = []
   traceAnswerHtml.value = []
   activeQuestion.value = ''
   viewState.value = idleQueryState()
@@ -148,10 +166,14 @@ watch(
 
 // On `done`, render every completed Markdown answer (ADR-0008): markdown-it
 // escapes raw HTML, DOMPurify is defense-in-depth, then KaTeX transforms math.
-async function renderTraceAnswers(generation: number, turns: QueryTrace['turns']) {
+async function renderTraceAnswers(
+  generation: number,
+  turns: QueryTrace['turns'],
+  maps: QueryMap[],
+) {
   // Pull the render libs on demand (S11-lazy). The CSS import is a side effect
   // (injects KaTeX styles) — its module value is unused.
-  const [{ renderMarkdown }, { default: DOMPurify }, { default: renderMathInElement }] =
+  const [{ renderQueryMarkdown }, { default: DOMPurify }, { default: renderMathInElement }] =
     await Promise.all([
       import('./render/markdown'),
       import('dompurify'),
@@ -159,7 +181,9 @@ async function renderTraceAnswers(generation: number, turns: QueryTrace['turns']
       import('katex/dist/katex.min.css'),
   ])
   if (generation !== requestGeneration) return
-  traceAnswerHtml.value = turns.map((turn) => DOMPurify.sanitize(renderMarkdown(turn.answer)))
+  traceAnswerHtml.value = turns.map((turn, index) =>
+    DOMPurify.sanitize(renderQueryMarkdown(turn.answer, maps[index]?.evidence ?? [])),
+  )
   await nextTick()
   if (generation !== requestGeneration || !renderedEl.value) return
   renderMathInElement(renderedEl.value, {
@@ -184,20 +208,51 @@ function acceptFrame(
   const next = reduceQueryFrame(previous, frame)
   if (next === previous && frame.reqId !== previous.requestId) return
   viewState.value = next
-  if (frame.kind === 'done') {
+  if (previous.mode !== 'error' && next.mode === 'error' && frame.kind !== 'error') {
+    stream?.cancel()
     stream = null
+    return
+  }
+  if (frame.kind === 'done' && next.mode === 'done' && next.map) {
+    stream = null
+    const citations = queryAnswerEvidenceCitations(next.answer, next.map.evidence)
     const completed = appendCompletedQueryTurn(
       trace.value,
       identity,
       askedQuestion,
       next.answer,
+      citations.knownIds,
     )
     trace.value = completed
+    const maps = [...traceMaps.value, next.map]
+    traceMaps.value = maps
     activeQuestion.value = ''
-    void renderTraceAnswers(generation, completed.turns)
+    void renderTraceAnswers(generation, completed.turns, maps)
   } else if (frame.kind === 'error') {
     stream = null
   }
+}
+
+function openEvidence(reference: CodeEvidenceRef) {
+  emit('openEvidence', reference)
+}
+
+function onAnswerClick(event: MouseEvent) {
+  const target = event.target
+  if (!(target instanceof Element)) return
+  const anchor = target.closest<HTMLAnchorElement>('a.query-code-evidence-link')
+  const href = anchor?.getAttribute('href') ?? ''
+  const prefix = '#fluid-evidence-'
+  if (!anchor || !href.startsWith(prefix)) return
+
+  const turn = anchor.closest<HTMLElement>('[data-query-turn-index]')
+  const index = Number(turn?.dataset.queryTurnIndex)
+  if (!Number.isInteger(index)) return
+  const map = traceMaps.value[index]
+  const reference = map && queryEvidenceById(map.evidence, href.slice(prefix.length))
+  if (!reference) return
+  event.preventDefault()
+  openEvidence(reference)
 }
 
 function newTrace() {
@@ -347,7 +402,7 @@ onBeforeUnmount(teardown)
     </header>
     <div v-if="!path && scope === 'current'" class="query-vacuum">打开文件以启用追问</div>
     <template v-else>
-      <div class="query-answer">
+      <div class="query-answer" @click="onAnswerClick">
           <div
             v-if="streaming && statusText"
             class="query-status"
@@ -357,6 +412,12 @@ onBeforeUnmount(teardown)
             <span v-if="viewState.phase !== 'fallback'" class="query-status-spinner" aria-hidden="true"></span>
             <span>{{ statusText }}</span>
           </div>
+
+          <QueryMapView
+            v-if="viewState.map"
+            :map="viewState.map"
+            @open-evidence="openEvidence"
+          />
 
           <div v-if="evidenceState" class="query-evidence-block">
             <div class="query-evidence-summary">
@@ -389,11 +450,24 @@ onBeforeUnmount(teardown)
           </div>
 
           <div v-if="completedTurns.length" ref="renderedEl" class="query-turn-list">
-            <article v-for="(turn, index) in completedTurns" :key="index" class="query-turn">
+            <article
+              v-for="(turn, index) in completedTurns"
+              :key="index"
+              class="query-turn"
+              :data-query-turn-index="index"
+            >
               <div class="query-turn-question">
                 <span class="query-turn-label">问 {{ index + 1 }}</span>
                 <span>{{ turn.question }}</span>
               </div>
+              <QueryMapView
+                v-if="
+                  traceMaps[index] &&
+                  !(viewState.mode === 'done' && index === completedTurns.length - 1)
+                "
+                :map="traceMaps[index]"
+                @open-evidence="openEvidence"
+              />
               <div class="query-turn-answer">
                 <span class="query-turn-label">答</span>
                 <div
@@ -401,8 +475,12 @@ onBeforeUnmount(teardown)
                   class="query-answer-md"
                   v-html="traceAnswerHtml[index]"
                 ></div>
-                <div v-else class="query-answer-plain">{{ turn.answer }}</div>
+                  <div v-else class="query-answer-plain">{{ turn.answer }}</div>
               </div>
+              <p v-if="traceUnknownEvidenceIds[index]?.length" class="query-warning" role="alert">
+                回答引用了未知代码证据：{{ traceUnknownEvidenceIds[index].join('、') }}。
+                这些编号不可跳转。
+              </p>
             </article>
           </div>
 
@@ -415,6 +493,10 @@ onBeforeUnmount(teardown)
               <span class="query-turn-label">答</span>
               <div class="query-answer-plain">{{ answer }}</div>
             </div>
+            <p v-if="activeUnknownEvidenceIds.length" class="query-warning" role="alert">
+              回答引用了未知代码证据：{{ activeUnknownEvidenceIds.join('、') }}。
+              这些编号不可跳转。
+            </p>
           </article>
 
           <span

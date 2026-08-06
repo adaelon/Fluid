@@ -148,10 +148,26 @@ export interface SourceLink {
   url: string
 }
 
-export type QueryPhase = 'planning-web' | 'searching-web' | 'answering' | 'fallback'
+export type QueryPhase =
+  | 'planning-source'
+  | 'planning-web'
+  | 'searching-web'
+  | 'answering'
+  | 'fallback'
 
-/** One completed question/answer pair in the in-memory follow-up trace. Code
- * evidence ids are empty until S-QSRC-1/S-QMAP-1 supplies source anchors. */
+/** Backend-built structural preview for one query. All E# references are local
+ * to this request and must resolve through `evidence`; graph-only relations are
+ * never promoted into `direction`. */
+export interface QueryMap {
+  actors: OrientationActor[]
+  direction: OrientationFlowStep[]
+  coreFunctionIds: string[]
+  supportingFunctionIds: string[]
+  walkthrough: OrientationWalkthrough
+  evidence: CodeEvidenceRef[]
+}
+
+/** One completed question/answer pair in the in-memory follow-up trace. */
 export interface QueryTurn {
   question: string
   answer: string
@@ -168,11 +184,12 @@ export interface QueryTrace {
   turns: QueryTurn[]
 }
 
-/** One inbound frame from either query WebSocket (S-QWEB-2, routes.rs
- * QueryFrame). `status` and `evidence` precede the existing free-form markdown
+/** One inbound frame from either query WebSocket (S-QMAP-1, routes.rs
+ * QueryFrame). `status* -> map -> evidence?` precedes the free-form markdown
  * `delta` stream; terminal frames remain `done` | `error`. */
 export type QueryFrame =
   | { kind: 'status'; reqId: string; phase: QueryPhase; message: string }
+  | { kind: 'map'; reqId: string; map: QueryMap }
   | {
       kind: 'evidence'
       reqId: string

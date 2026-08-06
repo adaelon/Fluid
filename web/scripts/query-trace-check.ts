@@ -11,6 +11,7 @@ import {
   startQueryTrace,
   reduceQueryFrame,
 } from '../src/queryState.ts'
+import type { QueryMap } from '../src/ghostTypes.ts'
 
 let failures = 0
 function check(label: string, condition: boolean): void {
@@ -19,6 +20,19 @@ function check(label: string, condition: boolean): void {
     console.error(`  FAIL  ${label}`)
     failures++
   }
+}
+
+const map: QueryMap = {
+  actors: [{ id: 'file', name: '当前文件', role: '本次追问范围。', boundary: 'inside-file' }],
+  direction: [],
+  coreFunctionIds: [],
+  supportingFunctionIds: [],
+  walkthrough: {
+    title: '直接作用',
+    input: 'fixture',
+    steps: [{ text: '核对当前源码。', evidenceIds: [] }],
+  },
+  evidence: [],
 }
 
 console.log('=== first question and continuous follow-ups ===')
@@ -58,6 +72,7 @@ let state = startQueryRequest('q-2')
 const beforeStale = state
 state = reduceQueryFrame(state, { kind: 'delta', reqId: 'q-1', text: '旧回答' })
 check('a stale request id cannot append answer text', state === beforeStale && state.answer === '')
+state = reduceQueryFrame(state, { kind: 'map', reqId: 'q-2', map })
 state = reduceQueryFrame(state, { kind: 'delta', reqId: 'q-2', text: '当前回答' })
 check('the active request id still streams normally', state.answer === '当前回答')
 

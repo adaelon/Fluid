@@ -30,18 +30,20 @@ use crate::cache_store::{
     SelectionExplanation, Translation, CAPSULE_PROMPT_VERSION, CAPSULE_SCHEMA_VERSION,
 };
 use crate::context_assembler::{
-    assemble_file_set_context, assemble_gen_context, build_bounded_orientation_prompt,
-    build_explain_decl_prompt, build_explain_line_prompt, build_file_set_query_prompt,
+    assemble_current_query_map, assemble_file_set_context, assemble_file_set_query_map,
+    assemble_gen_context, build_bounded_orientation_prompt, build_explain_decl_prompt,
+    build_explain_line_prompt, build_file_set_query_prompt, build_file_set_query_prompt_with_map,
     build_gen_prompt, build_orientation_prompt, build_orientation_source_planning_prompt,
-    build_query_prompt, build_query_source_planning_prompt, build_selection_explanation_prompt,
-    build_selection_private_context, build_untrusted_web_evidence_block,
-    cross_file_query_source_targets, cross_file_targets, extract_selection_site,
-    file_set_query_source_targets, focus_query_source_target, inline_query_source_target,
-    is_dependency_manifest_path, local_query_source_targets, orientation_core_source_targets,
-    orientation_requires_source_planning, rebase_query_source_targets, sample_dependency_manifests,
-    select_query_source_targets, slice_orientation_sources, slice_span, CrossFileTarget,
-    EvidenceCatalog, FileSetContext, FunctionSpan, GenContext, QueryFocus, QuerySourceTarget,
-    QueryTrace, SharedContext, ORIENTATION_FETCH_BUDGET_CHARS, QUERY_FETCH_BUDGET_CHARS,
+    build_query_prompt, build_query_prompt_with_map, build_query_source_planning_prompt,
+    build_selection_explanation_prompt, build_selection_private_context,
+    build_untrusted_web_evidence_block, cross_file_query_source_targets, cross_file_targets,
+    extract_selection_site, file_set_query_source_targets, focus_query_source_target,
+    inline_query_source_target, is_dependency_manifest_path, local_query_source_targets,
+    orientation_core_source_targets, orientation_requires_source_planning,
+    rebase_query_source_targets, sample_dependency_manifests, select_query_source_targets,
+    slice_orientation_sources, slice_span, CrossFileTarget, EvidenceCatalog, FileSetContext,
+    FunctionSpan, GenContext, QueryFocus, QueryMap, QuerySourceTarget, QueryTrace, SharedContext,
+    ORIENTATION_FETCH_BUDGET_CHARS, QUERY_FETCH_BUDGET_CHARS,
 };
 use crate::graph_loader::{GraphCatalog, GraphNode, KnowledgeGraph};
 use crate::llm_proxy::{
@@ -2486,15 +2488,16 @@ fn verify_query_orientation(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum QueryPhase {
+    PlanningSource,
     PlanningWeb,
     SearchingWeb,
     Answering,
     Fallback,
 }
 
-/// One outbound frame on either query socket. `status` and `evidence` are
-/// optional pre-answer frames; the existing `delta -> done | error` terminal
-/// contract remains unchanged. `reqId` is injected by the sender.
+/// One outbound frame on either query socket. Successful requests emit
+/// `status* -> map -> evidence -> delta* -> done`; `map` is the hard structural
+/// precondition for free-form answer text. `reqId` is injected by the sender.
 #[derive(Debug, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 enum QueryFrame {
@@ -2508,6 +2511,9 @@ enum QueryFrame {
         sources: Vec<SourceLink>,
         #[serde(skip_serializing_if = "Option::is_none")]
         warning: Option<String>,
+    },
+    Map {
+        map: QueryMap,
     },
     Delta {
         text: String,
@@ -2528,6 +2534,7 @@ enum QueryPlan {
     Direct {
         system: String,
         user: String,
+        map: Box<QueryMap>,
         dependency_hints: String,
     },
     /// Boxed so the (rare) two-phase variant doesn't bloat every `QueryPlan` value
@@ -2540,6 +2547,7 @@ enum QueryFilesPlan {
     Direct {
         system: String,
         user: String,
+        map: Box<QueryMap>,
         dependency_hints: String,
     },
     Degraded(Box<QueryFilesDegradedPlan>),
@@ -2562,6 +2570,7 @@ struct DegradedPlan {
     sources: BTreeMap<String, String>,
     mandatory_targets: Vec<QuerySourceTarget>,
     targets: Vec<QuerySourceTarget>,
+    orientation: FileOrientationCard,
     ctx: GenContext,
     capsules: Vec<(String, String)>,
     focus_name: Option<String>,
@@ -2697,17 +2706,23 @@ fn prepare_query_for_snapshot(
     targets.extend(cross_file_query_source_targets(&cross_targets));
 
     if targets.is_empty() {
-        let (system, user) = build_query_prompt(
+        let map = match assemble_current_query_map(&orientation, &initial_evidence) {
+            Ok(map) => map,
+            Err(message) => return QueryPlan::Err(message),
+        };
+        let (system, user) = build_query_prompt_with_map(
             &req.question,
             req.trace.as_ref(),
             &capsules,
             focus_ref,
             &ctx,
+            &map,
             &initial_evidence,
         );
         return QueryPlan::Direct {
             system,
             user,
+            map: Box::new(map),
             dependency_hints,
         };
     }
@@ -2737,6 +2752,7 @@ fn prepare_query_for_snapshot(
         sources,
         mandatory_targets,
         targets,
+        orientation,
         ctx,
         capsules,
         focus_name,
@@ -2825,15 +2841,22 @@ fn prepare_query_files_for_snapshot(
         }));
     }
 
-    let (system, user) = build_file_set_query_prompt(
+    let evidence = EvidenceCatalog::default();
+    let map = match assemble_file_set_query_map(&req.question, &ctx, &evidence) {
+        Ok(map) => map,
+        Err(message) => return QueryFilesPlan::Err(message),
+    };
+    let (system, user) = build_file_set_query_prompt_with_map(
         &req.question,
         req.trace.as_ref(),
         &ctx,
-        &EvidenceCatalog::default(),
+        &map,
+        &evidence,
     );
     QueryFilesPlan::Direct {
         system,
         user,
+        map: Box::new(map),
         dependency_hints,
     }
 }
@@ -2862,7 +2885,7 @@ async fn enrich_query_user<F>(
     dependency_hints: &str,
     allow_web: bool,
     emit: &mut F,
-) -> String
+) -> (String, EvidenceOutcome)
 where
     F: FnMut(QueryFrame) + Send,
 {
@@ -2890,14 +2913,12 @@ where
     if let Some(warning) = &evidence.warning {
         emit(query_status(QueryPhase::Fallback, warning.clone()));
     }
-    emit(query_evidence(&evidence));
-    emit(query_status(QueryPhase::Answering, "正在生成追问回答"));
 
     if let Some(block) = evidence_prompt_block(&evidence) {
         user.push_str("\n\n");
         user.push_str(&block);
     }
-    user
+    (user, evidence)
 }
 
 async fn stream_query_answer<F>(
@@ -3055,7 +3076,7 @@ where
         config: llm_config,
         proxy: llm_proxy,
     } = state.llm_snapshot();
-    let (system, user, dependency_hints) =
+    let (system, user, map, dependency_hints) =
         match prepare_query_for_snapshot(state, &req, llm_proxy.as_ref().map(|_| &llm_config)) {
             QueryPlan::Err(message) => {
                 emit(QueryFrame::Error { message });
@@ -3064,8 +3085,9 @@ where
             QueryPlan::Direct {
                 system,
                 user,
+                map,
                 dependency_hints,
-            } => (system, user, dependency_hints),
+            } => (system, user, *map, dependency_hints),
             QueryPlan::Degraded(plan) => {
                 let DegradedPlan {
                     planning_system,
@@ -3073,6 +3095,7 @@ where
                     sources,
                     mandatory_targets,
                     targets,
+                    orientation,
                     ctx,
                     capsules,
                     focus_name,
@@ -3086,6 +3109,10 @@ where
                     req.file_path,
                     targets.len()
                 );
+                emit(query_status(
+                    QueryPhase::PlanningSource,
+                    "正在规划相关源码证据",
+                ));
                 let need = match llm.complete(&planning_system, &planning_user).await {
                     Ok(content) => parse_fetch_plan(&content),
                     Err(error) => {
@@ -3124,22 +3151,34 @@ where
                     );
                 }
                 let focus_ref = focus_name.as_deref().map(|name| QueryFocus { name });
-                let (system, user) = build_query_prompt(
+                let map = match assemble_current_query_map(&orientation, &evidence) {
+                    Ok(map) => map,
+                    Err(message) => {
+                        emit(QueryFrame::Error { message });
+                        return;
+                    }
+                };
+                let (system, user) = build_query_prompt_with_map(
                     &req.question,
                     req.trace.as_ref(),
                     &capsules,
                     focus_ref,
                     &ctx,
+                    &map,
                     &evidence,
                 );
-                (system, user, dependency_hints)
+                (system, user, map, dependency_hints)
             }
         };
 
     let llm = llm_proxy
         .as_ref()
         .expect("a non-error plan requires the captured LLM snapshot");
-    let user = enrich_query_user(llm, user, &dependency_hints, req.allow_web, &mut emit).await;
+    let (user, evidence) =
+        enrich_query_user(llm, user, &dependency_hints, req.allow_web, &mut emit).await;
+    emit(query_status(QueryPhase::Answering, "正在生成追问回答"));
+    emit(QueryFrame::Map { map });
+    emit(query_evidence(&evidence));
     eprintln!("[query] {} — streaming ({})", req.file_path, llm.model);
     stream_query_answer(llm, &system, &user, "query", &mut emit).await;
 }
@@ -3149,7 +3188,7 @@ where
     F: FnMut(QueryFrame) + Send,
 {
     let llm_proxy = state.llm_proxy();
-    let (system, user, dependency_hints) =
+    let (system, user, map, dependency_hints) =
         match prepare_query_files_for_snapshot(state, &req, llm_proxy.is_some()) {
             QueryFilesPlan::Err(message) => {
                 emit(QueryFrame::Error { message });
@@ -3158,8 +3197,9 @@ where
             QueryFilesPlan::Direct {
                 system,
                 user,
+                map,
                 dependency_hints,
-            } => (system, user, dependency_hints),
+            } => (system, user, *map, dependency_hints),
             QueryFilesPlan::Degraded(plan) => {
                 let QueryFilesDegradedPlan {
                     planning_system,
@@ -3176,6 +3216,10 @@ where
                     "[query-files] planning source evidence ({} graph-scoped candidates)",
                     targets.len()
                 );
+                emit(query_status(
+                    QueryPhase::PlanningSource,
+                    "正在规划相关源码证据",
+                ));
                 let need = match llm.complete(&planning_system, &planning_user).await {
                     Ok(content) => parse_fetch_plan(&content),
                     Err(error) => {
@@ -3201,16 +3245,32 @@ where
                         .collect::<Vec<_>>();
                     eprintln!("[query-files] source evidence: {}", got.join(", "));
                 }
-                let (system, user) =
-                    build_file_set_query_prompt(&req.question, req.trace.as_ref(), &ctx, &evidence);
-                (system, user, dependency_hints)
+                let map = match assemble_file_set_query_map(&req.question, &ctx, &evidence) {
+                    Ok(map) => map,
+                    Err(message) => {
+                        emit(QueryFrame::Error { message });
+                        return;
+                    }
+                };
+                let (system, user) = build_file_set_query_prompt_with_map(
+                    &req.question,
+                    req.trace.as_ref(),
+                    &ctx,
+                    &map,
+                    &evidence,
+                );
+                (system, user, map, dependency_hints)
             }
         };
 
     let llm = llm_proxy
         .as_ref()
         .expect("a non-error plan requires the captured LLM snapshot");
-    let user = enrich_query_user(llm, user, &dependency_hints, req.allow_web, &mut emit).await;
+    let (user, evidence) =
+        enrich_query_user(llm, user, &dependency_hints, req.allow_web, &mut emit).await;
+    emit(query_status(QueryPhase::Answering, "正在生成追问回答"));
+    emit(QueryFrame::Map { map });
+    emit(query_evidence(&evidence));
     eprintln!(
         "[query-files] {} files — streaming ({})",
         req.file_paths.len(),
@@ -5319,11 +5379,44 @@ mod tests {
             .iter()
             .filter_map(|frame| frame["kind"].as_str())
             .collect();
+        let map_index = kinds.iter().position(|kind| *kind == "map").unwrap();
+        let evidence_index = kinds.iter().position(|kind| *kind == "evidence").unwrap();
         let delta = kinds.iter().position(|kind| *kind == "delta").unwrap();
         let done = kinds.iter().position(|kind| *kind == "done").unwrap();
-        assert!(delta < done, "delta must precede done: {kinds:?}");
+        assert!(
+            kinds[..map_index].iter().all(|kind| *kind == "status"),
+            "only status frames may precede map: {kinds:?}"
+        );
+        assert_eq!(
+            evidence_index,
+            map_index + 1,
+            "evidence follows map: {kinds:?}"
+        );
+        assert!(
+            kinds[evidence_index + 1..done]
+                .iter()
+                .all(|kind| *kind == "delta"),
+            "only deltas may follow evidence before done: {kinds:?}"
+        );
+        assert!(
+            map_index < delta && delta < done,
+            "map must precede delta/done: {kinds:?}"
+        );
+        assert_eq!(kinds.iter().filter(|kind| **kind == "map").count(), 1);
         assert!(!kinds.contains(&"error"));
         assert_eq!(frames[delta]["text"], "fixture answer");
+
+        let map: crate::context_assembler::QueryMap =
+            serde_json::from_value(frames[map_index]["map"].clone()).expect("query map frame");
+        crate::context_assembler::validate_query_map(&map)
+            .expect("fixture map references must all resolve");
+    }
+
+    fn map_frame(frames: &[serde_json::Value]) -> &serde_json::Value {
+        frames
+            .iter()
+            .find(|frame| frame["kind"] == "map")
+            .expect("map frame")
     }
 
     fn evidence_frame(frames: &[serde_json::Value]) -> &serde_json::Value {
@@ -5408,6 +5501,12 @@ mod tests {
 
     #[test]
     fn query_frame_serializes_with_kebab_kind() {
+        let planning = serde_json::to_value(QueryFrame::Status {
+            phase: QueryPhase::PlanningSource,
+            message: "取源中".into(),
+        })
+        .unwrap();
+        assert_eq!(planning["phase"], "planning-source");
         let v = serde_json::to_value(QueryFrame::Status {
             phase: QueryPhase::PlanningWeb,
             message: "规划中".into(),
@@ -5526,6 +5625,18 @@ mod tests {
         ] {
             let frames = query_ws_frames(&app, endpoint, request).await;
             assert_query_stream_succeeds(&frames, req_id);
+            let map = map_frame(&frames);
+            if endpoint == "/api/query" {
+                assert_eq!(map["map"]["direction"].as_array().unwrap().len(), 1);
+                assert_eq!(map["map"]["direction"][0]["evidenceIds"][0], "E1");
+                assert_eq!(map["map"]["coreFunctionIds"][0], "fa#1");
+            } else {
+                assert!(map["map"]["direction"].as_array().unwrap().is_empty());
+                assert_eq!(
+                    map["map"]["walkthrough"]["steps"][0]["text"],
+                    "当前没有可核验的跨组件源码方向；回答只能把图谱关系作为导航提示。"
+                );
+            }
             assert_eq!(evidence_frame(&frames)["status"], "unverified");
             assert!(evidence_frame(&frames).get("sources").is_none());
             assert!(evidence_frame(&frames).get("warning").is_none());
@@ -5565,6 +5676,23 @@ mod tests {
         assert!(answer_prompts
             .iter()
             .all(|prompt| prompt.contains("不是源码证据")));
+        assert!(answer_prompts
+            .iter()
+            .all(|prompt| prompt.contains("【追问方向图（后端确定性组装，不是模型输出）】")));
+        assert!(answer_prompts
+            .iter()
+            .all(|prompt| prompt.contains("\"walkthrough\"")));
+        let answer_systems: Vec<&str> = requests
+            .iter()
+            .filter(|(kind, _)| kind == "answer")
+            .map(|(_, body)| body["messages"][0]["content"].as_str().unwrap())
+            .collect();
+        assert!(answer_systems
+            .iter()
+            .all(|prompt| prompt.contains("禁止创建、改写或猜测任何结构 ID、源码行号")));
+        assert!(answer_systems
+            .iter()
+            .all(|prompt| prompt.contains("关键方向与调用链结论必须引用已知 [E#]")));
     }
 
     #[tokio::test]
