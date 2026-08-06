@@ -2,10 +2,6 @@
 import { nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue'
 import { Compartment, EditorState, type Extension } from '@codemirror/state'
 import { EditorView } from '@codemirror/view'
-import { basicSetup } from 'codemirror'
-import { python } from '@codemirror/lang-python'
-import { rust } from '@codemirror/lang-rust'
-import { javascript } from '@codemirror/lang-javascript'
 import { GhostStore } from './ghostStore'
 import { ghostField, foldClickHandler, retryClickHandler, refreshGhosts } from './render/ghostField'
 import { fnGutter, explainClickHandler } from './render/gutter'
@@ -17,7 +13,7 @@ import {
   type SelectionStream,
 } from './api'
 import { getParser } from './parser/browser'
-import { fluidDarkTheme } from './theme'
+import { readOnlyCodeViewExtensions } from './codeView'
 import { GenScheduler, viewportDistance } from './scheduler'
 import { buildQueryContext, type QueryContext } from './queryContext'
 import OrientationCard from './OrientationCard.vue'
@@ -173,28 +169,11 @@ function onFontKey(e: KeyboardEvent): void {
   }
 }
 
-function langExtension(lang: string): Extension {
-  if (lang === 'py') return python()
-  if (lang === 'rs') return rust()
-  // TS/JS family: one package, flavor toggled by the backend lang tag. These are
-  // highlight-only — generation stays gated to py/rs (isParserLang) for now.
-  if (lang === 'ts') return javascript({ typescript: true })
-  if (lang === 'tsx') return javascript({ typescript: true, jsx: true })
-  if (lang === 'js') return javascript()
-  if (lang === 'jsx') return javascript({ jsx: true })
-  return []
-}
-
 function buildState(source: string, lang: string): EditorState {
   return EditorState.create({
     doc: source,
     extensions: [
-      basicSetup,
-      fluidDarkTheme,
-      fontCompartment.of(fontTheme(fontPx.value)),
-      langExtension(lang),
-      EditorState.readOnly.of(true),
-      EditorView.editable.of(false),
+      ...readOnlyCodeViewExtensions(lang, [fontCompartment.of(fontTheme(fontPx.value))]),
       ghostField(store),
       fnGutter(store),
       foldClickHandler(store),

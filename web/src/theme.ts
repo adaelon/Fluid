@@ -1,10 +1,11 @@
-// Fluid dark theme for CodeMirror 6 (ADR-0016, U-R1).
+// Shared Fluid dark theme for read-only CodeMirror 6 surfaces (ADR-0016, U-R1).
 //
-// Before this, Editor.vue shipped only `basicSetup`, whose default highlight
+// Before this, the main Editor shipped only `basicSetup`, whose default highlight
 // style is tuned for light backgrounds — rendered inside the #0d1117 GitHub-dark
 // shell it read as harsh light syntax on dark. This theme + HighlightStyle match
 // the existing GitHub-dark palette (same vars as styles.css :root) so the code
-// reading area belongs to the shell.
+// reading surfaces belong to the shell. `codeView.ts` composes this theme into
+// the common base used by the Editor and future source-evidence previews.
 
 import { EditorView } from '@codemirror/view'
 import { HighlightStyle, syntaxHighlighting } from '@codemirror/language'
