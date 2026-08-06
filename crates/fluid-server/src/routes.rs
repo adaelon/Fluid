@@ -31,15 +31,16 @@ use crate::cache_store::{
 };
 use crate::context_assembler::{
     assemble_file_set_context, assemble_gen_context, build_bounded_orientation_prompt,
-    build_explain_decl_prompt, build_explain_line_prompt, build_file_set_query_planning_prompt,
-    build_file_set_query_prompt, build_gen_prompt, build_orientation_prompt,
-    build_orientation_source_planning_prompt, build_query_planning_prompt, build_query_prompt,
-    build_selection_explanation_prompt, build_selection_private_context,
-    build_untrusted_web_evidence_block, cross_file_targets, extract_selection_site,
-    file_set_fetchable_targets, is_dependency_manifest_path, orientation_requires_source_planning,
-    query_degraded_names, sample_dependency_manifests, slice_cross_file_sources,
-    slice_file_set_sources, slice_orientation_sources, slice_requested_sources, slice_span,
-    CrossFileTarget, FileSetContext, FileSetSourceTarget, FunctionSpan, GenContext, QueryFocus,
+    build_explain_decl_prompt, build_explain_line_prompt, build_file_set_query_prompt,
+    build_gen_prompt, build_orientation_prompt, build_orientation_source_planning_prompt,
+    build_query_prompt, build_query_source_planning_prompt, build_selection_explanation_prompt,
+    build_selection_private_context, build_untrusted_web_evidence_block,
+    cross_file_query_source_targets, cross_file_targets, extract_selection_site,
+    file_set_query_source_targets, focus_query_source_target, inline_query_source_target,
+    is_dependency_manifest_path, local_query_source_targets, orientation_core_source_targets,
+    orientation_requires_source_planning, rebase_query_source_targets, sample_dependency_manifests,
+    select_query_source_targets, slice_orientation_sources, slice_span, CrossFileTarget,
+    EvidenceCatalog, FileSetContext, FunctionSpan, GenContext, QueryFocus, QuerySourceTarget,
     QueryTrace, SharedContext, ORIENTATION_FETCH_BUDGET_CHARS, QUERY_FETCH_BUDGET_CHARS,
 };
 use crate::graph_loader::{GraphCatalog, GraphNode, KnowledgeGraph};
@@ -2443,7 +2444,7 @@ fn verify_query_orientation(
     config: &LlmConfig,
     req: &QueryRequest,
     source: &str,
-) -> Result<(), String> {
+) -> Result<FileOrientationCard, String> {
     project.graphs.refresh();
     let roster_fn_ids = verify_orientation_roster(source, &req.roster_spans)
         .map_err(|error| format!("invalid rosterSpans: {error}"))?;
@@ -2479,8 +2480,7 @@ fn verify_query_orientation(
     project
         .cache
         .get_orientation(&identity, &validation)
-        .ok_or_else(|| "unknown or stale orientationId; retry file orientation".to_string())?;
-    Ok(())
+        .ok_or_else(|| "unknown or stale orientationId; retry file orientation".to_string())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -2549,7 +2549,7 @@ struct QueryFilesDegradedPlan {
     planning_system: String,
     planning_user: String,
     ctx: FileSetContext,
-    fetchable: Vec<FileSetSourceTarget>,
+    targets: Vec<QuerySourceTarget>,
     sources: BTreeMap<String, String>,
     dependency_hints: String,
 }
@@ -2559,17 +2559,12 @@ struct QueryFilesDegradedPlan {
 struct DegradedPlan {
     planning_system: String,
     planning_user: String,
-    file_source: String,
+    sources: BTreeMap<String, String>,
+    mandatory_targets: Vec<QuerySourceTarget>,
+    targets: Vec<QuerySourceTarget>,
     ctx: GenContext,
     capsules: Vec<(String, String)>,
-    focus: Option<(String, u32, String)>,
-    /// Same-file name-only functions the model may fetch (S10a-追源).
-    fetchable: Vec<String>,
-    /// Cross-file callees the model may fetch (S10c, ADR-0007 修订).
-    cross_targets: Vec<CrossFileTarget>,
-    /// `file_path` → full source for every distinct cross-file target file,
-    /// read under the lock so `run_query` can slice after the lock drops.
-    cross_sources: BTreeMap<String, String>,
+    focus_name: Option<String>,
     dependency_hints: String,
 }
 
@@ -2601,33 +2596,32 @@ fn prepare_query_for_snapshot(
         Err(ReadErr::Forbidden) => return QueryPlan::Err("path outside project root".into()),
     };
 
-    // The focused function zoomed to source granularity (owned so it survives the
-    // lock drop / planning await). Its name rides along for prioritization + fetch.
-    let focus: Option<(String, u32, String)> = match &req.focus {
-        Some(f) => match slice_span(&source, f.line_range) {
-            Some(src) => Some((src, f.line_range[0], f.name.clone())),
-            None => return QueryPlan::Err("invalid lineRange for focus".into()),
-        },
-        None => None,
-    };
+    if req
+        .focus
+        .as_ref()
+        .is_some_and(|focus| slice_span(&source, focus.line_range).is_none())
+    {
+        return QueryPlan::Err("invalid lineRange for focus".into());
+    }
 
     let Some(llm_config) = llm_config else {
         return QueryPlan::Err("LLM not configured: set OPENCODE_API_KEY".into());
     };
 
+    if req.orientation_id.is_empty() {
+        return QueryPlan::Err("orientationId is required for current-file query".into());
+    }
     if let Some(trace) = req.trace.as_ref() {
-        if req.orientation_id.is_empty() {
-            return QueryPlan::Err("orientationId is required when query trace is present".into());
-        }
         let expected_scope_key = format!("current:{}", req.file_path);
         if let Err(message) = validate_query_trace(trace, &expected_scope_key, &req.orientation_id)
         {
             return QueryPlan::Err(message);
         }
-        if let Err(message) = verify_query_orientation(proj, llm_config, req, &source) {
-            return QueryPlan::Err(message);
-        }
     }
+    let orientation = match verify_query_orientation(proj, llm_config, req, &source) {
+        Ok(card) => card,
+        Err(message) => return QueryPlan::Err(message),
+    };
 
     let snapshot = proj.graphs.graph_for_file(&req.file_path);
     let ctx = assemble_gen_context(snapshot, &req.file_path, &req.roster, &req.shared);
@@ -2641,25 +2635,37 @@ fn prepare_query_for_snapshot(
         .iter()
         .map(|c| (c.name.clone(), c.summary.clone()))
         .collect();
-    let focus_ref = focus.as_ref().map(|(s, n, name)| QueryFocus {
-        source: s.as_str(),
-        start_line: *n,
-        name: name.as_str(),
-    });
+    let focus_name = req.focus.as_ref().map(|focus| focus.name.clone());
+    let focus_ref = focus_name.as_deref().map(|name| QueryFocus { name });
 
-    // Same-file functions degraded to name-only that we can actually slice (have a
-    // span) form the same-file fetchable set (S10a-追源).
-    let degraded = query_degraded_names(
-        &req.question,
-        req.trace.as_ref(),
-        &capsules,
-        focus_ref.as_ref(),
-        &ctx,
-    );
-    let same_file_fetchable: Vec<String> = degraded
-        .into_iter()
-        .filter(|name| req.roster_spans.iter().any(|s| &s.name == name))
-        .collect();
+    let mut sources = BTreeMap::new();
+    sources.insert(req.file_path.clone(), source.clone());
+    let inline = inline_query_source_target(&req.file_path, &source);
+    let mut mandatory_targets = Vec::new();
+    if let Some(target) = inline.clone() {
+        mandatory_targets.push(target);
+    }
+    if let Some(focus) = req.focus.as_ref() {
+        mandatory_targets.push(focus_query_source_target(&req.file_path, focus));
+    }
+    if inline.is_none() {
+        mandatory_targets.extend(orientation_core_source_targets(&orientation));
+    }
+
+    let initial_evidence =
+        EvidenceCatalog::assemble(&sources, &mandatory_targets, QUERY_FETCH_BUDGET_CHARS);
+    if let Err(message) = initial_evidence.validate_against_sources(&sources) {
+        return QueryPlan::Err(message);
+    }
+
+    // Large current files expose every verified local fnId to one planner. Small
+    // files already contribute their full source and therefore expose only
+    // bounded cross-file candidates.
+    let mut targets = if inline.is_none() {
+        local_query_source_targets(&req.file_path, &req.roster_spans, &orientation)
+    } else {
+        Vec::new()
+    };
 
     // Cross-file callees the graph can locate (S10c, ADR-0007 修订). Read each
     // distinct target file's source now, under the lock, so run_query can slice
@@ -2667,13 +2673,19 @@ fn prepare_query_for_snapshot(
     // target whose file can't be read is dropped (never offer a name we can't
     // honor). Pure read: no cache write, no activation — 目标文件事后仍真空.
     let cross_all = cross_file_targets(snapshot, &req.file_path, &req.roster);
-    let mut cross_sources: BTreeMap<String, String> = BTreeMap::new();
     let mut cross_targets: Vec<CrossFileTarget> = Vec::new();
     for t in cross_all {
-        let have = cross_sources.contains_key(&t.file_path)
+        if proj
+            .graphs
+            .graph_for_file(&t.file_path)
+            .is_none_or(|owner| owner.identity() != t.graph_id)
+        {
+            continue;
+        }
+        let have = sources.contains_key(&t.file_path)
             || match proj.reader.read_file(&t.file_path) {
                 Ok(s) => {
-                    cross_sources.insert(t.file_path.clone(), s);
+                    sources.insert(t.file_path.clone(), s);
                     true
                 }
                 Err(_) => false,
@@ -2682,23 +2694,16 @@ fn prepare_query_for_snapshot(
             cross_targets.push(t);
         }
     }
+    targets.extend(cross_file_query_source_targets(&cross_targets));
 
-    // fetchable for the planning prompt = same-file degraded ∪ cross-file callees.
-    // The two name pools are disjoint (cross excludes roster names), so the model's
-    // `{"need":[...]}` resolves each name to exactly one pool in run_query.
-    // Non-empty (either pool) → two-phase fetch; empty → single streaming call
-    // (ADR-0017 修订: 门控由「仅降级时」扩为「fetchable 非空即触发」).
-    let mut fetchable = same_file_fetchable.clone();
-    fetchable.extend(cross_targets.iter().map(|t| t.name.clone()));
-
-    if fetchable.is_empty() {
+    if targets.is_empty() {
         let (system, user) = build_query_prompt(
             &req.question,
             req.trace.as_ref(),
             &capsules,
             focus_ref,
             &ctx,
-            &[],
+            &initial_evidence,
         );
         return QueryPlan::Direct {
             system,
@@ -2707,24 +2712,34 @@ fn prepare_query_for_snapshot(
         };
     }
 
-    let (planning_system, planning_user) = build_query_planning_prompt(
+    let (_, navigation_prompt) = build_query_prompt(
         &req.question,
         req.trace.as_ref(),
         &capsules,
         focus_ref,
         &ctx,
-        &fetchable,
+        &initial_evidence,
+    );
+    let focus_id = req
+        .focus
+        .as_ref()
+        .map(|focus| format!("focus:{}", focus.id));
+    let (planning_system, planning_user) = build_query_source_planning_prompt(
+        &format!("current:{}", req.file_path),
+        &navigation_prompt,
+        Some(&orientation),
+        focus_id.as_deref(),
+        &targets,
     );
     QueryPlan::Degraded(Box::new(DegradedPlan {
         planning_system,
         planning_user,
-        file_source: source,
+        sources,
+        mandatory_targets,
+        targets,
         ctx,
         capsules,
-        focus,
-        fetchable: same_file_fetchable,
-        cross_targets,
-        cross_sources,
+        focus_name,
         dependency_hints,
     }))
 }
@@ -2746,10 +2761,11 @@ fn prepare_query_files_for_snapshot(
         }
     }
 
-    let guard = state.project.read().unwrap();
-    let Some(proj) = guard.as_ref() else {
+    let mut guard = state.project.write().unwrap();
+    let Some(proj) = guard.as_mut() else {
         return QueryFilesPlan::Err("no project open".into());
     };
+    proj.graphs.refresh();
 
     let ctx = match assemble_file_set_context(&proj.graphs, &req.file_paths) {
         Ok(ctx) => ctx,
@@ -2766,40 +2782,55 @@ fn prepare_query_files_for_snapshot(
         String::new()
     };
 
-    let mut sources: BTreeMap<String, String> = BTreeMap::new();
-    let mut fetchable = Vec::new();
-    for t in file_set_fetchable_targets(&ctx) {
-        let have = sources.contains_key(&t.file_path)
-            || match proj.reader.read_file(&t.file_path) {
-                Ok(s) => {
-                    sources.insert(t.file_path.clone(), s);
-                    true
-                }
-                Err(_) => false,
-            };
-        if have {
-            fetchable.push(t);
-        }
+    let mut sources = BTreeMap::new();
+    for file in &ctx.files {
+        let source = match proj.reader.read_file(&file.path) {
+            Ok(source) => source,
+            Err(ReadErr::NotFound) => {
+                return QueryFilesPlan::Err(format!("selected file not found: {}", file.path))
+            }
+            Err(ReadErr::Forbidden) => {
+                return QueryFilesPlan::Err(format!(
+                    "selected file is outside project root: {}",
+                    file.path
+                ))
+            }
+        };
+        sources.insert(file.path.clone(), source);
     }
+    let targets: Vec<QuerySourceTarget> = file_set_query_source_targets(&ctx)
+        .into_iter()
+        .filter(|target| sources.contains_key(&target.file_path))
+        .collect();
 
-    if !fetchable.is_empty() {
-        let (planning_system, planning_user) = build_file_set_query_planning_prompt(
-            &req.question,
-            req.trace.as_ref(),
-            &ctx,
-            &fetchable,
+    if !targets.is_empty() {
+        let empty_evidence = EvidenceCatalog::default();
+        let (_, navigation_prompt) =
+            build_file_set_query_prompt(&req.question, req.trace.as_ref(), &ctx, &empty_evidence);
+        let (scope_key, _) = selected_query_scope_identity(&req.file_paths);
+        let (planning_system, planning_user) = build_query_source_planning_prompt(
+            &scope_key,
+            &navigation_prompt,
+            None,
+            None,
+            &targets,
         );
         return QueryFilesPlan::Degraded(Box::new(QueryFilesDegradedPlan {
             planning_system,
             planning_user,
             ctx,
-            fetchable,
+            targets,
             sources,
             dependency_hints,
         }));
     }
 
-    let (system, user) = build_file_set_query_prompt(&req.question, req.trace.as_ref(), &ctx, &[]);
+    let (system, user) = build_file_set_query_prompt(
+        &req.question,
+        req.trace.as_ref(),
+        &ctx,
+        &EvidenceCatalog::default(),
+    );
     QueryFilesPlan::Direct {
         system,
         user,
@@ -2909,6 +2940,108 @@ async fn stream_query_answer<F>(
     emit(QueryFrame::Done);
 }
 
+fn current_query_evidence_after_plan(
+    state: &AppState,
+    req: &QueryRequest,
+    llm_config: &LlmConfig,
+    planned_sources: &BTreeMap<String, String>,
+    mandatory_targets: &[QuerySourceTarget],
+    targets: &[QuerySourceTarget],
+    need: &[String],
+) -> Result<EvidenceCatalog, String> {
+    let mut guard = state.project.write().unwrap();
+    let project = guard
+        .as_mut()
+        .ok_or_else(|| "no project open".to_string())?;
+    let active_source = project
+        .reader
+        .read_file(&req.file_path)
+        .map_err(|error| match error {
+            ReadErr::NotFound => "file changed or disappeared during source planning".to_string(),
+            ReadErr::Forbidden => "path outside project root".to_string(),
+        })?;
+    let planned_active = planned_sources
+        .get(&req.file_path)
+        .ok_or_else(|| "current source snapshot is missing".to_string())?;
+    if active_source.as_bytes() != planned_active.as_bytes() {
+        return Err("current file changed during source planning; retry query".into());
+    }
+    // Refresh graph ownership and revalidate the backend orientation after the
+    // await. A changed graph/card/source cannot silently reuse the old planner.
+    verify_query_orientation(project, llm_config, req, &active_source)?;
+
+    let mut current_sources = BTreeMap::new();
+    current_sources.insert(req.file_path.clone(), active_source);
+    for path in planned_sources
+        .keys()
+        .filter(|path| *path != &req.file_path)
+    {
+        if let Ok(source) = project.reader.read_file(path) {
+            current_sources.insert(path.clone(), source);
+        }
+    }
+
+    let selected = select_query_source_targets(targets, need)
+        .into_iter()
+        .filter(|target| {
+            target.graph_id.as_ref().is_none_or(|graph_id| {
+                project
+                    .graphs
+                    .graph_for_file(&target.file_path)
+                    .is_some_and(|owner| owner.identity() == graph_id)
+            })
+        })
+        .collect::<Vec<_>>();
+    let selected = rebase_query_source_targets(&selected, planned_sources, &current_sources);
+    let mut ordered_targets = mandatory_targets.to_vec();
+    ordered_targets.extend(selected);
+    let catalog =
+        EvidenceCatalog::assemble(&current_sources, &ordered_targets, QUERY_FETCH_BUDGET_CHARS);
+    catalog.validate_against_sources(&current_sources)?;
+    Ok(catalog)
+}
+
+fn selected_query_evidence_after_plan(
+    state: &AppState,
+    planned_sources: &BTreeMap<String, String>,
+    targets: &[QuerySourceTarget],
+    need: &[String],
+) -> Result<EvidenceCatalog, String> {
+    let mut guard = state.project.write().unwrap();
+    let project = guard
+        .as_mut()
+        .ok_or_else(|| "no project open".to_string())?;
+    project.graphs.refresh();
+
+    let mut current_sources = BTreeMap::new();
+    for path in planned_sources.keys() {
+        let source = project
+            .reader
+            .read_file(path)
+            .map_err(|error| match error {
+                ReadErr::NotFound => format!("selected file changed or disappeared: {path}"),
+                ReadErr::Forbidden => format!("selected file is outside project root: {path}"),
+            })?;
+        current_sources.insert(path.clone(), source);
+    }
+
+    let selected = select_query_source_targets(targets, need)
+        .into_iter()
+        .filter(|target| {
+            target.graph_id.as_ref().is_some_and(|graph_id| {
+                project
+                    .graphs
+                    .graph_for_file(&target.file_path)
+                    .is_some_and(|owner| owner.identity() == graph_id)
+            })
+        })
+        .collect::<Vec<_>>();
+    let selected = rebase_query_source_targets(&selected, planned_sources, &current_sources);
+    let catalog = EvidenceCatalog::assemble(&current_sources, &selected, QUERY_FETCH_BUDGET_CHARS);
+    catalog.validate_against_sources(&current_sources)?;
+    Ok(catalog)
+}
+
 /// Run one current-file query without owning a socket. The synchronous emitter
 /// lets progress frames reach the socket while the worker is awaiting provider IO
 /// and gives fixtures the exact same execution path as production.
@@ -2937,23 +3070,21 @@ where
                 let DegradedPlan {
                     planning_system,
                     planning_user,
-                    file_source,
+                    sources,
+                    mandatory_targets,
+                    targets,
                     ctx,
                     capsules,
-                    focus,
-                    fetchable,
-                    cross_targets,
-                    cross_sources,
+                    focus_name,
                     dependency_hints,
                 } = *plan;
                 let llm = llm_proxy
                     .as_ref()
                     .expect("Degraded plan requires the captured LLM snapshot");
                 eprintln!(
-                    "[query] {} — planning fetch ({} same-file, {} cross-file)",
+                    "[query] {} — planning source evidence ({} candidates)",
                     req.file_path,
-                    fetchable.len(),
-                    cross_targets.len()
+                    targets.len()
                 );
                 let need = match llm.complete(&planning_system, &planning_user).await {
                     Ok(content) => parse_fetch_plan(&content),
@@ -2965,43 +3096,41 @@ where
                         Vec::new()
                     }
                 };
-                let mut extra = slice_requested_sources(
-                    &file_source,
-                    &req.roster_spans,
+                let evidence = match current_query_evidence_after_plan(
+                    state,
+                    &req,
+                    &llm_config,
+                    &sources,
+                    &mandatory_targets,
+                    &targets,
                     &need,
-                    &fetchable,
-                    QUERY_FETCH_BUDGET_CHARS,
-                );
-                let used: usize = extra
-                    .iter()
-                    .map(|(name, source)| name.chars().count() + source.chars().count() + 4)
-                    .sum();
-                extra.extend(slice_cross_file_sources(
-                    &cross_targets,
-                    &cross_sources,
-                    &need,
-                    QUERY_FETCH_BUDGET_CHARS.saturating_sub(used),
-                ));
-                if !extra.is_empty() {
-                    let got: Vec<&str> = extra.iter().map(|(name, _)| name.as_str()).collect();
+                ) {
+                    Ok(evidence) => evidence,
+                    Err(message) => {
+                        emit(QueryFrame::Error { message });
+                        return;
+                    }
+                };
+                if !evidence.is_empty() {
+                    let got = evidence
+                        .entries
+                        .iter()
+                        .map(|entry| entry.reference.id.as_str())
+                        .collect::<Vec<_>>();
                     eprintln!(
-                        "[query] {} — fetched sources: {}",
+                        "[query] {} — source evidence: {}",
                         req.file_path,
                         got.join(", ")
                     );
                 }
-                let focus_ref = focus.as_ref().map(|(source, start_line, name)| QueryFocus {
-                    source: source.as_str(),
-                    start_line: *start_line,
-                    name: name.as_str(),
-                });
+                let focus_ref = focus_name.as_deref().map(|name| QueryFocus { name });
                 let (system, user) = build_query_prompt(
                     &req.question,
                     req.trace.as_ref(),
                     &capsules,
                     focus_ref,
                     &ctx,
-                    &extra,
+                    &evidence,
                 );
                 (system, user, dependency_hints)
             }
@@ -3036,7 +3165,7 @@ where
                     planning_system,
                     planning_user,
                     ctx,
-                    fetchable,
+                    targets,
                     sources,
                     dependency_hints,
                 } = *plan;
@@ -3044,8 +3173,8 @@ where
                     .as_ref()
                     .expect("Degraded plan requires the captured LLM snapshot");
                 eprintln!(
-                    "[query-files] planning fetch ({} graph nodes)",
-                    fetchable.len()
+                    "[query-files] planning source evidence ({} graph-scoped candidates)",
+                    targets.len()
                 );
                 let need = match llm.complete(&planning_system, &planning_user).await {
                     Ok(content) => parse_fetch_plan(&content),
@@ -3056,14 +3185,24 @@ where
                         Vec::new()
                     }
                 };
-                let extra =
-                    slice_file_set_sources(&fetchable, &sources, &need, QUERY_FETCH_BUDGET_CHARS);
-                if !extra.is_empty() {
-                    let got: Vec<&str> = extra.iter().map(|(name, _)| name.as_str()).collect();
-                    eprintln!("[query-files] fetched sources: {}", got.join(", "));
+                let evidence =
+                    match selected_query_evidence_after_plan(state, &sources, &targets, &need) {
+                        Ok(evidence) => evidence,
+                        Err(message) => {
+                            emit(QueryFrame::Error { message });
+                            return;
+                        }
+                    };
+                if !evidence.is_empty() {
+                    let got = evidence
+                        .entries
+                        .iter()
+                        .map(|entry| entry.reference.id.as_str())
+                        .collect::<Vec<_>>();
+                    eprintln!("[query-files] source evidence: {}", got.join(", "));
                 }
                 let (system, user) =
-                    build_file_set_query_prompt(&req.question, req.trace.as_ref(), &ctx, &extra);
+                    build_file_set_query_prompt(&req.question, req.trace.as_ref(), &ctx, &evidence);
                 (system, user, dependency_hints)
             }
         };
@@ -5256,6 +5395,11 @@ mod tests {
         write_test_graph(root);
         std::fs::write(root.join("a.py"), "def fa():\n    return 1\n").unwrap();
         std::fs::write(
+            root.join("b.py"),
+            "skip\nskip\nskip\ndef fb():\n    value = 2\n    return value\n",
+        )
+        .unwrap();
+        std::fs::write(
             root.join("Cargo.toml"),
             "[dependencies]\nserde_json = \"1\"\n",
         )
@@ -5401,7 +5545,7 @@ mod tests {
         assert_eq!(kinds.iter().filter(|kind| *kind == "answer").count(), 2);
         assert_eq!(
             kinds.iter().filter(|kind| *kind == "source-plan").count(),
-            1
+            2
         );
         assert!(!kinds.iter().any(|kind| kind == "web-plan" || kind == "web"));
 
@@ -5708,16 +5852,68 @@ mod tests {
             original_question: request.question.clone(),
             turns: vec![],
         });
-        assert!(matches!(
-            prepare_query(&state, &request),
-            QueryPlan::Direct { .. }
-        ));
+        match prepare_query(&state, &request) {
+            QueryPlan::Direct { system, user, .. } => {
+                assert!(system.contains("只有【代码证据目录】中的 E#"));
+                assert!(user.contains("[E1] a.py:1-2"));
+                assert!(user.contains("   1 | def f():"));
+                assert!(user.contains("   2 |     return 1"));
+            }
+            _ => panic!("small current file should inline full source directly"),
+        }
 
         request.orientation_id = "stale-orientation".into();
         request.trace.as_mut().unwrap().scope_revision = request.orientation_id.clone();
         match prepare_query(&state, &request) {
             QueryPlan::Err(message) => assert!(message.contains("unknown or stale orientationId")),
             _ => panic!("expected stale orientation rejection"),
+        }
+    }
+
+    #[test]
+    fn prepare_large_current_query_plans_exact_ids_with_focus_trace_and_orientation() {
+        let tmp = TmpDir::new();
+        let mut source = "def f():\n    return 1\n".to_string();
+        while source.chars().count() <= crate::context_assembler::QUERY_INLINE_SOURCE_BUDGET_CHARS {
+            source.push_str("# deterministic padding\n");
+        }
+        std::fs::write(tmp.path().join("a.py"), source).unwrap();
+        let state = make_state(tmp.path(), "key");
+        let bound = bound_req(&state, "a.py");
+        let mut request = query_req("a.py", Some([1, 2]));
+        request.orientation_id = bound.orientation_id.clone();
+        request.roster = bound.roster.clone();
+        request.roster_spans = bound.roster_spans.clone();
+        request.trace = Some(QueryTrace {
+            scope_key: "current:a.py".into(),
+            scope_revision: bound.orientation_id,
+            original_question: "原始问题必须影响取源".into(),
+            turns: vec![],
+        });
+
+        match prepare_query(&state, &request) {
+            QueryPlan::Degraded(plan) => {
+                assert!(plan.targets.iter().any(|target| target.id == "fn:f#1"));
+                assert!(plan
+                    .mandatory_targets
+                    .iter()
+                    .any(|target| target.id == "focus:f#1"));
+                assert!(plan
+                    .mandatory_targets
+                    .iter()
+                    .any(|target| target.id == "orientation:E1"));
+                assert!(plan.planning_user.contains("原始问题必须影响取源"));
+                assert!(plan
+                    .planning_user
+                    .contains("【当前文件定向卡（仅作导航，不是代码证据）】"));
+                assert!(plan
+                    .planning_user
+                    .contains("【显式 focus（已优先取源）】focus:f#1"));
+                assert!(plan.planning_user.contains("fn:f#1 | a.py:1-2 | f"));
+                assert!(plan.planning_system.contains("禁止返回源码或行号"));
+                assert!(plan.planning_system.contains("递归规划"));
+            }
+            _ => panic!("large current file should use one source planner"),
         }
     }
 
@@ -5771,6 +5967,15 @@ mod tests {
     fn prepare_query_files_builds_direct_prompt_from_graph_context() {
         let tmp = TmpDir::new();
         write_test_graph(tmp.path());
+        std::fs::write(tmp.path().join("a.py"), "def fa():\n    return 1\n").unwrap();
+        std::fs::write(tmp.path().join("b.py"), "def fb():\n    return 2\n").unwrap();
+        let graph_path = tmp.path().join(".understand-anything/knowledge-graph.json");
+        let mut graph: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&graph_path).unwrap()).unwrap();
+        for node in graph["nodes"].as_array_mut().unwrap() {
+            node.as_object_mut().unwrap().remove("lineRange");
+        }
+        std::fs::write(&graph_path, graph.to_string()).unwrap();
         let state = make_state(tmp.path(), "key");
         match prepare_query_files(&state, &query_files_req(&["a.py", "b.py"])) {
             QueryFilesPlan::Direct { system, user, .. } => {
@@ -5805,18 +6010,70 @@ mod tests {
         let state = make_state(tmp.path(), "key");
         match prepare_query_files(&state, &query_files_req(&["a.py", "b.py"])) {
             QueryFilesPlan::Degraded(plan) => {
-                assert_eq!(plan.fetchable.len(), 2);
+                assert_eq!(plan.targets.len(), 2);
                 assert!(plan
                     .planning_user
-                    .contains("function:a.py:fa | fa | function | a.py"));
+                    .contains("::function:a.py:fa | a.py:1-3 | fa"));
                 assert!(plan
                     .planning_user
-                    .contains("function:b.py:fb | fb | function | b.py"));
+                    .contains("::function:b.py:fb | b.py:4-6 | fb"));
+                assert!(plan.planning_user.contains("【候选组: "));
                 assert!(plan.sources.contains_key("a.py"));
                 assert!(plan.sources.contains_key("b.py"));
             }
             _ => panic!("expected Degraded plan"),
         }
+    }
+
+    #[test]
+    fn selected_query_evidence_rereads_source_rebases_lines_and_ignores_unknown_ids() {
+        let tmp = TmpDir::new();
+        write_test_graph(tmp.path());
+        std::fs::write(
+            tmp.path().join("a.py"),
+            "def fa():\n    x = 1\n    return x\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("b.py"),
+            "skip\nskip\nskip\ndef fb():\n    y = 2\n    return y\n",
+        )
+        .unwrap();
+        let state = make_state(tmp.path(), "key");
+        let plan = match prepare_query_files(&state, &query_files_req(&["a.py", "b.py"])) {
+            QueryFilesPlan::Degraded(plan) => plan,
+            _ => panic!("expected source plan"),
+        };
+        let a_id = plan
+            .targets
+            .iter()
+            .find(|target| target.file_path == "a.py")
+            .unwrap()
+            .id
+            .clone();
+
+        std::fs::write(
+            tmp.path().join("a.py"),
+            "inserted = True\ndef fa():\n    x = 1\n    return x\n",
+        )
+        .unwrap();
+        let evidence = selected_query_evidence_after_plan(
+            &state,
+            &plan.sources,
+            &plan.targets,
+            &["unknown-id".into(), a_id],
+        )
+        .unwrap();
+
+        assert_eq!(evidence.entries.len(), 1);
+        assert_eq!(evidence.entries[0].reference.id, "E1");
+        assert_eq!(evidence.entries[0].reference.file_path, "a.py");
+        assert_eq!(evidence.entries[0].reference.start_line, 2);
+        assert_eq!(evidence.entries[0].reference.end_line, 4);
+        assert_eq!(
+            evidence.entries[0].source,
+            "def fa():\n    x = 1\n    return x"
+        );
     }
 
     // — U5a settings (ADR-0018) —
