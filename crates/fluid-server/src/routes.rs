@@ -5271,6 +5271,82 @@ mod tests {
         orientation_id
     }
 
+    fn bridge_roster_spans() -> Vec<FunctionSpan> {
+        [
+            ("handle_message", [6, 17]),
+            ("start_request", [19, 36]),
+            ("dispatch_burst", [38, 41]),
+            ("reduce_request", [43, 48]),
+            ("send_terminal_output", [50, 56]),
+            ("wait_for_ipc_endpoint", [58, 62]),
+            ("publish_scheduler_stats", [64, 66]),
+            ("start_trace", [68, 70]),
+            ("load_lora", [72, 74]),
+            ("send_utility_response", [76, 78]),
+            ("cleanup_streams", [80, 82]),
+        ]
+        .into_iter()
+        .map(|(name, line_range)| FunctionSpan {
+            id: format!("{name}#{}", line_range[0]),
+            name: name.into(),
+            line_range,
+        })
+        .collect()
+    }
+
+    fn write_bridge_fixture_project(root: &Path) {
+        std::fs::write(
+            root.join("bridge.rs"),
+            include_str!("../tests/fixtures/bridge/bridge.rs"),
+        )
+        .unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[dependencies]\n").unwrap();
+    }
+
+    fn seed_bridge_orientation(state: &AppState) -> FileOrientationCard {
+        let config = state.llm_snapshot().config;
+        let roster_spans = bridge_roster_spans();
+        let mut guard = state.project.write().unwrap();
+        let project = guard.as_mut().unwrap();
+        project.graphs.refresh();
+        let source = project.reader.read_file("bridge.rs").unwrap();
+        let roster_fn_ids = verify_orientation_roster(&source, &roster_spans).unwrap();
+        let graph_hash = project
+            .graphs
+            .relevant_graph_set_hash(&["bridge.rs".to_string()]);
+        let identity = OrientationCacheIdentity {
+            full_file_source: &source,
+            relevant_graph_set_hash: &graph_hash,
+            provider_base_url: &config.base_url,
+            model: &config.model,
+            prompt_version: ORIENTATION_PROMPT_VERSION,
+            schema_version: ORIENTATION_SCHEMA_VERSION,
+        };
+        let orientation_id = identity.key();
+        let card = parse_orientation_card(
+            include_str!("../tests/fixtures/bridge/orientation.json"),
+            &orientation_id,
+            "bridge.rs",
+            OrientationCoverage {
+                mode: OrientationCoverageMode::FullSource,
+                omitted_function_ids: Vec::new(),
+            },
+        )
+        .unwrap();
+        let line_ranges = orientation_roster_line_ranges(&roster_spans);
+        let validation = OrientationValidationContext {
+            file_path: "bridge.rs",
+            source: &source,
+            roster_fn_ids: &roster_fn_ids,
+            roster_line_ranges: Some(&line_ranges),
+        };
+        project
+            .cache
+            .put_orientation(&identity, &validation, &card)
+            .unwrap();
+        card
+    }
+
     fn query_state(
         root: &Path,
         server: &QueryMockServer,
@@ -5370,6 +5446,29 @@ mod tests {
                 }]
             },
             "allowWeb": allow_web
+        })
+    }
+
+    fn bridge_query_json(orientation_id: &str) -> serde_json::Value {
+        let roster_spans = bridge_roster_spans();
+        let roster = roster_spans
+            .iter()
+            .map(|span| span.name.clone())
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "reqId": "q-bridge-golden",
+            "filePath": "bridge.rs",
+            "orientationId": orientation_id,
+            "question": "请沿方向图说明 req-a 从 Add 到 token 和 Finished 返回的路径。",
+            "roster": roster,
+            "rosterSpans": roster_spans,
+            "trace": {
+                "scopeKey": "current:bridge.rs",
+                "scopeRevision": orientation_id,
+                "originalQuestion": "req-a 如何从 Add 走到 token 和 Finished 返回？",
+                "turns": []
+            },
+            "allowWeb": false
         })
     }
 
@@ -5598,6 +5697,210 @@ mod tests {
             scope_key,
             format!("selected:[\"{astral}\",\"{private_use}\"]")
         );
+    }
+
+    #[tokio::test]
+    async fn bridge_golden_orientation_and_current_query_are_source_grounded() {
+        let tmp = TmpDir::new();
+        write_bridge_fixture_project(tmp.path());
+        let mock = start_query_mock(
+            r#"{"action":"local"}"#,
+            StatusCode::OK,
+            include_str!("../tests/fixtures/web_search/openai_cited.json"),
+            Duration::ZERO,
+            StatusCode::OK,
+        )
+        .await;
+        let config = LlmConfig {
+            base_url: mock.base_url.clone(),
+            model: "fixture-model".into(),
+            api_key: "fixture-key".into(),
+        };
+        let state = make_state_with_config(tmp.path(), config.clone());
+        let proxy = LlmProxy::from_config_with_web_search_timeout(&config, Duration::from_secs(1))
+            .expect("fixture key enables proxy");
+        state.llm.write().unwrap().proxy = Some(Arc::new(proxy));
+
+        let card = seed_bridge_orientation(&state);
+        let source = include_str!("../tests/fixtures/bridge/bridge.rs");
+        for evidence in &card.evidence {
+            let exact = slice_span(source, [evidence.start_line, evidence.end_line])
+                .expect("golden evidence must back-slice the fixture");
+            assert!(
+                evidence
+                    .symbol
+                    .as_ref()
+                    .is_some_and(|symbol| exact.contains(symbol)),
+                "{} must contain its declared symbol",
+                evidence.id
+            );
+        }
+
+        let type_owner = |name: &str| {
+            card.types
+                .iter()
+                .find(|item| item.name == name)
+                .map(|item| item.owner_actor_id.as_str())
+                .expect("golden type")
+        };
+        assert_eq!(type_owner("EngineCoreRequest"), "vllm_frontend");
+        assert_eq!(type_owner("GenerateRequest"), "bridge");
+        assert_eq!(type_owner("TokenEvent"), "openinfer_scheduler");
+        assert_eq!(type_owner("EngineCoreOutputs"), "bridge");
+
+        let card_steps = card
+            .core_flows
+            .iter()
+            .flat_map(|flow| flow.steps.iter())
+            .collect::<Vec<_>>();
+        let direction = |payload: &str, from: &str, to: &str| {
+            card_steps.iter().any(|step| {
+                step.payload == payload
+                    && step.from_actor_id == from
+                    && step.to_actor_id == to
+                    && !step.evidence_ids.is_empty()
+            })
+        };
+        assert!(direction("EngineCoreRequest", "vllm_frontend", "bridge"));
+        assert!(direction(
+            "GenerateRequest",
+            "bridge",
+            "openinfer_scheduler"
+        ));
+        assert!(direction("TokenEvent", "openinfer_scheduler", "bridge"));
+        assert!(direction("EngineCoreOutputs", "bridge", "vllm_frontend"));
+        let terminal = card_steps
+            .iter()
+            .find(|step| step.via.contains("send_terminal_output"))
+            .expect("terminal output direction");
+        assert_eq!(terminal.from_actor_id, "bridge");
+        assert_eq!(terminal.to_actor_id, "vllm_frontend");
+        assert_ne!(terminal.to_actor_id, "openinfer_scheduler");
+        let terminal_source = slice_span(source, [50, 56]).unwrap();
+        assert!(terminal_source.contains("frontend_tx"));
+        assert!(!terminal_source.contains("scheduler"));
+
+        let core_ids = card
+            .function_roles
+            .iter()
+            .filter(|role| role.lane == crate::orientation::FunctionLane::Core)
+            .map(|role| role.fn_id.as_str())
+            .collect::<Vec<_>>();
+        let start = core_ids
+            .iter()
+            .position(|id| *id == "start_request#19")
+            .unwrap();
+        let dispatch = core_ids
+            .iter()
+            .position(|id| *id == "dispatch_burst#38")
+            .unwrap();
+        let reduce = core_ids
+            .iter()
+            .position(|id| *id == "reduce_request#43")
+            .unwrap();
+        assert!(start < dispatch && dispatch < reduce);
+        let capability_names = card
+            .supporting_capabilities
+            .iter()
+            .map(|capability| capability.name.as_str())
+            .collect::<Vec<_>>();
+        for expected in [
+            "IPC readiness",
+            "Scheduler statistics",
+            "Request tracing",
+            "LoRA selection",
+            "Utility responses",
+            "Stream cleanup",
+        ] {
+            assert!(capability_names.contains(&expected), "missing {expected}");
+        }
+        assert_eq!(card.walkthrough.input, "req-a");
+        assert!(card
+            .walkthrough
+            .steps
+            .iter()
+            .all(|step| !step.evidence_ids.is_empty()));
+        let walkthrough = card
+            .walkthrough
+            .steps
+            .iter()
+            .map(|step| step.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(walkthrough.contains("Add"));
+        assert!(walkthrough.contains("Token"));
+        assert!(walkthrough.contains("Finished"));
+
+        let orientation_id = card.orientation_id.clone();
+        let app = start_query_app(state).await;
+        let frames = query_ws_frames(&app, "/api/query", bridge_query_json(&orientation_id)).await;
+        assert_query_stream_succeeds(&frames, "q-bridge-golden");
+        let map: crate::context_assembler::QueryMap =
+            serde_json::from_value(map_frame(&frames)["map"].clone()).unwrap();
+        crate::context_assembler::validate_query_map(&map)
+            .expect("bridge query map references resolve");
+        assert!(map
+            .core_function_ids
+            .iter()
+            .any(|id| id == "start_request#19"));
+        assert!(map
+            .core_function_ids
+            .iter()
+            .any(|id| id == "dispatch_burst#38"));
+        assert!(map
+            .core_function_ids
+            .iter()
+            .any(|id| id == "reduce_request#43"));
+        assert_eq!(map.supporting_function_ids.len(), 6);
+        assert_eq!(map.walkthrough.input, "req-a");
+        assert!(map
+            .walkthrough
+            .steps
+            .iter()
+            .all(|step| !step.evidence_ids.is_empty()));
+        let map_direction = |payload: &str, from: &str, to: &str| {
+            map.direction.iter().any(|step| {
+                step.payload == payload
+                    && step.from_actor_id == from
+                    && step.to_actor_id == to
+                    && !step.evidence_ids.is_empty()
+            })
+        };
+        assert!(map_direction(
+            "EngineCoreRequest",
+            "vllm_frontend",
+            "bridge"
+        ));
+        assert!(map_direction(
+            "GenerateRequest",
+            "bridge",
+            "openinfer_scheduler"
+        ));
+        assert!(map_direction("TokenEvent", "openinfer_scheduler", "bridge"));
+        assert!(map_direction(
+            "EngineCoreOutputs",
+            "bridge",
+            "vllm_frontend"
+        ));
+        let map_terminal = map
+            .direction
+            .iter()
+            .find(|step| step.via.contains("send_terminal_output"))
+            .expect("terminal direction survives current-query projection");
+        assert_eq!(map_terminal.to_actor_id, "vllm_frontend");
+        assert_ne!(map_terminal.to_actor_id, "openinfer_scheduler");
+
+        let requests = mock.requests.lock().unwrap();
+        let answer_prompt = requests
+            .iter()
+            .find(|(kind, _)| kind == "answer")
+            .and_then(|(_, body)| body["messages"][1]["content"].as_str())
+            .expect("final answer prompt");
+        assert!(answer_prompt.contains("req-a"));
+        assert!(answer_prompt.contains("EngineCoreRequestType::Add"));
+        assert!(answer_prompt.contains("send_terminal_output"));
+        assert!(answer_prompt.contains("【追问方向图（后端确定性组装，不是模型输出）】"));
+        assert!(answer_prompt.contains("【代码证据目录"));
     }
 
     #[tokio::test]

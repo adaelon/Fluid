@@ -1,0 +1,332 @@
+{
+  "purpose": "Translate vLLM engine requests into OpenInfer scheduler work and translate scheduler token events back into vLLM engine outputs.",
+  "actors": [
+    {
+      "id": "vllm_frontend",
+      "name": "vLLM frontend",
+      "role": "Creates engine requests and receives engine output batches.",
+      "boundary": "project"
+    },
+    {
+      "id": "bridge",
+      "name": "bridge",
+      "role": "Translates request and response protocols inside bridge.rs.",
+      "boundary": "inside-file"
+    },
+    {
+      "id": "openinfer_scheduler",
+      "name": "OpenInfer scheduler",
+      "role": "Accepts generation work and emits scheduled token events.",
+      "boundary": "project"
+    }
+  ],
+  "types": [
+    {
+      "name": "EngineCoreRequest",
+      "ownerActorId": "vllm_frontend",
+      "meaning": "One request submitted by the vLLM frontend."
+    },
+    {
+      "name": "GenerateRequest",
+      "ownerActorId": "bridge",
+      "meaning": "The scheduler request assembled by the bridge."
+    },
+    {
+      "name": "TokenEvent",
+      "ownerActorId": "openinfer_scheduler",
+      "meaning": "A token or terminal event emitted by the scheduler."
+    },
+    {
+      "name": "EngineCoreOutputs",
+      "ownerActorId": "bridge",
+      "meaning": "The output batch returned to the vLLM frontend."
+    }
+  ],
+  "coreFlows": [
+    {
+      "id": "request-flow",
+      "name": "Frontend request submission",
+      "kind": "request",
+      "why": "The two engines use different request protocols and need an explicit translation boundary.",
+      "steps": [
+        {
+          "fromActorId": "vllm_frontend",
+          "via": "handle_message -> start_request",
+          "payload": "EngineCoreRequest",
+          "toActorId": "bridge",
+          "why": "The bridge must receive and recognize the Add request before translation.",
+          "evidenceIds": ["E1", "E2"]
+        },
+        {
+          "fromActorId": "bridge",
+          "via": "Scheduler::submit in start_request",
+          "payload": "GenerateRequest",
+          "toActorId": "openinfer_scheduler",
+          "why": "The scheduler only accepts its own generation request contract.",
+          "evidenceIds": ["E2"]
+        }
+      ]
+    },
+    {
+      "id": "response-flow",
+      "name": "Scheduler token return",
+      "kind": "response",
+      "why": "Scheduler events must be folded into the frontend output protocol.",
+      "steps": [
+        {
+          "fromActorId": "openinfer_scheduler",
+          "via": "dispatch_burst",
+          "payload": "TokenEvent",
+          "toActorId": "bridge",
+          "why": "The bridge is the consumer that batches each scheduler event.",
+          "evidenceIds": ["E3"]
+        },
+        {
+          "fromActorId": "bridge",
+          "via": "reduce_request -> FrontendSender::send",
+          "payload": "EngineCoreOutputs",
+          "toActorId": "vllm_frontend",
+          "why": "The frontend requires token and finish information in its own output batch.",
+          "evidenceIds": ["E3", "E4"]
+        }
+      ]
+    },
+    {
+      "id": "terminal-flow",
+      "name": "Immediate terminal output",
+      "kind": "response",
+      "why": "Rejected requests still need a terminal response without entering the scheduler.",
+      "steps": [
+        {
+          "fromActorId": "bridge",
+          "via": "send_terminal_output -> FrontendSender::send",
+          "payload": "EngineCoreOutputs",
+          "toActorId": "vllm_frontend",
+          "why": "The terminal helper reports directly to the frontend output channel.",
+          "evidenceIds": ["E5"]
+        }
+      ]
+    }
+  ],
+  "supportingCapabilities": [
+    {
+      "name": "IPC readiness",
+      "why": "The bridge waits until the local endpoint exists before connecting.",
+      "functionIds": ["wait_for_ipc_endpoint#58"],
+      "evidenceIds": ["E6"]
+    },
+    {
+      "name": "Scheduler statistics",
+      "why": "Frontend gauges need scheduler load snapshots independently of request output.",
+      "functionIds": ["publish_scheduler_stats#64"],
+      "evidenceIds": ["E7"]
+    },
+    {
+      "name": "Request tracing",
+      "why": "A request trace connects bridge submission with scheduler timing.",
+      "functionIds": ["start_trace#68"],
+      "evidenceIds": ["E8"]
+    },
+    {
+      "name": "LoRA selection",
+      "why": "Optional adapter selection is derived before scheduler submission.",
+      "functionIds": ["load_lora#72"],
+      "evidenceIds": ["E9"]
+    },
+    {
+      "name": "Utility responses",
+      "why": "Control calls return a frontend-compatible utility result.",
+      "functionIds": ["send_utility_response#76"],
+      "evidenceIds": ["E10"]
+    },
+    {
+      "name": "Stream cleanup",
+      "why": "Aborted or completed requests must release their bridge state.",
+      "functionIds": ["cleanup_streams#80"],
+      "evidenceIds": ["E11"]
+    }
+  ],
+  "functionRoles": [
+    {
+      "fnId": "handle_message#6",
+      "lane": "core",
+      "flowIds": ["request-flow"],
+      "stage": "route an Add request",
+      "receivesFromActorIds": ["vllm_frontend"],
+      "consumes": ["EngineCoreRequest"],
+      "sendsToActorIds": ["bridge"],
+      "produces": ["validated Add dispatch"],
+      "why": "Only Add requests should enter the normal generation path.",
+      "evidenceIds": ["E1"]
+    },
+    {
+      "fnId": "start_request#19",
+      "lane": "core",
+      "flowIds": ["request-flow"],
+      "stage": "translate and submit the request",
+      "receivesFromActorIds": ["vllm_frontend"],
+      "consumes": ["EngineCoreRequest"],
+      "sendsToActorIds": ["openinfer_scheduler"],
+      "produces": ["GenerateRequest"],
+      "why": "The scheduler needs its own request type and associated execution metadata.",
+      "evidenceIds": ["E2"]
+    },
+    {
+      "fnId": "dispatch_burst#38",
+      "lane": "core",
+      "flowIds": ["response-flow"],
+      "stage": "receive and dispatch scheduler events",
+      "receivesFromActorIds": ["openinfer_scheduler"],
+      "consumes": ["TokenEvent"],
+      "sendsToActorIds": ["vllm_frontend"],
+      "produces": ["EngineCoreOutputs"],
+      "why": "Ready scheduler events must be reduced and sent as frontend output.",
+      "evidenceIds": ["E3"]
+    },
+    {
+      "fnId": "reduce_request#43",
+      "lane": "core",
+      "flowIds": ["response-flow"],
+      "stage": "fold token and Finished events",
+      "receivesFromActorIds": ["openinfer_scheduler"],
+      "consumes": ["TokenEvent"],
+      "sendsToActorIds": ["bridge"],
+      "produces": ["EngineCoreOutputs"],
+      "why": "Token and terminal variants require different output fields.",
+      "evidenceIds": ["E4"]
+    },
+    {
+      "fnId": "send_terminal_output#50",
+      "lane": "core",
+      "flowIds": ["terminal-flow"],
+      "stage": "return an immediate terminal response",
+      "receivesFromActorIds": ["bridge"],
+      "consumes": ["FinishReason"],
+      "sendsToActorIds": ["vllm_frontend"],
+      "produces": ["EngineCoreOutputs"],
+      "why": "Invalid requests must terminate visibly without scheduler submission.",
+      "evidenceIds": ["E5"]
+    },
+    {
+      "fnId": "wait_for_ipc_endpoint#58",
+      "lane": "supporting",
+      "flowIds": [],
+      "stage": "wait for IPC readiness",
+      "receivesFromActorIds": [],
+      "consumes": ["IPC address"],
+      "sendsToActorIds": [],
+      "produces": ["ready endpoint"],
+      "why": "Connection attempts must wait for the local endpoint.",
+      "evidenceIds": ["E6"]
+    },
+    {
+      "fnId": "publish_scheduler_stats#64",
+      "lane": "supporting",
+      "flowIds": [],
+      "stage": "publish scheduler statistics",
+      "receivesFromActorIds": ["openinfer_scheduler"],
+      "consumes": ["SchedulerSnapshot"],
+      "sendsToActorIds": ["vllm_frontend"],
+      "produces": ["statistics output"],
+      "why": "Operational gauges are separate from request token output.",
+      "evidenceIds": ["E7"]
+    },
+    {
+      "fnId": "start_trace#68",
+      "lane": "supporting",
+      "flowIds": [],
+      "stage": "open request tracing",
+      "receivesFromActorIds": ["bridge"],
+      "consumes": ["request id"],
+      "sendsToActorIds": ["openinfer_scheduler"],
+      "produces": ["TraceContext"],
+      "why": "Scheduler spans need a request-level parent context.",
+      "evidenceIds": ["E8"]
+    },
+    {
+      "fnId": "load_lora#72",
+      "lane": "supporting",
+      "flowIds": [],
+      "stage": "select an optional LoRA adapter",
+      "receivesFromActorIds": ["vllm_frontend"],
+      "consumes": ["EngineCoreRequest"],
+      "sendsToActorIds": ["bridge"],
+      "produces": ["LoraAdapter"],
+      "why": "Adapter configuration accompanies generation but is not the core transport path.",
+      "evidenceIds": ["E9"]
+    },
+    {
+      "fnId": "send_utility_response#76",
+      "lane": "supporting",
+      "flowIds": [],
+      "stage": "return a utility result",
+      "receivesFromActorIds": ["bridge"],
+      "consumes": ["utility call"],
+      "sendsToActorIds": ["vllm_frontend"],
+      "produces": ["utility output"],
+      "why": "Utility calls bypass normal token generation.",
+      "evidenceIds": ["E10"]
+    },
+    {
+      "fnId": "cleanup_streams#80",
+      "lane": "supporting",
+      "flowIds": [],
+      "stage": "release request stream state",
+      "receivesFromActorIds": ["bridge"],
+      "consumes": ["stream state"],
+      "sendsToActorIds": [],
+      "produces": ["released resources"],
+      "why": "Finished or aborted requests must not retain bridge state.",
+      "evidenceIds": ["E11"]
+    }
+  ],
+  "walkthrough": {
+    "title": "req-a Add request to token and Finished output",
+    "input": "req-a",
+    "steps": [
+      {
+        "text": "The vLLM frontend sends req-a as an Add EngineCoreRequest and handle_message routes it to start_request.",
+        "evidenceIds": ["E1", "E2"]
+      },
+      {
+        "text": "start_request translates req-a into GenerateRequest and submits it to the OpenInfer scheduler.",
+        "evidenceIds": ["E2"]
+      },
+      {
+        "text": "The OpenInfer scheduler returns req-a TokenEvent values to dispatch_burst.",
+        "evidenceIds": ["E3"]
+      },
+      {
+        "text": "reduce_request folds req-a Token and Finished variants into EngineCoreOutputs.",
+        "evidenceIds": ["E4"]
+      },
+      {
+        "text": "dispatch_burst sends the resulting req-a EngineCoreOutputs to the vLLM frontend.",
+        "evidenceIds": ["E3", "E4"]
+      }
+    ]
+  },
+  "invariants": [
+    {
+      "text": "send_terminal_output sends EngineCoreOutputs to FrontendSender and never to the OpenInfer scheduler.",
+      "evidenceIds": ["E5"]
+    },
+    {
+      "text": "The normal response chain passes TokenEvent through dispatch_burst and reduce_request before frontend output.",
+      "evidenceIds": ["E3", "E4"]
+    }
+  ],
+  "evidence": [
+    { "id": "E1", "filePath": "bridge.rs", "startLine": 6, "endLine": 17, "symbol": "handle_message" },
+    { "id": "E2", "filePath": "bridge.rs", "startLine": 19, "endLine": 36, "symbol": "start_request" },
+    { "id": "E3", "filePath": "bridge.rs", "startLine": 38, "endLine": 41, "symbol": "dispatch_burst" },
+    { "id": "E4", "filePath": "bridge.rs", "startLine": 43, "endLine": 48, "symbol": "reduce_request" },
+    { "id": "E5", "filePath": "bridge.rs", "startLine": 50, "endLine": 56, "symbol": "send_terminal_output" },
+    { "id": "E6", "filePath": "bridge.rs", "startLine": 58, "endLine": 62, "symbol": "wait_for_ipc_endpoint" },
+    { "id": "E7", "filePath": "bridge.rs", "startLine": 64, "endLine": 66, "symbol": "publish_scheduler_stats" },
+    { "id": "E8", "filePath": "bridge.rs", "startLine": 68, "endLine": 70, "symbol": "start_trace" },
+    { "id": "E9", "filePath": "bridge.rs", "startLine": 72, "endLine": 74, "symbol": "load_lora" },
+    { "id": "E10", "filePath": "bridge.rs", "startLine": 76, "endLine": 78, "symbol": "send_utility_response" },
+    { "id": "E11", "filePath": "bridge.rs", "startLine": 80, "endLine": 82, "symbol": "cleanup_streams" }
+  ]
+}

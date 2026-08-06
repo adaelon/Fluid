@@ -2,7 +2,7 @@
 
 Fluid提供**只读**代码理解环境。在不修改源码任何字节的前提下,用 LLM 为你打开的每个文件生成人类可读的语义投影——函数摘要、逐行解释、可追问——帮你看懂代码每一行在做什么。
 
-> 状态:MVP 功能闭环;「代码选区解释 + 追问器共享供应商托管联网检索」已完成(见 `docs/切片方案-代码选区解释与共享联网检索.md`)。
+> 状态:MVP 功能闭环;代码选区解释与共享联网检索、文件定向卡与源码证据化连续追问均已完成(见 `docs/切片方案-代码选区解释与共享联网检索.md`、`docs/切片方案-文件定向卡与证据化追问.md`)。
 
 ## 核心理念
 
@@ -19,22 +19,24 @@ Fluid提供**只读**代码理解环境。在不修改源码任何字节的前�
 ## 能力一览
 
 - **只读浏览**:文件树导航 + CodeMirror 6 只读编辑器(暗色主题、字号可调)。
+- **文件定向卡**:代码文件激活后先显示具名参与者、核心方向、贯穿示例、外围能力与源码锚点;通过确定性校验后才生成共享同一坐标系的函数胶囊。
 - **流式语义生成**:每个函数一个「胶囊」(签名·摘要·复杂度·IO)+ 重点行尾随式玻璃注释,逐个显影;失败可单点重试。
 - **代码选区解释**:选择任意非空单行代码后点「解释」,临时浮层显示「它是什么 / 这里做什么 / 来源状态」;项目内符号优先临时取源,第三方证据不足时可自动联网。
-- **旁路缓存**:函数/行与选区解释都落盘 `.fluid/`;相关源码、模型、Prompt、选区范围或联网模式不变时零 Token 秒显,解释文本始终不回写源码。
-- **追问器**:针对当前文件的流式问答(Markdown + LaTeX 渲染);也可显式选择多个文件做职责/调用/依赖关系追问。两种范围共享供应商托管 Web Search,并显示「网页有来源 / 联网无来源 / 未核验」;联网失败会显式降级后继续本地回答。
+- **旁路缓存**:文件定向卡、函数/行与选区解释都落盘 `.fluid/`;相关源码、图谱、模型、Prompt、选区范围或联网模式不变时零 Token 秒显,解释文本始终不回写源码。
+- **证据化连续追问**:当前文件追问先显示确定性方向图,再流式回答;保留当前范围内的原问题与完整追问,关键 `[E#]` 可点击回到精确源码。也可显式选择多个文件做职责/调用/依赖关系追问。两种范围共享供应商托管 Web Search,并显示「网页有来源 / 联网无来源 / 未核验」;联网失败会显式降级后继续本地回答。
 - **联网可控**:设置里的「允许联网检索」默认开启,同时控制选区解释与追问器;关闭后不做检索规划或 Web Search,只使用本地上下文。
 - **手动单行补注**:非重点行 hover → 「解释这一行」按需生成。
 - **类 VSCode 壳**:活动栏 / 资源管理器 / 多 tab + 面包屑 / 状态栏 / Open Folder 换根 / 命令面板 / LLM 设置面板。
-- **知识图谱增强(推荐)**:存在 `.understand-anything/knowledge-graph.json` 时作为上下文增强——文件摘要、调用关系、跨文件取源、文件集关系追问;缺失不影响单文件运行,但**最佳体验是先跑 understand-anything**(见「快速开始」)。
+- **知识图谱增强(推荐)**:项目或子项目存在 `.ua/knowledge-graph.json` 时作为导航增强,并兼容旧 `.understand-anything/knowledge-graph.json`;多作用域按最近祖先归属,源码始终是真相。图谱缺失不影响单文件运行,但**最佳体验是先跑 understand-anything**(见「快速开始」)。
 
 ## 架构
 
 ```
 后端 crates/fluid-server  (Rust · axum + tokio)
   ProjectReader  读文件树/源码(路径穿越防护)
-  GraphLoader    可选加载 understand-anything 图谱
-  ContextAssembler 装配生成/追问上下文(分层降级 + 跨文件取源)
+  GraphCatalog   可选发现根/嵌套 understand-anything 图谱并解析最近作用域
+  OrientationProtocol 校验文件参与者、方向、函数角色与源码锚点
+  ContextAssembler 装配生成/追问上下文(有界取源 + EvidenceCatalog + QueryMap)
   WebEvidenceService 共享 local → plan → search → fallback 证据编排
   LlmProxy       唯一出网组件,/chat/completions + 可选 /responses Web Search
   CacheStore     旁路缓存 .fluid/
@@ -44,7 +46,7 @@ Fluid提供**只读**代码理解环境。在不修改源码任何字节的前�
   CodeMirror 6 只读编辑器 + 幽灵注释 widget(玻璃材质)
   tree-sitter WASM 解析(Python / Rust)→ 函数清单 + 重点行
   GhostStore 内存态 + 视口感知生成调度(并行 WS)
-  SelectionState / QueryState 投影选区与追问的状态、证据和降级
+  OrientationState / SelectionState / QueryState 投影激活、选区、连续追问与证据状态
   shell/ 类 VSCode 壳组件
 ```
 
@@ -75,7 +77,7 @@ fluid /path/to/your/project        # 或直接 fluid,启动后在界面里「打
 
 启动后后端+前端在同一端口,默认自动打开 **http://127.0.0.1:7878**(没自动开就手动访问)。
 
-> **最佳体验:先对目标项目跑一遍 [understand-anything](https://github.com/Understand-Anything)**,在项目根生成 `.understand-anything/knowledge-graph.json`。Fluid 没有它也能跑(纯只读浏览 + 单文件生成/追问),但有了图谱才解锁:文件级摘要、调用/导入关系上下文、文件集关系追问,以及追问时**跨文件取被调函数/类的实现**(S10c / S-FSQ 依赖图谱定位)。
+> **最佳体验:先对目标项目跑一遍 [understand-anything](https://github.com/Understand-Anything)**,生成现行 `.ua/knowledge-graph.json`(旧 `.understand-anything/knowledge-graph.json` 仍兼容)。Fluid 没有它也能跑(纯只读浏览 + 单文件定向/生成/追问),但有了图谱才解锁:文件级摘要、调用/导入关系导航、文件集关系追问,以及追问时**跨文件取被调函数/类的实现**;嵌套子项目可各自持有图谱。
 >
 > 别在被服务项目自带 `.env` 的目录里启动 fluid(会读错 LLM 配置);从其他目录启动即可。
 
@@ -115,7 +117,7 @@ cd web && npm install && npm run dev                # Vite 5173,/api 代理到 7
 
 ## 主要端点
 
-`GET /api/project/tree`、`GET /api/file`、`GET /api/project/graph`、`POST /api/project/open|pick`、`GET|POST /api/settings/llm`、`POST /api/settings/llm/test`、`POST /api/explain-line`、`WS /api/generate`、`WS /api/explain-selection`、`WS /api/query`、`WS /api/query-files`。
+`GET /api/project/tree`、`GET /api/file`、`GET /api/project/graph`、`POST /api/project/open|pick`、`GET|POST /api/settings/llm`、`POST /api/settings/llm/test`、`POST /api/explain-line`、`WS /api/orient`、`WS /api/generate`、`WS /api/explain-selection`、`WS /api/query`、`WS /api/query-files`。
 
 ## 开发与验证
 
@@ -132,7 +134,11 @@ node scripts/scheduler-check.ts # 生成调度核
 node scripts/parse-check.ts     # tree-sitter 解析
 node scripts/markdown-check.ts  # 追问答案渲染
 node scripts/selection-check.ts # 选区 UTF-8 range + 状态机
+node scripts/orientation-check.ts # 文件定向激活闸门
+node scripts/capsule-check.ts # 胶囊定向坐标展示
 node scripts/query-context-check.ts # 追问上下文投影
+node scripts/query-trace-check.ts # 连续追问 scope/revision 轨迹
+node scripts/query-map-check.ts # map 帧序与 E# 链接
 node scripts/query-web-check.ts # 两种 scope 的联网证据状态机
 ```
 
