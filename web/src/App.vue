@@ -12,6 +12,13 @@ import SettingsModal from './shell/SettingsModal.vue'
 import CommandPalette, { type PaletteItem } from './shell/CommandPalette.vue'
 import { EMPTY_QUERY_CONTEXT, type QueryContext } from './queryContext'
 import type { CodeEvidenceRef } from './ghostTypes'
+import {
+  QUERY_DOCK_STORAGE_KEY,
+  clampQueryDockHeight,
+  loadQueryDockHeight,
+  queryDockHeightBounds,
+  queryDockHeightFromPointer,
+} from './queryLayout'
 
 type OpenFile = { path: string; lang: string; source: string }
 
@@ -84,6 +91,101 @@ watch(
 // the code area until the user opens it from the status-bar 「💬 追问」 toggle
 // (S10b dock revision). Sticky across file switches; auto-hidden when no file.
 const queryPanelOpen = ref(false)
+
+// S-QDOCK-1: App owns the dock geometry so opening/closing the panel does not
+// discard the last user-selected size. The preferred value survives temporary
+// viewport shrink; only the rendered height is re-clamped until space returns.
+const queryDockViewportHeight = ref(window.innerHeight)
+let queryDockPreferredHeight = loadQueryDockHeight(
+  localStorage.getItem(QUERY_DOCK_STORAGE_KEY),
+  queryDockViewportHeight.value,
+)
+const queryDockHeight = ref(queryDockPreferredHeight)
+const queryDockBounds = computed(() => queryDockHeightBounds(queryDockViewportHeight.value))
+const queryDockDragging = ref(false)
+
+interface QueryDockResize {
+  pointerId: number
+  startY: number
+  startHeight: number
+  startPreferredHeight: number
+}
+
+let queryDockResize: QueryDockResize | null = null
+
+function startQueryDockResize(e: PointerEvent): void {
+  if (e.button !== 0 || queryDockResize) return
+  e.preventDefault()
+  queryDockResize = {
+    pointerId: e.pointerId,
+    startY: e.clientY,
+    startHeight: queryDockHeight.value,
+    startPreferredHeight: queryDockPreferredHeight,
+  }
+  queryDockDragging.value = true
+  const handle = e.currentTarget as HTMLElement
+  handle.setPointerCapture(e.pointerId)
+}
+
+function moveQueryDockResize(e: PointerEvent): void {
+  const resize = queryDockResize
+  if (!resize || resize.pointerId !== e.pointerId) return
+  const height = queryDockHeightFromPointer(
+    resize.startHeight,
+    resize.startY,
+    e.clientY,
+    queryDockViewportHeight.value,
+  )
+  queryDockPreferredHeight = height
+  queryDockHeight.value = height
+}
+
+function finishQueryDockResize(e: PointerEvent, persist: boolean): void {
+  const resize = queryDockResize
+  if (!resize || resize.pointerId !== e.pointerId) return
+  queryDockResize = null
+  queryDockDragging.value = false
+  if (persist) {
+    queryDockPreferredHeight = queryDockHeight.value
+    localStorage.setItem(QUERY_DOCK_STORAGE_KEY, String(queryDockHeight.value))
+  } else {
+    queryDockPreferredHeight = resize.startPreferredHeight
+    queryDockHeight.value = clampQueryDockHeight(
+      resize.startPreferredHeight,
+      queryDockViewportHeight.value,
+    )
+  }
+  const handle = e.currentTarget as HTMLElement
+  if (handle.hasPointerCapture(e.pointerId)) handle.releasePointerCapture(e.pointerId)
+}
+
+function endQueryDockResize(e: PointerEvent): void {
+  finishQueryDockResize(e, true)
+}
+
+function cancelQueryDockResize(e: PointerEvent): void {
+  finishQueryDockResize(e, false)
+}
+
+function loseQueryDockPointer(e: PointerEvent): void {
+  const resize = queryDockResize
+  if (!resize || resize.pointerId !== e.pointerId) return
+  queryDockResize = null
+  queryDockDragging.value = false
+  queryDockPreferredHeight = resize.startPreferredHeight
+  queryDockHeight.value = clampQueryDockHeight(
+    resize.startPreferredHeight,
+    queryDockViewportHeight.value,
+  )
+}
+
+function resizeQueryDockForViewport(): void {
+  queryDockViewportHeight.value = window.innerHeight
+  queryDockHeight.value = clampQueryDockHeight(
+    queryDockPreferredHeight,
+    queryDockViewportHeight.value,
+  )
+}
 
 // LLM backend settings modal (U5b, ADR-0018), opened from the activity-bar gear.
 const settingsOpen = ref(false)
@@ -178,6 +280,7 @@ function endResize(e: PointerEvent): void {
 
 onMounted(async () => {
   window.addEventListener('keydown', onGlobalKey)
+  window.addEventListener('resize', resizeQueryDockForViewport)
   try {
     files.value = await fetchTree()
   } catch (e) {
@@ -192,7 +295,10 @@ onMounted(async () => {
     /* settings probe is best-effort — ignore */
   }
 })
-onBeforeUnmount(() => window.removeEventListener('keydown', onGlobalKey))
+onBeforeUnmount(() => {
+  window.removeEventListener('keydown', onGlobalKey)
+  window.removeEventListener('resize', resizeQueryDockForViewport)
+})
 
 // Open a file from the tree: if already open just activate its tab; otherwise
 // fetch the source once, append a tab, and activate it (U2).
@@ -352,19 +458,39 @@ function closeTab(path: string) {
         <div v-else class="empty">从左侧选择一个文件以只读查看源码</div>
       </main>
     </div>
-    <QueryPanel
+    <div
       v-if="queryPanelOpen && current"
-      :path="current.path"
-      :ctx="queryCtx"
-      :selection-mode="fileSelectionMode"
-      :selected-count="selectedFileCount"
-      :selected-paths="selectedFilePathList"
-      :allow-web="allowWeb"
-      @close="queryPanelOpen = false"
-      @toggle-selection-mode="fileSelectionMode = !fileSelectionMode"
-      @clear-selected="clearSelectedFiles"
-      @open-evidence="openCodeEvidence"
-    />
+      class="query-dock"
+      :class="{ dragging: queryDockDragging }"
+      :style="{ height: queryDockHeight + 'px' }"
+    >
+      <div
+        class="query-dock-resizer"
+        role="separator"
+        aria-label="调整追问器高度"
+        aria-orientation="horizontal"
+        :aria-valuemin="queryDockBounds.min"
+        :aria-valuemax="queryDockBounds.max"
+        :aria-valuenow="queryDockHeight"
+        @pointerdown="startQueryDockResize"
+        @pointermove="moveQueryDockResize"
+        @pointerup="endQueryDockResize"
+        @pointercancel="cancelQueryDockResize"
+        @lostpointercapture="loseQueryDockPointer"
+      ></div>
+      <QueryPanel
+        :path="current.path"
+        :ctx="queryCtx"
+        :selection-mode="fileSelectionMode"
+        :selected-count="selectedFileCount"
+        :selected-paths="selectedFilePathList"
+        :allow-web="allowWeb"
+        @close="queryPanelOpen = false"
+        @toggle-selection-mode="fileSelectionMode = !fileSelectionMode"
+        @clear-selected="clearSelectedFiles"
+        @open-evidence="openCodeEvidence"
+      />
+    </div>
     <StatusBar
       :path="current?.path ?? null"
       :lang="current?.lang ?? null"

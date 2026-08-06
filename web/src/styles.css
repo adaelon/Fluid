@@ -901,19 +901,57 @@ body {
   background: var(--btn-hover);
 }
 
-/* — Query panel (S10b): docked as a bottom panel under the editor, above the
-   status bar. Was a fixed bottom-right overlay (S3) — re-homed here to resolve the
-   right-edge collision with trailing line notes (ADR-0016 PENDING). Standard IDE
-   chrome (the §7.4 glass rule now scopes only to in-code annotations, ADR-0015). — */
-.query-panel {
+/* — Query dock (S10b + S-QDOCK-1): App owns the wrapper height; QueryPanel fills
+   it without owning presentation geometry. The top separator uses pointer capture
+   so dragging continues beyond the handle and never writes storage per move. — */
+.query-dock {
   flex: none;
+  min-height: 0;
   display: flex;
   flex-direction: column;
-  max-height: 240px;
-  border-top: 1px solid var(--border);
   background: var(--panel);
-  /* S11-d: faint upward shadow lifts the docked panel above the editor. */
   box-shadow: 0 -2px 6px var(--shadow-chrome);
+}
+
+.query-dock-resizer {
+  position: relative;
+  flex: none;
+  height: 6px;
+  cursor: row-resize;
+  touch-action: none;
+  background: var(--panel);
+  border-top: 1px solid var(--border);
+}
+
+.query-dock-resizer::after {
+  content: '';
+  position: absolute;
+  top: 1px;
+  left: 50%;
+  width: 36px;
+  height: 2px;
+  transform: translateX(-50%);
+  background: var(--border);
+}
+
+.query-dock-resizer:hover::after,
+.query-dock.dragging .query-dock-resizer::after {
+  background: var(--accent);
+}
+
+.query-dock.dragging,
+.query-dock.dragging * {
+  cursor: row-resize !important;
+  user-select: none;
+}
+
+.query-panel {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--panel);
 }
 
 .query-panel.disabled {
