@@ -1,13 +1,15 @@
-// S-FIND-0 deterministic checks. Run with:
+// S-FIND-0/S-FIND-CM1 deterministic checks. Run with:
 //   node scripts/in-file-find-check.ts
 // Node 24 strips TypeScript annotations; no Vue, DOM or backend is needed.
 
-import { EditorState, Text as CmText } from '@codemirror/state'
+import { EditorState, Text as CmText, Transaction } from '@codemirror/state'
+import { getSearchQuery, search, setSearchQuery } from '@codemirror/search'
 import {
   collectInFileMatches,
   createInFileSearchQuery,
   currentInFileMatch,
   moveInFileFindCurrent,
+  snapshotInFileFindState,
   type FindRange,
   type InFileFindQuery,
 } from '../src/inFileFind.ts'
@@ -135,6 +137,74 @@ check('previous wraps first to last', moveInFileFindCurrent(1, 3, 'previous') ==
 check('next from no current starts at first', moveInFileFindCurrent(0, 3, 'next') === 1)
 check('previous from no current starts at last', moveInFileFindCurrent(0, 3, 'previous') === 3)
 check('no results always has current zero', moveInFileFindCurrent(1, 0, 'next') === 0)
+
+console.log('\n=== CodeMirror controlled query state ===')
+let controlledState = EditorState.create({
+  doc: 'one two one',
+  extensions: [search()],
+})
+check('search extension starts with a clear query', getSearchQuery(controlledState).search === '')
+check('clear query starts with a zero snapshot', JSON.stringify(snapshotInFileFindState(controlledState)) === JSON.stringify({
+  current: 0,
+  total: 0,
+  error: null,
+}))
+
+const controlledQuery = createInFileSearchQuery(literal('one'))
+controlledState = controlledState.update({
+  effects: setSearchQuery.of(controlledQuery),
+}).state
+check('controlled query is stored in CodeMirror search state', getSearchQuery(controlledState).eq(controlledQuery))
+
+const controlledRanges = collectInFileMatches(controlledState, controlledQuery)
+const secondSelection = controlledState.update({
+  selection: { anchor: controlledRanges[1].from, head: controlledRanges[1].to },
+  annotations: Transaction.userEvent.of('select.search'),
+})
+check('programmatic match selection is tagged select.search', secondSelection.isUserEvent('select.search'))
+controlledState = secondSelection.state
+check('selected match produces a 1-based CodeMirror snapshot', JSON.stringify(snapshotInFileFindState(controlledState)) === JSON.stringify({
+  current: 2,
+  total: 2,
+  error: null,
+}))
+
+const wrappedIndex = moveInFileFindCurrent(2, controlledRanges.length, 'next')
+const wrappedRange = controlledRanges[wrappedIndex - 1]
+controlledState = controlledState.update({
+  selection: { anchor: wrappedRange.from, head: wrappedRange.to },
+  annotations: Transaction.userEvent.of('select.search'),
+}).state
+check('wrapped CodeMirror selection resolves to the first result', snapshotInFileFindState(controlledState).current === 1)
+
+const manualSelection = controlledState.update({
+  selection: { anchor: 4, head: 7 },
+  annotations: Transaction.userEvent.of('select.pointer'),
+})
+check('manual selection is not mistaken for select.search', !manualSelection.isUserEvent('select.search'))
+
+const selectionBeforeClear = controlledState.selection.main
+controlledState = controlledState.update({
+  effects: setSearchQuery.of(createInFileSearchQuery(literal(''))),
+}).state
+check('clearing removes the CodeMirror search query', getSearchQuery(controlledState).search === '')
+check('clearing produces a zero snapshot', JSON.stringify(snapshotInFileFindState(controlledState)) === JSON.stringify({
+  current: 0,
+  total: 0,
+  error: null,
+}))
+check('clearing leaves the navigated source position intact',
+  controlledState.selection.main.from === selectionBeforeClear.from
+  && controlledState.selection.main.to === selectionBeforeClear.to)
+
+controlledState = controlledState.update({
+  effects: setSearchQuery.of(createInFileSearchQuery(regexp('['))),
+}).state
+check('invalid regexp surfaces a controlled error snapshot', JSON.stringify(snapshotInFileFindState(controlledState)) === JSON.stringify({
+  current: 0,
+  total: 0,
+  error: 'invalid-regexp',
+}))
 
 if (failures > 0) {
   console.error(`\n${failures} FAILED`)

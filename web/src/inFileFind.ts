@@ -1,4 +1,4 @@
-import { SearchQuery } from '@codemirror/search'
+import { getSearchQuery, SearchQuery } from '@codemirror/search'
 import type { EditorState, Text as CmText } from '@codemirror/state'
 
 export type InFileFindMode = 'literal' | 'regexp'
@@ -15,6 +15,11 @@ export interface InFileFindSnapshot {
   current: number
   total: number
   error: 'invalid-regexp' | null
+}
+
+export interface InFileFindSurfaceHandle {
+  moveFind(direction: InFileFindDirection): void
+  focusContent(): void
 }
 
 /** UTF-16 document offsets shared by CodeMirror and browser DOM ranges. */
@@ -60,6 +65,20 @@ export function currentInFileMatch(
     (match) => match.from === activeRange.from && match.to === activeRange.to,
   )
   return index + 1
+}
+
+/** Read the controlled query and active selection from CodeMirror search state. */
+export function snapshotInFileFindState(state: EditorState): InFileFindSnapshot {
+  const query = getSearchQuery(state)
+  const matches = collectInFileMatches(state, query)
+  const selection = state.selection.main
+  return {
+    current: currentInFileMatch(matches, { from: selection.from, to: selection.to }),
+    total: matches.length,
+    error: query.regexp && query.search.length > 0 && !query.valid
+      ? 'invalid-regexp'
+      : null,
+  }
 }
 
 /** Move a 1-based current counter, wrapping at both ends. */

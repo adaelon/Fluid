@@ -1,7 +1,16 @@
 <script setup lang="ts">
 import { nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue'
-import { Compartment, EditorState, type Extension } from '@codemirror/state'
-import { EditorView } from '@codemirror/view'
+import { Compartment, EditorSelection, EditorState, type Extension } from '@codemirror/state'
+import { EditorView, type Panel } from '@codemirror/view'
+import {
+  findNext,
+  findPrevious,
+  getSearchQuery,
+  openSearchPanel,
+  search,
+  searchPanelOpen,
+  setSearchQuery,
+} from '@codemirror/search'
 import { GhostStore } from './ghostStore'
 import { ghostField, foldClickHandler, retryClickHandler, refreshGhosts } from './render/ghostField'
 import { fnGutter, explainClickHandler } from './render/gutter'
@@ -34,6 +43,17 @@ import {
 } from './selectionState'
 import type { DeclSpan, FunctionSpan, ParserLang } from './parser/types.ts'
 import type { CodeEvidenceRef, GenFrame } from './ghostTypes'
+import {
+  collectInFileMatches,
+  createInFileSearchQuery,
+  moveInFileFindCurrent,
+  snapshotInFileFindState,
+  type FindRange,
+  type InFileFindDirection,
+  type InFileFindQuery,
+  type InFileFindSnapshot,
+  type InFileFindSurfaceHandle,
+} from './inFileFind.ts'
 
 interface EvidenceReveal extends CodeEvidenceRef {
   revealKey: number
@@ -45,6 +65,7 @@ const props = defineProps<{
   path: string
   allowWeb: boolean
   revealEvidence?: EvidenceReveal | null
+  findQuery?: InFileFindQuery | null
 }>()
 // Generation progress surfaces to the status bar (U1) via @progress; the
 // per-file query context (roster + generated capsules) surfaces to QueryPanel
@@ -52,6 +73,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   progress: [{ phase: 'idle' | 'running' | 'done'; completed: number; total: number }]
   context: [QueryContext]
+  'find-state': [InFileFindSnapshot]
 }>()
 
 // Push the current-file query snapshot up to QueryPanel (S10b-cap). Called on
@@ -78,6 +100,7 @@ const host = shallowRef<HTMLDivElement | null>(null)
 // ADR-0014: the CM6 EditorView is an imperative object. Hold it in a
 // shallowRef so Vue never deep-proxies its internal state. NEVER a plain ref().
 const view = shallowRef<EditorView | null>(null)
+let suppressFindStateEmit = false
 // GhostStore + scheduler are imperative too — plain (non-reactive) component state.
 const store = new GhostStore()
 // Viewport-aware generation scheduler (S8): orders requests by viewport
@@ -169,11 +192,117 @@ function onFontKey(e: KeyboardEvent): void {
   }
 }
 
+const EMPTY_FIND_QUERY: InFileFindQuery = {
+  text: '',
+  mode: 'literal',
+  caseSensitive: false,
+}
+
+// CodeMirror only enables its search decorations while a panel is active. Keep
+// that state active through an inert hidden panel; the real controlled surface
+// is owned by App in S-FIND-UI1, and the default .cm-panel.cm-search is never made.
+function createControlledFindPanel(): Panel {
+  const dom = document.createElement('div')
+  dom.className = 'cm-fluid-find-panel'
+  dom.hidden = true
+  dom.setAttribute('aria-hidden', 'true')
+  return { dom }
+}
+
+function ensureFindSearchState(editor: EditorView): void {
+  if (!searchPanelOpen(editor.state)) openSearchPanel(editor)
+}
+
+function emitFindState(state: EditorState): void {
+  emit('find-state', snapshotInFileFindState(state))
+}
+
+function selectFindRange(editor: EditorView, range: FindRange): void {
+  const selection = EditorSelection.single(range.from, range.to)
+  suppressFindStateEmit = true
+  try {
+    editor.dispatch({
+      selection,
+      effects: EditorView.scrollIntoView(selection.main),
+      userEvent: 'select.search',
+    })
+  } finally {
+    suppressFindStateEmit = false
+  }
+  emitFindState(editor.state)
+}
+
+function applyFindQuery(query: InFileFindQuery | null | undefined): void {
+  const editor = view.value
+  if (!editor) return
+
+  ensureFindSearchState(editor)
+  const nextQuery = createInFileSearchQuery(query ?? EMPTY_FIND_QUERY)
+  const previousQuery = getSearchQuery(editor.state)
+  if (previousQuery.eq(nextQuery)) {
+    emitFindState(editor.state)
+    return
+  }
+
+  editor.dispatch({ effects: setSearchQuery.of(nextQuery) })
+  const matches = collectInFileMatches(editor.state, nextQuery)
+  if (!nextQuery.valid || matches.length === 0) {
+    emitFindState(editor.state)
+    return
+  }
+  selectFindRange(editor, matches[0])
+}
+
+function moveFind(direction: InFileFindDirection): void {
+  const editor = view.value
+  if (!editor) return
+
+  const controlledQuery = createInFileSearchQuery(props.findQuery ?? EMPTY_FIND_QUERY)
+  if (!getSearchQuery(editor.state).eq(controlledQuery)) applyFindQuery(props.findQuery)
+  ensureFindSearchState(editor)
+
+  const query = getSearchQuery(editor.state)
+  const matches = collectInFileMatches(editor.state, query)
+  const before = snapshotInFileFindState(editor.state)
+  if (!query.valid || matches.length === 0) {
+    emitFindState(editor.state)
+    return
+  }
+
+  const expectedCurrent = moveInFileFindCurrent(before.current, matches.length, direction)
+  suppressFindStateEmit = true
+  let moved = false
+  try {
+    moved = (direction === 'next' ? findNext : findPrevious)(editor)
+  } finally {
+    suppressFindStateEmit = false
+  }
+
+  // CodeMirror's regexp command can remain on the same zero-width match, and
+  // overlapping string matches can differ from the shared cursor contract.
+  // Retain the command's normal selection/scroll behavior, then correct only a
+  // semantic mismatch to the stable shared range sequence.
+  const after = snapshotInFileFindState(editor.state)
+  if (!moved || after.current !== expectedCurrent) {
+    selectFindRange(editor, matches[expectedCurrent - 1])
+    return
+  }
+  emitFindState(editor.state)
+}
+
+function focusContent(): void {
+  view.value?.focus()
+}
+
+defineExpose({ moveFind, focusContent } satisfies InFileFindSurfaceHandle)
+
 function buildState(source: string, lang: string): EditorState {
   return EditorState.create({
     doc: source,
     extensions: [
       ...readOnlyCodeViewExtensions(lang, [fontCompartment.of(fontTheme(fontPx.value))]),
+      EditorView.contentAttributes.of({ tabindex: '0' }),
+      search({ createPanel: createControlledFindPanel }),
       ghostField(store),
       fnGutter(store),
       foldClickHandler(store),
@@ -182,7 +311,17 @@ function buildState(source: string, lang: string): EditorState {
       // Scroll → re-order the pending generation queue by the new viewport (S8).
       EditorView.updateListener.of((u) => {
         if (u.viewportChanged) scheduler?.reprioritize(viewportDist())
-        if (u.selectionSet) syncSelection(u.view)
+        if (u.selectionSet) {
+          const findSelection = u.transactions.some((transaction) => (
+            transaction.isUserEvent('select.search')
+          ))
+          if (findSelection) {
+            closeSelectionUi()
+            if (!suppressFindStateEmit) emitFindState(u.state)
+          } else {
+            syncSelection(u.view)
+          }
+        }
         if (u.viewportChanged || u.geometryChanged) updateSelectionAnchor()
       }),
     ],
@@ -550,6 +689,7 @@ onMounted(() => {
     state: buildState(props.source, props.lang),
     parent: host.value!,
   })
+  applyFindQuery(props.findQuery)
   window.addEventListener('keydown', onFontKey)
   window.addEventListener('keydown', onSelectionKey)
   window.addEventListener('resize', updateSelectionAnchor)
@@ -561,8 +701,15 @@ watch(
   () => [props.source, props.lang, props.path] as const,
   () => {
     view.value?.setState(buildState(props.source, props.lang))
+    applyFindQuery(props.findQuery)
     void activate(props.source, props.lang, props.path)
   },
+)
+
+watch(
+  () => props.findQuery,
+  (query) => applyFindQuery(query),
+  { deep: true },
 )
 
 watch(
