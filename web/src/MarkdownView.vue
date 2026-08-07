@@ -11,11 +11,37 @@
 import { ref, watch, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import { renderDoc, typesetMath } from './render/markdownDoc'
 import { streamTranslate, type TranslateStream } from './api'
+import {
+  collectInFileMatches,
+  createInFileSearchQuery,
+  moveInFileFindCurrent,
+  type FindRange,
+  type InFileFindDirection,
+  type InFileFindQuery,
+  type InFileFindSnapshot,
+  type InFileFindSurfaceHandle,
+} from './inFileFind.ts'
+import {
+  buildRenderedTextIndex,
+  MarkdownFindHighlightLayer,
+  renderedHighlightRects,
+  type RenderedHighlightRect,
+  type RenderedTextIndex,
+} from './markdownFind.ts'
 
-const props = defineProps<{ source: string; path: string }>()
+const props = defineProps<{
+  source: string
+  path: string
+  findQuery?: InFileFindQuery | null
+}>()
+const emit = defineEmits<{
+  'find-state': [InFileFindSnapshot]
+}>()
 
 const html = ref('')
+const scroll = ref<HTMLElement | null>(null)
 const article = ref<HTMLElement | null>(null)
+const findOverlayRects = ref<RenderedHighlightRect[]>([])
 // 'en' shows props.source; 'zh' shows the translated chunks joined in order.
 const mode = ref<'en' | 'zh'>('en')
 const zhChunks = ref<string[]>([]) // translated chunks by index (filled in order)
@@ -27,21 +53,179 @@ const error = ref('')
 let stream: TranslateStream | null = null
 // Bumps on every file switch; async render/stream callbacks bail if it moved.
 let token = 0
+// Separately guards overlapping renders within one file (translation chunks can
+// arrive faster than Markdown/KaTeX finishes rendering).
+let renderRequest = 0
+
+const EMPTY_FIND_QUERY: InFileFindQuery = {
+  text: '',
+  mode: 'literal',
+  caseSensitive: false,
+}
+const findHighlights = new MarkdownFindHighlightLayer()
+let findRevision = findHighlights.currentRevision()
+let renderedText: RenderedTextIndex | null = null
+let findMatches: FindRange[] = []
+let findCurrent = 0
+let activeFindRange: FindRange | null = null
+let appliedFindQuery = createInFileSearchQuery(EMPTY_FIND_QUERY)
+let findResizeObserver: ResizeObserver | null = null
+let findResizeFrame = 0
 
 function zhSource(): string {
   return zhChunks.value.join('')
 }
 
+function sameRange(left: FindRange, right: FindRange): boolean {
+  return left.from === right.from && left.to === right.to
+}
+
+function emitFindState(): void {
+  emit('find-state', {
+    current: findMatches.length > 0 ? findCurrent : 0,
+    total: findMatches.length,
+    error: appliedFindQuery.regexp
+      && appliedFindQuery.search.length > 0
+      && !appliedFindQuery.valid
+      ? 'invalid-regexp'
+      : null,
+  })
+}
+
+function scrollRangeIntoView(range: Range | null): void {
+  const scroller = scroll.value
+  if (!range || !scroller) return
+
+  const rectangles = Array.from(range.getClientRects())
+  const target = rectangles.find((rect) => rect.width > 0 || rect.height > 0)
+    ?? range.getBoundingClientRect()
+  const viewport = scroller.getBoundingClientRect()
+  if (target.top >= viewport.top && target.bottom <= viewport.bottom) return
+
+  const viewportHeight = scroller.clientHeight || viewport.height
+  const centeredOffset = target.top - viewport.top - Math.max(0, (viewportHeight - target.height) / 2)
+  scroller.scrollTop = Math.max(0, scroller.scrollTop + centeredOffset)
+}
+
+function paintFindHighlights(scrollCurrent: boolean): void {
+  if (!renderedText) return
+  const mapped = findHighlights.apply(
+    findRevision,
+    renderedText,
+    findMatches,
+    findCurrent,
+  )
+  const scroller = scroll.value
+  if (mapped && scroller && !findHighlights.usesNativeHighlights()) {
+    const origin = scroller.getBoundingClientRect()
+    findOverlayRects.value = renderedHighlightRects(
+      mapped.all,
+      mapped.current,
+      origin,
+      scroller.scrollLeft,
+      scroller.scrollTop,
+    )
+  } else {
+    findOverlayRects.value = []
+  }
+  if (scrollCurrent) scrollRangeIntoView(mapped?.current ?? null)
+}
+
+function clearFindHighlights(): void {
+  findHighlights.clear()
+  findOverlayRects.value = []
+}
+
+function scheduleFindRepaint(): void {
+  window.cancelAnimationFrame(findResizeFrame)
+  findResizeFrame = window.requestAnimationFrame(() => {
+    findResizeFrame = 0
+    if (renderedText && findMatches.length > 0) paintFindHighlights(false)
+  })
+}
+
+function applyFindQuery(
+  query: InFileFindQuery | null | undefined,
+  options: {
+    preserveQuery?: typeof appliedFindQuery
+    preserveRange?: FindRange | null
+    scrollCurrent?: boolean
+  } = {},
+): void {
+  const nextQuery = createInFileSearchQuery(query ?? EMPTY_FIND_QUERY)
+  const preserveQuery = options.preserveQuery ?? appliedFindQuery
+  const preserveRange = options.preserveRange === undefined
+    ? activeFindRange
+    : options.preserveRange
+  const canPreserve = preserveQuery.eq(nextQuery) && preserveRange !== null
+  appliedFindQuery = nextQuery
+
+  if (!renderedText) {
+    findMatches = []
+    findCurrent = 0
+    activeFindRange = null
+    clearFindHighlights()
+    emitFindState()
+    return
+  }
+
+  findMatches = collectInFileMatches(renderedText.text, nextQuery)
+  if (!nextQuery.valid || findMatches.length === 0) {
+    findCurrent = 0
+    activeFindRange = null
+    clearFindHighlights()
+    emitFindState()
+    return
+  }
+
+  const preservedIndex = canPreserve
+    ? findMatches.findIndex((match) => sameRange(match, preserveRange))
+    : -1
+  findCurrent = preservedIndex >= 0 ? preservedIndex + 1 : 1
+  activeFindRange = findMatches[findCurrent - 1]
+  paintFindHighlights(options.scrollCurrent ?? false)
+  emitFindState()
+}
+
+function moveFind(direction: InFileFindDirection): void {
+  if (!renderedText || !appliedFindQuery.valid || findMatches.length === 0) {
+    emitFindState()
+    return
+  }
+  findCurrent = moveInFileFindCurrent(findCurrent, findMatches.length, direction)
+  activeFindRange = findMatches[findCurrent - 1] ?? null
+  paintFindHighlights(true)
+  emitFindState()
+}
+
+function focusContent(): void {
+  article.value?.focus({ preventScroll: true })
+}
+
+defineExpose({ moveFind, focusContent } satisfies InFileFindSurfaceHandle)
+
 // Render whichever source the current mode selects (en original / zh-so-far).
-async function renderActive(): Promise<void> {
+async function renderActive(preserveCurrent = true): Promise<void> {
   const t = token
+  const request = ++renderRequest
+  const preservedQuery = appliedFindQuery
+  const preservedRange = preserveCurrent ? activeFindRange : null
+  findRevision = findHighlights.beginRevision()
+  findOverlayRects.value = []
+  renderedText = null
   const src = mode.value === 'zh' ? zhSource() : props.source
   const out = await renderDoc(src)
-  if (t !== token) return
+  if (t !== token || request !== renderRequest) return
   html.value = out
   await nextTick()
-  if (t !== token || !article.value) return
+  if (t !== token || request !== renderRequest || !article.value) return
   await typesetMath(article.value)
+  if (t !== token || request !== renderRequest || !article.value) return
+  renderedText = buildRenderedTextIndex(article.value)
+  applyFindQuery(props.findQuery, {
+    preserveQuery: preservedQuery,
+    preserveRange: preservedRange,
+  })
 }
 
 function teardownStream(): void {
@@ -60,7 +244,10 @@ function reset(): void {
   progressDone.value = 0
   progressTotal.value = 0
   error.value = ''
-  void renderActive()
+  findMatches = []
+  findCurrent = 0
+  activeFindRange = null
+  void renderActive(false)
 }
 
 async function showOriginal(): Promise<void> {
@@ -119,13 +306,36 @@ function showChinese(): void {
   })
 }
 
-onMounted(() => void renderActive())
+onMounted(() => {
+  if (typeof ResizeObserver !== 'undefined' && article.value) {
+    findResizeObserver = new ResizeObserver(scheduleFindRepaint)
+    findResizeObserver.observe(article.value)
+  }
+  void renderActive(false)
+})
 watch(() => [props.source, props.path], reset)
-onBeforeUnmount(teardownStream)
+watch(
+  () => props.findQuery,
+  (query) => applyFindQuery(query, { scrollCurrent: true }),
+  { deep: true },
+)
+onBeforeUnmount(() => {
+  token++
+  renderRequest++
+  window.cancelAnimationFrame(findResizeFrame)
+  findResizeObserver?.disconnect()
+  findResizeObserver = null
+  teardownStream()
+  renderedText = null
+  findMatches = []
+  activeFindRange = null
+  findOverlayRects.value = []
+  findHighlights.dispose()
+})
 </script>
 
 <template>
-  <div class="fluid-doc-scroll">
+  <div ref="scroll" class="fluid-doc-scroll">
     <div class="fluid-doc-head">
       <div class="fluid-doc-toggle" role="group" aria-label="原文或译文">
         <button
@@ -150,6 +360,24 @@ onBeforeUnmount(teardownStream)
       </span>
       <span v-else-if="error" class="fluid-doc-err" :title="error">翻译失败</span>
     </div>
-    <article ref="article" class="fluid-doc" v-html="html"></article>
+    <article ref="article" class="fluid-doc" tabindex="0" v-html="html"></article>
+    <div
+      v-if="findOverlayRects.length > 0"
+      class="fluid-doc-find-overlay"
+      aria-hidden="true"
+    >
+      <span
+        v-for="(rect, index) in findOverlayRects"
+        :key="index"
+        class="fluid-doc-find-hit"
+        :class="{ current: rect.current }"
+        :style="{
+          left: `${rect.left}px`,
+          top: `${rect.top}px`,
+          width: `${rect.width}px`,
+          height: `${rect.height}px`,
+        }"
+      ></span>
+    </div>
   </div>
 </template>

@@ -19,6 +19,8 @@
   --btn: rgba(177, 186, 196, 0.12); /* neutral button face */
   --btn-hover: rgba(177, 186, 196, 0.22);
   --code-bg: rgba(255, 255, 255, 0.06); /* inline / block code in answers */
+  --find-match: rgba(227, 179, 65, 0.28);
+  --find-current: rgba(240, 136, 62, 0.62);
 
   /* semantic color temperatures (flow meaning, not brand) */
   --c-normal: #7ee787; /* normal flow */
@@ -1660,6 +1662,7 @@ body {
    .query-answer-md answer panel), dark tokens, centered measure. Code blocks stay
    素色 (no syntax highlight — that's a later slice). — */
 .fluid-doc-scroll {
+  position: relative;
   flex: 1;
   min-height: 0;
   overflow-y: auto;
@@ -1723,6 +1726,35 @@ body {
   font-size: 15px;
   line-height: 1.7;
   word-wrap: break-word;
+}
+.fluid-doc:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+.fluid-doc::highlight(fluid-markdown-find-match) {
+  color: inherit;
+  background-color: var(--find-match);
+}
+.fluid-doc::highlight(fluid-markdown-find-current) {
+  color: inherit;
+  background-color: var(--find-current);
+}
+.fluid-doc-find-overlay {
+  position: absolute;
+  z-index: 1;
+  top: 0;
+  right: 0;
+  left: 0;
+  height: 0;
+  pointer-events: none;
+}
+.fluid-doc-find-hit {
+  position: absolute;
+  border-radius: 2px;
+  background: var(--find-match);
+}
+.fluid-doc-find-hit.current {
+  background: var(--find-current);
 }
 .fluid-doc > :first-child {
   margin-top: 0;
