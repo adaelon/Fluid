@@ -42,7 +42,7 @@ import {
   type SelectionViewState,
 } from './selectionState'
 import type { DeclSpan, FunctionSpan, ParserLang } from './parser/types.ts'
-import type { CodeEvidenceRef, GenFrame } from './ghostTypes'
+import type { CodeEvidenceRef, GenerationProgress, GenFrame } from './ghostTypes'
 import {
   collectInFileMatches,
   createInFileSearchQuery,
@@ -71,7 +71,7 @@ const props = defineProps<{
 // per-file query context (roster + generated capsules) surfaces to QueryPanel
 // via @context (S10b-cap), lifted through App as a sibling-component bridge.
 const emit = defineEmits<{
-  progress: [{ phase: 'idle' | 'running' | 'done'; completed: number; total: number }]
+  progress: [GenerationProgress]
   context: [QueryContext]
   'find-state': [InFileFindSnapshot]
 }>()
@@ -137,7 +137,7 @@ let selectionStream: SelectionStream | null = null
 let selectionRequestSeq = 0
 
 // Generation progress (S7.5) — reactive; emitted up to the status bar (U1).
-const phase = ref<'idle' | 'running' | 'done'>('idle')
+const phase = ref<GenerationProgress['phase']>('idle')
 const total = ref(0)
 const completed = ref(0)
 watch([phase, total, completed], () => {
@@ -294,7 +294,11 @@ function focusContent(): void {
   view.value?.focus()
 }
 
-defineExpose({ moveFind, focusContent } satisfies InFileFindSurfaceHandle)
+interface EditorSurfaceHandle extends InFileFindSurfaceHandle {
+  toggleGeneration(): void
+}
+
+defineExpose({ moveFind, focusContent, toggleGeneration } satisfies EditorSurfaceHandle)
 
 function buildState(source: string, lang: string): EditorState {
   return EditorState.create({
@@ -584,6 +588,33 @@ function settle(fnId: string, ok: boolean, message = ''): void {
   }
 }
 
+/** Stop queue dispatch and close every in-flight generation socket. Settled
+ * capsules remain in GhostStore; only unfinished functions enter paused state. */
+function pauseGeneration(): void {
+  if (phase.value !== 'running') return
+  scheduler?.pause()
+  store.pausePending()
+  phase.value = 'paused'
+  refresh()
+}
+
+/** Re-arm paused functions and let current viewport distance establish the new
+ * order. `extraIds` supports retrying a failed function while globally paused. */
+function resumeGeneration(extraIds: string[] = []): void {
+  if (phase.value !== 'paused') return
+  const ids = [...new Set([...extraIds, ...store.pausedIds()])]
+  if (ids.length === 0) return
+  for (const id of ids) store.markPending(id)
+  phase.value = 'running'
+  refresh()
+  scheduler?.start(ids, viewportDist())
+}
+
+function toggleGeneration(): void {
+  if (phase.value === 'running') pauseGeneration()
+  else if (phase.value === 'paused') resumeGeneration()
+}
+
 // Retry one failed function (S7.6): re-arm it to pending, rewind progress one
 // step, and hand it back to the scheduler (jumps the queue, S8).
 function retry(fnId: string): void {
@@ -591,6 +622,10 @@ function retry(fnId: string): void {
   if (!fn) return
   if (store.statusOf(fnId) === 'error' && completed.value > 0) completed.value--
   store.markPending(fnId)
+  if (phase.value === 'paused') {
+    resumeGeneration([fnId])
+    return
+  }
   phase.value = 'running'
   refresh()
   scheduler?.retry(fnId)

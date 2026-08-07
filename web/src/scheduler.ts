@@ -99,13 +99,28 @@ export interface SchedulerOptions {
   onFrame: (frame: GenFrame) => void
   /** Concurrent sockets; clamped to [1, 5]. Default 4. */
   poolSize?: number
+  /** Test seam; production uses the browser WebSocket constructor. */
+  createSocket?: (url: string) => SchedulerSocket
+}
+
+/** Minimal WebSocket surface owned by the scheduler. */
+export interface SchedulerSocket {
+  readonly readyState: number
+  onopen: ((event: Event) => unknown) | null
+  onmessage: ((event: MessageEvent) => unknown) | null
+  onerror: ((event: Event) => unknown) | null
+  onclose: ((event: CloseEvent) => unknown) | null
+  send(data: string): void
+  close(): void
 }
 
 /** One parallel worker: a socket plus the function it is currently handling. */
 interface Worker {
-  sock: WebSocket
+  sock: SchedulerSocket
   current: FnId | null
 }
+
+const SOCKET_OPEN = 1
 
 /**
  * Drives bounded-concurrency generation over a pool of WebSockets. Each worker
@@ -143,13 +158,22 @@ export class GenScheduler {
     if (this.stopped) return
     this.queue.pushFront(id)
     // Feed an idle worker, or open one if the pool has shrunk to nothing.
-    const idle = this.workers.find((w) => w.current === null && w.sock.readyState === WebSocket.OPEN)
+    const idle = this.workers.find((w) => w.current === null && w.sock.readyState === SOCKET_OPEN)
     if (idle) this.pump(idle)
-    else if (this.workers.every((w) => w.sock.readyState > WebSocket.OPEN)) this.spawnWorker()
+    else if (this.workers.every((w) => w.sock.readyState > SOCKET_OPEN)) this.spawnWorker()
+  }
+
+  /** Pause user-requested work: close in-flight sockets and forget queued ids. */
+  pause(): void {
+    this.teardown()
   }
 
   /** Tear down every socket and clear the queue (file switch / unmount). */
   stop(): void {
+    this.teardown()
+  }
+
+  private teardown(): void {
     this.stopped = true
     this.queue.set([], new Map())
     for (const w of this.workers) {
@@ -166,8 +190,12 @@ export class GenScheduler {
     this.workers.length = 0
   }
 
+  get pendingCount(): number {
+    return this.queue.size
+  }
+
   private spawnWorker(): void {
-    const sock = new WebSocket(this.opts.wsUrl)
+    const sock = this.opts.createSocket?.(this.opts.wsUrl) ?? new WebSocket(this.opts.wsUrl)
     const worker: Worker = { sock, current: null }
     this.workers.push(worker)
     sock.onopen = () => {
@@ -194,7 +222,7 @@ export class GenScheduler {
   /** If the worker is free and has an open socket, send the next pending fn. */
   private pump(worker: Worker): void {
     if (this.stopped || worker.current !== null) return
-    if (worker.sock.readyState !== WebSocket.OPEN) return
+    if (worker.sock.readyState !== SOCKET_OPEN) return
     const next = this.queue.shift()
     if (next === undefined) return
     worker.current = next

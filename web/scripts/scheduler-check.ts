@@ -5,7 +5,14 @@
 // The parallel-socket concurrency and scroll wiring in GenScheduler are
 // browser-verified (A2); this script locks the orderable logic those rely on.
 
-import { viewportDistance, PendingQueue, type FnId } from '../src/scheduler.ts'
+import { GhostStore } from '../src/ghostStore.ts'
+import {
+  GenScheduler,
+  viewportDistance,
+  PendingQueue,
+  type FnId,
+  type SchedulerSocket,
+} from '../src/scheduler.ts'
 
 let failures = 0
 function check(label: string, cond: boolean): void {
@@ -66,6 +73,69 @@ q3.shift() // dispatch p
 q3.pushFront('p') // p failed → retry
 check('retried id is at front', q3.order[0] === 'p')
 check('no duplicate on double pushFront', (q3.pushFront('p'), q3.order.filter((i) => i === 'p').length === 1))
+
+console.log('\n=== pause preserves settled work and marks only pending functions ===')
+const store = new GhostStore()
+const roster = [
+  { id: 'done#1', name: 'done', lineRange: [1, 2] as [number, number] },
+  { id: 'waiting#3', name: 'waiting', lineRange: [3, 4] as [number, number] },
+  { id: 'failed#5', name: 'failed', lineRange: [5, 6] as [number, number] },
+]
+store.setRoster(roster, new Map())
+for (const fn of roster) store.markPending(fn.id)
+store.settle('done#1', true)
+store.settle('failed#5', false, 'fixture failure')
+store.pausePending()
+check('settled function stays settled', store.statusOf('done#1') === 'settled')
+check('pending function becomes paused', store.statusOf('waiting#3') === 'paused')
+check('failed function stays failed', store.statusOf('failed#5') === 'error')
+check('paused ids preserve roster order', eqArr(store.pausedIds(), ['waiting#3']))
+
+console.log('\n=== scheduler pause closes in-flight workers and ignores late frames ===')
+class FakeSocket implements SchedulerSocket {
+  readyState = 0
+  onopen: ((event: Event) => unknown) | null = null
+  onmessage: ((event: MessageEvent) => unknown) | null = null
+  onerror: ((event: Event) => unknown) | null = null
+  onclose: ((event: CloseEvent) => unknown) | null = null
+  sent: string[] = []
+  closed = false
+
+  open(): void {
+    this.readyState = 1
+    this.onopen?.(new Event('open'))
+  }
+
+  send(data: string): void {
+    this.sent.push(data)
+  }
+
+  close(): void {
+    this.closed = true
+    this.readyState = 3
+  }
+}
+
+const sockets: FakeSocket[] = []
+const frames: string[] = []
+const scheduler = new GenScheduler({
+  wsUrl: 'ws://fixture/api/generate',
+  poolSize: 1,
+  buildRequest: (fnId) => ({ reqId: fnId }),
+  onFrame: (frame) => frames.push(frame.reqId),
+  createSocket: () => {
+    const socket = new FakeSocket()
+    sockets.push(socket)
+    return socket
+  },
+})
+scheduler.start(['first#1', 'second#3'], new Map([['first#1', 0], ['second#3', 1]]))
+sockets[0].open()
+check('worker dispatches nearest function before pause', sockets[0].sent.length === 1)
+scheduler.pause()
+check('pause closes the in-flight socket', sockets[0].closed)
+check('pause clears queued work', scheduler.pendingCount === 0)
+check('pause detaches late socket frames', sockets[0].onmessage === null && frames.length === 0)
 
 console.log(`\n${failures === 0 ? 'ALL PASS' : failures + ' FAILED'}`)
 process.exit(failures === 0 ? 0 : 1)

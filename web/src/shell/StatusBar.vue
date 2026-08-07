@@ -4,22 +4,24 @@
 // Editor via App (the S7.5 progress chip moved here from its temporary editor
 // overlay). Standard IDE chrome.
 import { computed } from 'vue'
+import type { GenerationProgress } from '../ghostTypes'
 
 const props = defineProps<{
   path: string | null
   lang: string | null
-  progress: { phase: 'idle' | 'running' | 'done'; completed: number; total: number }
+  progress: GenerationProgress
   /** Whether the follow-up query panel is currently open (toggle reflects it). */
   queryOpen: boolean
 }>()
 
 // The query terminal is hidden by default; this bar carries the only affordance
 // to open it, handing the bottom space back to the code area until asked for.
-const emit = defineEmits<{ toggleQuery: [] }>()
+const emit = defineEmits<{ toggleQuery: []; toggleGeneration: [] }>()
 
 const progressText = computed(() => {
   const p = props.progress
   if (p.phase === 'running') return `⟳ 生成中 ${p.completed}/${p.total}`
+  if (p.phase === 'paused') return `Ⅱ 已暂停 ${p.completed}/${p.total}`
   if (p.phase === 'done') return `✓ ${p.total} 个函数已显影`
   return ''
 })
@@ -55,7 +57,21 @@ const progressText = computed(() => {
         </svg>
         追问
       </button>
-      <span class="status-right" :class="{ done: progress.phase === 'done' }">{{ progressText }}</span>
+      <button
+        v-if="progress.phase === 'running' || progress.phase === 'paused'"
+        class="status-generation-toggle"
+        :class="{ paused: progress.phase === 'paused' }"
+        type="button"
+        :title="progress.phase === 'running' ? '暂停生成并取消在途请求' : '继续生成未完成函数'"
+        @click="emit('toggleGeneration')"
+      >
+        <span aria-hidden="true">{{ progress.phase === 'running' ? 'Ⅱ' : '▶' }}</span>
+        {{ progress.phase === 'running' ? '暂停生成' : '继续生成' }}
+      </button>
+      <span
+        class="status-right"
+        :class="{ done: progress.phase === 'done', paused: progress.phase === 'paused' }"
+      >{{ progressText }}</span>
     </span>
   </footer>
 </template>

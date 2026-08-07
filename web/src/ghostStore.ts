@@ -8,8 +8,8 @@
 import type { DeclSpan, FunctionSpan } from './parser/types.ts'
 import type { Capsule, LineAnnotation } from './ghostTypes'
 
-/** Generation status of one function (S7.5): request in flight, finished, or failed. */
-export type GhostStatus = 'pending' | 'settled' | 'error'
+/** Generation status of one function, including a user-paused unfinished request. */
+export type GhostStatus = 'pending' | 'paused' | 'settled' | 'error'
 
 export class GhostStore {
   /** Function roster for the open file (positions the capsules/lines). */
@@ -91,6 +91,18 @@ export class GhostStore {
   markPending(fnId: string): void {
     this.status.set(fnId, 'pending')
     this.errors.delete(fnId)
+  }
+
+  /** Freeze unfinished functions without disturbing completed or failed work. */
+  pausePending(): void {
+    for (const [fnId, status] of this.status) {
+      if (status === 'pending') this.status.set(fnId, 'paused')
+    }
+  }
+
+  /** Paused function ids in source-roster order, ready for viewport re-scheduling. */
+  pausedIds(): string[] {
+    return this.roster.filter((fn) => this.status.get(fn.id) === 'paused').map((fn) => fn.id)
   }
 
   /** Mark a function's generation finished (`ok`) or failed (with a message). */

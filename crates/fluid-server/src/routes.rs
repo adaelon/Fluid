@@ -1307,19 +1307,43 @@ async fn generate_ws(ws: WebSocketUpgrade, State(state): State<Shared>) -> impl 
 
 /// Drive one `/api/generate` socket: read request frames, process each
 /// sequentially, stream its frames back tagged with the request's `reqId`.
+/// While supplier IO is pending we keep polling the socket; a client close drops
+/// the generation future immediately, which cancels reqwest IO before parsing or
+/// cache persistence. Text frames pipelined by a client remain FIFO queued.
 async fn handle_generate_socket(mut socket: WebSocket, state: Shared) {
-    while let Some(Ok(msg)) = socket.recv().await {
-        let text = match msg {
-            Message::Text(t) => t,
-            Message::Close(_) => break,
-            // ignore ping/pong/binary; axum answers pings for us.
-            _ => continue,
+    let mut queued_requests = std::collections::VecDeque::<String>::new();
+    loop {
+        let text = if let Some(text) = queued_requests.pop_front() {
+            text
+        } else {
+            loop {
+                match socket.recv().await {
+                    Some(Ok(Message::Text(text))) => break text.to_string(),
+                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return,
+                    // Ignore ping/pong/binary; axum answers pings for us.
+                    _ => continue,
+                }
+            }
         };
 
         let (req_id, frames) = match serde_json::from_str::<GenerateRequest>(&text) {
             Ok(req) => {
                 let req_id = req.req_id.clone();
-                (req_id, run_generation(&state, req).await)
+                let generation = run_generation(&state, req);
+                tokio::pin!(generation);
+                let frames = loop {
+                    tokio::select! {
+                        frames = &mut generation => break frames,
+                        incoming = socket.recv() => match incoming {
+                            Some(Ok(Message::Text(text))) => {
+                                queued_requests.push_back(text.to_string());
+                            }
+                            Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return,
+                            _ => {}
+                        }
+                    }
+                };
+                (req_id, frames)
             }
             Err(e) => (String::new(), vec![err(format!("bad request: {e}"))]),
         };
@@ -4090,6 +4114,32 @@ mod tests {
         request
     }
 
+    fn generation_request_json(request: &GenerateRequest) -> serde_json::Value {
+        serde_json::json!({
+            "reqId": request.req_id,
+            "filePath": request.file_path,
+            "orientationId": request.orientation_id,
+            "fn": {
+                "id": request.func.id,
+                "name": request.func.name,
+                "lineRange": request.func.line_range,
+            },
+            "roster": request.roster,
+            "rosterSpans": request.roster_spans,
+            "keyLines": request.key_lines,
+            "shared": {},
+        })
+    }
+
+    fn generation_cache_exists(state: &AppState, request: &GenerateRequest) -> bool {
+        let config = state.llm_snapshot().config;
+        let mut guard = state.project.write().unwrap();
+        let project = guard.as_mut().unwrap();
+        let binding = verify_capsule_binding(project, &config, request).unwrap();
+        let identity = capsule_cache_identity(&binding, &config);
+        project.cache.get_capsule(&identity).is_some()
+    }
+
     fn bounded_orientation_source() -> String {
         let mut source = concat!(
             "use crate::Request;\n",
@@ -4282,6 +4332,64 @@ mod tests {
             GenFrame::Error { message } => assert!(message.contains("LLM not configured")),
             other => panic!("expected error frame, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn generation_websocket_disconnect_aborts_inflight_request_without_cache_write() {
+        let tmp = TmpDir::new();
+        std::fs::write(tmp.path().join("a.py"), "def f():\n    return 1\n").unwrap();
+        let response = serde_json::json!({
+            "capsule": {
+                "signature": "def f()",
+                "summary": "fixture",
+                "complexity": "simple",
+                "io": "none"
+            },
+            "lines": []
+        });
+        let mock = start_orientation_mock(
+            StatusCode::OK,
+            response.to_string(),
+            Duration::from_millis(300),
+        )
+        .await;
+        let state = Arc::new(orientation_state(tmp.path(), &mock));
+        let request = bound_req(&state, "a.py");
+        let request_json = generation_request_json(&request);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = router(Arc::clone(&state));
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let url = format!("ws://{address}/api/generate");
+        let (mut socket, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        socket
+            .send(ClientMessage::Text(request_json.to_string()))
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !mock.requests.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("generation request did not reach the mock LLM");
+
+        socket.close(None).await.unwrap();
+        drop(socket);
+        tokio::time::sleep(Duration::from_millis(450)).await;
+
+        assert!(
+            !generation_cache_exists(&state, &request),
+            "a disconnected generation must not finish and populate the cache"
+        );
+        task.abort();
     }
 
     #[tokio::test]

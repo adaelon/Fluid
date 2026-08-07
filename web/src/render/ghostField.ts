@@ -33,13 +33,13 @@ function build(store: GhostStore, state: EditorState): DecorationSet {
         Decoration.widget({ widget: new CapsuleWidget(cap, folded), block: true, side: -1 }).range(at),
       )
     } else {
-      // No capsule yet (S7.5): show a "生成中" skeleton, or a "生成失败" chip.
+      // No capsule yet: show running/paused feedback or a failure chip.
       const st = store.statusOf(fn.id)
-      if (st === 'pending' || st === 'error') {
+      if (st === 'pending' || st === 'paused' || st === 'error') {
         const widget =
           st === 'error'
             ? new PlaceholderWidget(fn.id, 'error', store.errorOf(fn.id))
-            : new PlaceholderWidget(fn.id, 'pending')
+            : new PlaceholderWidget(fn.id, st)
         ranges.push(Decoration.widget({ widget, block: true, side: -1 }).range(at))
       }
     }

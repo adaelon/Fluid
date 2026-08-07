@@ -130,6 +130,15 @@ export type OrientationFrame =
   | { kind: 'done'; reqId: string }
   | { kind: 'error'; reqId: string; message: string }
 
+/** User-visible lifecycle of the current file's function generation. */
+export type GenerationPhase = 'idle' | 'running' | 'paused' | 'done'
+
+export interface GenerationProgress {
+  phase: GenerationPhase
+  completed: number
+  total: number
+}
+
 /** One inbound frame from `WS /api/generate` (S7a, §4). `reqId` echoes the
  *  request (= the function id); terminal frames are `done` | `error`. */
 export type GenFrame =

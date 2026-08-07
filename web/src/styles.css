@@ -451,6 +451,9 @@ body {
   color: var(--accent);
   font-weight: 600;
 }
+.status-right.paused {
+  color: var(--text);
+}
 /* Right cluster: the 「追问」 toggle + the generation progress text. */
 .status-right-group {
   display: flex;
@@ -493,6 +496,28 @@ body {
 .status-query-toggle:disabled {
   opacity: 0.45;
   cursor: default;
+}
+.status-generation-toggle {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 18px;
+  padding: 0 6px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  cursor: pointer;
+}
+.status-generation-toggle:hover {
+  color: var(--text);
+  background: var(--hover);
+}
+.status-generation-toggle.paused {
+  color: var(--accent);
+  border-color: var(--accent);
 }
 
 /* — Tab strip (U2): one tab per open file; active is highlighted. — */
@@ -2184,6 +2209,13 @@ body {
 .fluid-placeholder.pending .fluid-body {
   color: var(--muted);
   animation: fluid-pulse 1.2s ease-in-out infinite;
+}
+.fluid-placeholder.paused {
+  border-left-color: var(--muted);
+}
+.fluid-placeholder.paused .fluid-body {
+  color: var(--muted);
+  opacity: 0.8;
 }
 .fluid-placeholder.error {
   border-left-color: var(--c-error);

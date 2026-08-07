@@ -1,12 +1,12 @@
 // PlaceholderWidget — function-level generation feedback (S7.5/S7.6). Shown at a
 // function's definition line while no capsule has arrived: a pulsing "生成中"
-// skeleton (mode 'pending'), or a "生成失败" chip carrying the failure reason +
-// a 重试 button (mode 'error', S7.6). Replaced by the real CapsuleWidget once the
-// `capsule` frame lands. Shares the .fluid-ghost glass pipeline (§7.4).
+// skeleton (mode 'pending'), a static "已暂停" marker, or a "生成失败" chip
+// carrying the failure reason + a 重试 button (mode 'error', S7.6). Replaced by
+// the real CapsuleWidget once the `capsule` frame lands.
 
 import { WidgetType } from '@codemirror/view'
 
-export type PlaceholderMode = 'pending' | 'error'
+export type PlaceholderMode = 'pending' | 'paused' | 'error'
 
 export class PlaceholderWidget extends WidgetType {
   constructor(
@@ -44,6 +44,8 @@ export class PlaceholderWidget extends WidgetType {
       retry.textContent = '重试'
 
       body.append(label, retry)
+    } else if (this.mode === 'paused') {
+      body.textContent = '已暂停'
     } else {
       body.textContent = '生成中…'
     }

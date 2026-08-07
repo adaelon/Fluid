@@ -12,7 +12,7 @@ import Tabs from './shell/Tabs.vue'
 import SettingsModal from './shell/SettingsModal.vue'
 import CommandPalette, { type PaletteItem } from './shell/CommandPalette.vue'
 import { EMPTY_QUERY_CONTEXT, type QueryContext } from './queryContext'
-import type { CodeEvidenceRef } from './ghostTypes'
+import type { CodeEvidenceRef, GenerationProgress } from './ghostTypes'
 import type {
   InFileFindDirection,
   InFileFindQuery,
@@ -52,7 +52,10 @@ interface InFileFindBarHandle {
 }
 
 const editorStage = ref<HTMLElement | null>(null)
-const activeFindSurface = ref<InFileFindSurfaceHandle | null>(null)
+interface ActiveContentSurfaceHandle extends InFileFindSurfaceHandle {
+  toggleGeneration?: () => void
+}
+const activeFindSurface = ref<ActiveContentSurfaceHandle | null>(null)
 const findBarComponent = ref<InFileFindBarHandle | null>(null)
 const findOpen = ref(false)
 const findQuery = ref<InFileFindQuery>({ ...DEFAULT_FIND_QUERY })
@@ -123,11 +126,15 @@ watch(activePath, (path, previousPath) => {
 })
 
 // Generation progress lifted from Editor (U1) → rendered in the status bar.
-const genProgress = ref<{ phase: 'idle' | 'running' | 'done'; completed: number; total: number }>({
+const genProgress = ref<GenerationProgress>({
   phase: 'idle',
   completed: 0,
   total: 0,
 })
+
+function toggleGeneration(): void {
+  activeFindSurface.value?.toggleGeneration?.()
+}
 
 // Current-file query context lifted from Editor (S10b-cap) → handed to QueryPanel
 // so follow-ups carry the roster + generated capsule summaries. Editor emits a
@@ -172,6 +179,9 @@ watch(
   (c) => {
     if (!c || c.lang === 'md' || queryCtx.value.filePath !== c.path) {
       queryCtx.value = EMPTY_QUERY_CONTEXT
+    }
+    if (!c || c.lang === 'md') {
+      genProgress.value = { phase: 'idle', completed: 0, total: 0 }
     }
   },
 )
@@ -702,6 +712,7 @@ function closeTab(path: string) {
       :aria-hidden="queryFocusActive ? 'true' : undefined"
       :inert="queryFocusActive"
       @toggle-query="toggleQueryPanel"
+      @toggle-generation="toggleGeneration"
     />
     <SettingsModal
       v-if="settingsOpen"
