@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { computed, onMounted, onBeforeUnmount, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onBeforeUnmount, ref, watch } from 'vue'
 import { fetchFile, fetchTree, openFolder, pickFolder, getLlmSettings, type FileNode } from './api'
 import FileTree from './FileTree.vue'
 import Editor from './Editor.vue'
 import MarkdownView from './MarkdownView.vue'
+import InFileFindBar from './InFileFindBar.vue'
 import QueryPanel from './QueryPanel.vue'
 import ActivityBar from './shell/ActivityBar.vue'
 import StatusBar from './shell/StatusBar.vue'
@@ -12,6 +13,12 @@ import SettingsModal from './shell/SettingsModal.vue'
 import CommandPalette, { type PaletteItem } from './shell/CommandPalette.vue'
 import { EMPTY_QUERY_CONTEXT, type QueryContext } from './queryContext'
 import type { CodeEvidenceRef } from './ghostTypes'
+import type {
+  InFileFindDirection,
+  InFileFindQuery,
+  InFileFindSnapshot,
+  InFileFindSurfaceHandle,
+} from './inFileFind.ts'
 import {
   QUERY_DOCK_STORAGE_KEY,
   clampQueryDockHeight,
@@ -33,6 +40,87 @@ const current = computed<OpenFile | null>(
 // Breadcrumb segments of the active file path (U2).
 const crumbs = computed<string[]>(() => current.value?.path.split('/') ?? [])
 const loadError = ref<string | null>(null)
+
+const DEFAULT_FIND_QUERY: InFileFindQuery = {
+  text: '',
+  mode: 'literal',
+  caseSensitive: false,
+}
+
+interface InFileFindBarHandle {
+  focusInput(): void
+}
+
+const editorStage = ref<HTMLElement | null>(null)
+const activeFindSurface = ref<InFileFindSurfaceHandle | null>(null)
+const findBarComponent = ref<InFileFindBarHandle | null>(null)
+const findOpen = ref(false)
+const findQuery = ref<InFileFindQuery>({ ...DEFAULT_FIND_QUERY })
+const lastFindQuery = ref<InFileFindQuery>({ ...DEFAULT_FIND_QUERY })
+const findSnapshot = ref<InFileFindSnapshot>(emptyFindSnapshot())
+const activeFindQuery = computed(() => findOpen.value ? findQuery.value : null)
+
+function emptyFindSnapshot(): InFileFindSnapshot {
+  return { current: 0, total: 0, error: null }
+}
+
+function focusFindInput(): void {
+  void nextTick(() => findBarComponent.value?.focusInput())
+}
+
+function openFind(): void {
+  if (!current.value) return
+  if (!findOpen.value) {
+    findQuery.value = { ...lastFindQuery.value }
+    findSnapshot.value = emptyFindSnapshot()
+    findOpen.value = true
+  }
+  focusFindInput()
+}
+
+function closeFind(restoreFocus = true): void {
+  if (!findOpen.value) return
+  lastFindQuery.value = { ...findQuery.value }
+  findOpen.value = false
+  findSnapshot.value = emptyFindSnapshot()
+  if (restoreFocus) {
+    void nextTick(() => activeFindSurface.value?.focusContent())
+  }
+}
+
+function updateFindQuery(query: InFileFindQuery): void {
+  findQuery.value = { ...query }
+  findSnapshot.value = emptyFindSnapshot()
+}
+
+function updateFindSnapshot(snapshot: InFileFindSnapshot): void {
+  if (findOpen.value) findSnapshot.value = { ...snapshot }
+}
+
+function moveFind(direction: InFileFindDirection): void {
+  if (
+    !findOpen.value
+    || findSnapshot.value.error !== null
+    || findSnapshot.value.total === 0
+  ) return
+  activeFindSurface.value?.moveFind(direction)
+}
+
+function isFindKeyboardContext(event: KeyboardEvent): boolean {
+  const stage = editorStage.value
+  if (!stage || !current.value) return false
+  const target = event.target instanceof Node ? event.target : document.activeElement
+  return target instanceof Node && stage.contains(target)
+}
+
+function consumeFindKey(event: KeyboardEvent): void {
+  event.preventDefault()
+  event.stopImmediatePropagation()
+}
+
+watch(activePath, (path, previousPath) => {
+  if (path !== previousPath) closeFind(false)
+})
 
 // Generation progress lifted from Editor (U1) → rendered in the status bar.
 const genProgress = ref<{ phase: 'idle' | 'running' | 'done'; completed: number; total: number }>({
@@ -290,6 +378,42 @@ function onGlobalKey(e: KeyboardEvent) {
     restoreQueryDock()
     return
   }
+
+  const findLayerBlocked = settingsOpen.value || Boolean(paletteMode.value) || queryFocusActive.value
+  const findKeyboardContext = !findLayerBlocked && !e.isComposing && isFindKeyboardContext(e)
+  const findChord = (e.ctrlKey || e.metaKey)
+    && !e.altKey
+    && !e.shiftKey
+    && e.key.toLowerCase() === 'f'
+  if (findKeyboardContext && findChord) {
+    consumeFindKey(e)
+    openFind()
+    return
+  }
+  if (
+    findKeyboardContext
+    && findOpen.value
+    && e.key === 'F3'
+    && !e.ctrlKey
+    && !e.metaKey
+    && !e.altKey
+  ) {
+    consumeFindKey(e)
+    moveFind(e.shiftKey ? 'previous' : 'next')
+    return
+  }
+  if (
+    findKeyboardContext
+    && findOpen.value
+    && e.key === 'Escape'
+    && !e.ctrlKey
+    && !e.metaKey
+    && !e.altKey
+  ) {
+    consumeFindKey(e)
+    closeFind()
+    return
+  }
   if (!(e.ctrlKey || e.metaKey)) return
   if (e.key.toLowerCase() === 'p') {
     e.preventDefault()
@@ -493,22 +617,39 @@ function closeTab(path: string) {
             <span v-if="i < crumbs.length - 1" class="crumb-sep">›</span>
           </span>
         </div>
-        <MarkdownView
-          v-if="current && current.lang === 'md'"
-          :source="current.source"
-          :path="current.path"
-        />
-        <Editor
-          v-else-if="current"
-          :source="current.source"
-          :lang="current.lang"
-          :path="current.path"
-          :allow-web="allowWeb"
-          :reveal-evidence="activeEvidenceReveal"
-          @progress="genProgress = $event"
-          @context="queryCtx = $event"
-        />
-        <div v-else class="empty">从左侧选择一个文件以只读查看源码</div>
+        <div ref="editorStage" class="editor-stage">
+          <MarkdownView
+            v-if="current && current.lang === 'md'"
+            ref="activeFindSurface"
+            :source="current.source"
+            :path="current.path"
+            :find-query="activeFindQuery"
+            @find-state="updateFindSnapshot"
+          />
+          <Editor
+            v-else-if="current"
+            ref="activeFindSurface"
+            :source="current.source"
+            :lang="current.lang"
+            :path="current.path"
+            :allow-web="allowWeb"
+            :reveal-evidence="activeEvidenceReveal"
+            :find-query="activeFindQuery"
+            @progress="genProgress = $event"
+            @context="queryCtx = $event"
+            @find-state="updateFindSnapshot"
+          />
+          <div v-else class="empty">从左侧选择一个文件以只读查看源码</div>
+          <InFileFindBar
+            v-if="findOpen && current"
+            ref="findBarComponent"
+            :query="findQuery"
+            :snapshot="findSnapshot"
+            @update:query="updateFindQuery"
+            @move="moveFind"
+            @close="closeFind()"
+          />
+        </div>
       </main>
     </div>
     <div
