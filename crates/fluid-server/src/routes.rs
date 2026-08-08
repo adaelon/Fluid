@@ -32,12 +32,12 @@ use crate::cache_store::{
 };
 use crate::context_assembler::{
     assemble_current_query_map, assemble_file_set_context, assemble_file_set_query_map,
-    assemble_gen_context, build_bounded_orientation_role_batch_specs,
-    build_bounded_orientation_skeleton_prompt, build_explain_decl_prompt,
-    build_explain_line_prompt, build_file_set_query_prompt, build_file_set_query_prompt_with_map,
+    assemble_gen_context, build_bounded_orientation_function_evidence_sources,
+    build_bounded_orientation_role_batch_specs, build_bounded_orientation_skeleton_prompt,
+    build_explain_decl_prompt, build_explain_line_prompt, build_file_set_query_prompt,
+    build_file_set_query_prompt_with_map, build_full_orientation_function_evidence_sources,
     build_full_orientation_role_batch_specs, build_gen_prompt,
-    build_legacy_orientation_role_batch_correction_prompt as build_orientation_role_batch_correction_prompt,
-    build_legacy_orientation_role_batch_prompt as build_orientation_role_batch_prompt,
+    build_orientation_role_batch_correction_prompt, build_orientation_role_batch_prompt,
     build_orientation_skeleton_prompt, build_orientation_source_planning_prompt,
     build_query_prompt, build_query_prompt_with_map, build_query_source_planning_prompt,
     build_selection_explanation_prompt, build_selection_private_context,
@@ -54,17 +54,16 @@ use crate::graph_loader::{GraphCatalog, GraphNode, KnowledgeGraph};
 #[cfg(test)]
 use crate::llm_proxy::parse_orientation_card;
 use crate::llm_proxy::{
-    parse_fetch_plan, parse_generation,
-    parse_legacy_orientation_role_batch as parse_orientation_role_batch, parse_line_annotation,
+    parse_fetch_plan, parse_generation, parse_line_annotation, parse_orientation_role_batch,
     parse_orientation_skeleton, parse_orientation_source_plan, parse_selection_explanation,
     LlmProxy, SseDecoder,
 };
 use crate::orientation::{
-    merge_orientation_card, orientation_context_hash, validate_orientation_role_batch,
-    validate_orientation_skeleton, FileOrientationCard, FunctionRole, OrientationBackendFacts,
-    OrientationCacheIdentity, OrientationCoverage, OrientationCoverageMode,
-    OrientationRoleBatchSpec, OrientationValidationContext, ORIENTATION_PROMPT_VERSION,
-    ORIENTATION_SCHEMA_VERSION,
+    bind_exact_function_evidence, materialize_orientation_role_batch, merge_orientation_card,
+    orientation_context_hash, validate_orientation_skeleton, FileOrientationCard, FunctionRole,
+    OrientationBackendFacts, OrientationCacheIdentity, OrientationCoverage,
+    OrientationCoverageMode, OrientationFunctionEvidenceSource, OrientationRoleBatchSpec,
+    OrientationValidationContext, ORIENTATION_PROMPT_VERSION, ORIENTATION_SCHEMA_VERSION,
 };
 use crate::project_reader::{FileNode, ProjectReader, ReadErr};
 use crate::settings::{mask_key, persist_env, LlmConfig};
@@ -624,6 +623,7 @@ enum OrientationGenerationInput {
         skeleton_system: String,
         skeleton_user: String,
         role_batches: Vec<OrientationRoleBatchSpec>,
+        evidence_sources: Vec<OrientationFunctionEvidenceSource>,
     },
     BoundedSource {
         planning_system: String,
@@ -636,6 +636,7 @@ struct OrientationGenerationPlan {
     skeleton_system: String,
     skeleton_user: String,
     role_batches: Vec<OrientationRoleBatchSpec>,
+    evidence_sources: Vec<OrientationFunctionEvidenceSource>,
     skeleton_fn_ids: Vec<String>,
     coverage: OrientationCoverage,
 }
@@ -761,10 +762,21 @@ where
                         return;
                     }
                 };
+            let evidence_sources =
+                match build_full_orientation_function_evidence_sources(&req.roster_spans) {
+                    Ok(sources) => sources,
+                    Err(error) => {
+                        emit(orientation_error(format!(
+                            "orientation function evidence preparation error: {error}"
+                        )));
+                        return;
+                    }
+                };
             OrientationGenerationInput::FullSource {
                 skeleton_system,
                 skeleton_user,
                 role_batches,
+                evidence_sources,
             }
         };
 
@@ -788,10 +800,12 @@ where
             skeleton_system,
             skeleton_user,
             role_batches,
+            evidence_sources,
         } => OrientationGenerationPlan {
             skeleton_system: skeleton_system.clone(),
             skeleton_user: skeleton_user.clone(),
             role_batches: role_batches.clone(),
+            evidence_sources: evidence_sources.clone(),
             skeleton_fn_ids: work.roster_fn_ids.clone(),
             coverage: OrientationCoverage {
                 mode: OrientationCoverageMode::FullSource,
@@ -883,10 +897,23 @@ where
                     return;
                 }
             };
+            let evidence_sources = match build_bounded_orientation_function_evidence_sources(
+                &work.roster_spans,
+                &selection,
+            ) {
+                Ok(sources) => sources,
+                Err(error) => {
+                    emit(orientation_error(format!(
+                        "orientation function evidence preparation error: {error}"
+                    )));
+                    return;
+                }
+            };
             OrientationGenerationPlan {
                 skeleton_system,
                 skeleton_user,
                 role_batches,
+                evidence_sources,
                 skeleton_fn_ids: selection
                     .sources
                     .iter()
@@ -944,6 +971,22 @@ where
         )));
         return;
     }
+    let (skeleton, evidence_bindings) =
+        match bind_exact_function_evidence(skeleton, &plan.evidence_sources, &work.file_path) {
+            Ok(bound) => bound,
+            Err(error) => {
+                emit(orientation_error(format!(
+                    "orientation function evidence binding error: {error}"
+                )));
+                return;
+            }
+        };
+    if let Err(error) = validate_orientation_skeleton(&skeleton, &skeleton_validation) {
+        emit(orientation_error(format!(
+            "enriched orientation skeleton validation error: {error}"
+        )));
+        return;
+    }
 
     let batch_count = plan.role_batches.len();
     let mut role_batches = Vec::with_capacity(batch_count);
@@ -971,10 +1014,10 @@ where
             }
         };
         let first_attempt = match parse_orientation_role_batch(&content) {
-            Ok(batch) => match validate_orientation_role_batch(&batch, &spec, &skeleton) {
-                Ok(()) => Ok(batch),
-                Err(error) => Err(format!("validation error: {error}")),
-            },
+            Ok(draft) => {
+                materialize_orientation_role_batch(draft, &spec, &skeleton, &evidence_bindings)
+                    .map_err(|error| format!("validation error: {error}"))
+            }
             Err(error) => Err(format!("parse error: {error}")),
         };
         let batch = match first_attempt {
@@ -1008,8 +1051,8 @@ where
                         return;
                     }
                 };
-                let corrected_batch = match parse_orientation_role_batch(&corrected_content) {
-                    Ok(batch) => batch,
+                let corrected_draft = match parse_orientation_role_batch(&corrected_content) {
+                    Ok(draft) => draft,
                     Err(error) => {
                         emit(orientation_error(format!(
                             "orientation role batch {} correction parse error: {error}",
@@ -1018,16 +1061,21 @@ where
                         return;
                     }
                 };
-                if let Err(error) =
-                    validate_orientation_role_batch(&corrected_batch, &spec, &skeleton)
-                {
-                    emit(orientation_error(format!(
-                        "orientation role batch {} correction validation error: {error}",
-                        spec.index + 1
-                    )));
-                    return;
+                match materialize_orientation_role_batch(
+                    corrected_draft,
+                    &spec,
+                    &skeleton,
+                    &evidence_bindings,
+                ) {
+                    Ok(batch) => batch,
+                    Err(error) => {
+                        emit(orientation_error(format!(
+                            "orientation role batch {} correction validation error: {error}",
+                            spec.index + 1
+                        )));
+                        return;
+                    }
                 }
-                corrected_batch
             }
         };
         role_batches.push((spec, batch));
@@ -4239,7 +4287,21 @@ mod tests {
         })
     }
 
-    fn orientation_role_batch_json(card: &serde_json::Value) -> serde_json::Value {
+    fn orientation_role_batch_draft_json(card: &serde_json::Value) -> serde_json::Value {
+        let mut batch = serde_json::json!({
+            "functionRoles": card["functionRoles"].clone(),
+            "supportingCapabilities": card["supportingCapabilities"].clone(),
+        });
+        for role in batch["functionRoles"].as_array_mut().unwrap() {
+            role.as_object_mut().unwrap().remove("evidenceIds");
+        }
+        for capability in batch["supportingCapabilities"].as_array_mut().unwrap() {
+            capability.as_object_mut().unwrap().remove("evidenceIds");
+        }
+        batch
+    }
+
+    fn legacy_orientation_role_batch_json(card: &serde_json::Value) -> serde_json::Value {
         serde_json::json!({
             "functionRoles": card["functionRoles"].clone(),
             "supportingCapabilities": card["supportingCapabilities"].clone(),
@@ -4258,7 +4320,7 @@ mod tests {
             ),
             (
                 StatusCode::OK,
-                orientation_role_batch_json(card).to_string(),
+                orientation_role_batch_draft_json(card).to_string(),
                 Duration::ZERO,
             ),
         ]
@@ -4358,7 +4420,6 @@ mod tests {
                     } else {
                         "Keeps auxiliary work available to the file coordinator."
                     },
-                    "evidenceIds": ["E1"]
                 })
             })
             .collect::<Vec<_>>();
@@ -4782,7 +4843,7 @@ mod tests {
             ),
             (
                 StatusCode::OK,
-                orientation_role_batch_json(&card).to_string(),
+                orientation_role_batch_draft_json(&card).to_string(),
                 Duration::ZERO,
             ),
         ])
@@ -4797,6 +4858,18 @@ mod tests {
         assert_eq!(miss[2]["card"]["schemaVersion"], 1);
         assert_eq!(miss[2]["card"]["filePath"], "a.rs");
         assert_eq!(miss[2]["card"]["coverage"]["mode"], "full-source");
+        assert_eq!(
+            miss[2]["card"]["functionRoles"][0]["evidenceIds"],
+            serde_json::json!(["E1"])
+        );
+        assert_eq!(
+            miss[2]["card"]["functionRoles"][1]["evidenceIds"],
+            serde_json::json!(["E2"])
+        );
+        assert_eq!(
+            miss[2]["card"]["supportingCapabilities"][0]["evidenceIds"],
+            serde_json::json!(["E2"])
+        );
         let orientation_id = miss[2]["card"]["orientationId"]
             .as_str()
             .expect("backend injects orientationId")
@@ -4846,6 +4919,8 @@ mod tests {
             .unwrap();
         assert!(role_system.contains("functionRoles"));
         assert!(role_system.contains("supportingCapabilities"));
+        assert!(role_system.contains("后端负责注入源码证据"));
+        assert!(!role_system.contains("\"evidenceIds\""));
         assert!(requests
             .iter()
             .all(|request| request.get("response_format").is_none()));
@@ -4877,7 +4952,36 @@ mod tests {
 
         let miss = orientation_ws_frames(&app, batched_orientation_request_json()).await;
         assert_eq!(miss.last().unwrap()["kind"], "done");
-        assert!(miss.iter().any(|frame| frame["kind"] == "card"));
+        let card = miss
+            .iter()
+            .find(|frame| frame["kind"] == "card")
+            .expect("full-source miss emits a card");
+        let evidence_ids_and_symbols = card["card"]["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|evidence| {
+                (
+                    evidence["id"].as_str().unwrap().to_string(),
+                    evidence["symbol"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            evidence_ids_and_symbols,
+            (0..9)
+                .map(|index| (format!("E{}", index + 1), format!("f{index}")))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            card["card"]["functionRoles"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|role| role["evidenceIds"][0].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            (1..=9).map(|index| format!("E{index}")).collect::<Vec<_>>()
+        );
         let hit = orientation_ws_frames(&app, batched_orientation_request_json()).await;
         assert_eq!(frame_kinds(&hit), vec!["cache-hit", "card", "done"]);
 
@@ -4907,10 +5011,16 @@ mod tests {
 
     #[tokio::test]
     async fn orientation_websocket_role_batch_parse_or_validation_failure_corrects_once() {
-        let mut invalid_reference = orientation_role_batch_json(&orientation_card_json());
+        let card = orientation_card_json();
+        let mut invalid_reference = orientation_role_batch_draft_json(&card);
         invalid_reference["functionRoles"][0]["flowIds"] = serde_json::json!(["missing-flow"]);
         let cases = [
             ("parse", "not-json".to_string(), "not-json"),
+            (
+                "legacy-shape",
+                legacy_orientation_role_batch_json(&card).to_string(),
+                "evidenceIds",
+            ),
             ("validation", invalid_reference.to_string(), "missing-flow"),
         ];
 
@@ -4927,7 +5037,7 @@ mod tests {
                 (StatusCode::OK, invalid_output, Duration::ZERO),
                 (
                     StatusCode::OK,
-                    orientation_role_batch_json(&card).to_string(),
+                    orientation_role_batch_draft_json(&card).to_string(),
                     Duration::ZERO,
                 ),
             ])
@@ -4965,9 +5075,9 @@ mod tests {
     #[tokio::test]
     async fn orientation_websocket_correction_rejects_out_of_batch_and_frozen_ids() {
         let card = orientation_card_json();
-        let mut out_of_batch = orientation_role_batch_json(&card);
+        let mut out_of_batch = orientation_role_batch_draft_json(&card);
         out_of_batch["functionRoles"][0]["fnId"] = serde_json::json!("ghost#404");
-        let mut out_of_frozen = orientation_role_batch_json(&card);
+        let mut out_of_frozen = orientation_role_batch_draft_json(&card);
         out_of_frozen["functionRoles"][0]["flowIds"] = serde_json::json!(["ghost-flow"]);
 
         for (case, corrected_output) in [
@@ -5024,7 +5134,7 @@ mod tests {
             ),
             (
                 StatusCode::OK,
-                orientation_role_batch_json(&card).to_string(),
+                orientation_role_batch_draft_json(&card).to_string(),
                 Duration::ZERO,
             ),
         ])
@@ -5187,7 +5297,7 @@ mod tests {
             ),
             (
                 StatusCode::OK,
-                orientation_role_batch_json(&bounded_orientation_card_json()).to_string(),
+                orientation_role_batch_draft_json(&bounded_orientation_card_json()).to_string(),
                 Duration::ZERO,
             ),
         ])
@@ -5206,6 +5316,21 @@ mod tests {
         assert_eq!(
             miss[3]["card"]["coverage"]["omittedFunctionIds"],
             serde_json::json!(["omitted#9"])
+        );
+        let roles = miss[3]["card"]["functionRoles"].as_array().unwrap();
+        let evidence_for = |fn_id: &str| {
+            roles.iter().find(|role| role["fnId"] == fn_id).unwrap()["evidenceIds"].clone()
+        };
+        assert_eq!(evidence_for("fetch#5"), serde_json::json!(["E1"]));
+        assert_eq!(evidence_for("helper#8"), serde_json::json!(["E2"]));
+        assert_eq!(evidence_for("omitted#9"), serde_json::json!([]));
+        assert_eq!(
+            miss[3]["card"]["supportingCapabilities"][0]["functionIds"],
+            serde_json::json!(["helper#8"])
+        );
+        assert_eq!(
+            miss[3]["card"]["supportingCapabilities"][0]["evidenceIds"],
+            serde_json::json!(["E2"])
         );
 
         let hit = orientation_ws_frames(&app, bounded_orientation_request_json()).await;
@@ -5284,7 +5409,7 @@ mod tests {
                 ),
                 (
                     StatusCode::OK,
-                    orientation_role_batch_json(&bounded_orientation_card_json()).to_string(),
+                    orientation_role_batch_draft_json(&bounded_orientation_card_json()).to_string(),
                     Duration::ZERO,
                 ),
             ])
@@ -5462,7 +5587,7 @@ mod tests {
             ),
             (
                 StatusCode::OK,
-                orientation_role_batch_json(&card).to_string(),
+                orientation_role_batch_draft_json(&card).to_string(),
                 Duration::from_millis(300),
             ),
         ];

@@ -23,9 +23,7 @@ use crate::orientation::{
     OrientationInvariant, OrientationType, OrientationWalkthrough, SupportingCapability,
     ORIENTATION_SCHEMA_VERSION,
 };
-use crate::orientation::{
-    FunctionRole, OrientationRoleBatch, OrientationRoleBatchDraft, OrientationSkeleton,
-};
+use crate::orientation::{FunctionRole, OrientationRoleBatchDraft, OrientationSkeleton};
 use crate::web_evidence::{
     parse_web_search_response, EvidenceStatus, SourceLink, WebSearchError, WebSearchResult,
 };
@@ -432,20 +430,7 @@ pub fn parse_orientation_skeleton(content: &str) -> anyhow::Result<OrientationSk
 /// Parse only one model-authored stage-B semantic draft. Unknown fields are
 /// rejected by `OrientationRoleBatchDraft`, so evidence, batch identity, and
 /// final card facts remain backend-owned.
-#[allow(dead_code)] // S-ORI3-3 replaces the temporary legacy route import.
 pub fn parse_orientation_role_batch(content: &str) -> anyhow::Result<OrientationRoleBatchDraft> {
-    serde_json::from_str(extract_json(content)).map_err(|error| {
-        anyhow::anyhow!(
-            "LLM did not return the expected orientation role batch JSON: {error}; content: {content}"
-        )
-    })
-}
-
-/// Temporary ORI2 parser retained only until S-ORI3-3 moves the production
-/// route through draft materialization.
-pub(crate) fn parse_legacy_orientation_role_batch(
-    content: &str,
-) -> anyhow::Result<OrientationRoleBatch> {
     serde_json::from_str(extract_json(content)).map_err(|error| {
         anyhow::anyhow!(
             "LLM did not return the expected orientation role batch JSON: {error}; content: {content}"

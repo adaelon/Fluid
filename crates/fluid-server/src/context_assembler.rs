@@ -814,7 +814,6 @@ pub fn build_full_orientation_role_batch_specs(
 /// without changing roster order. Source text remains owned by the role-batch
 /// specs; this projection carries only the stable identity and full span used
 /// later by `bind_exact_function_evidence`.
-#[allow(dead_code)] // S-ORI3-3 wires the staged projector into `/api/orient`.
 pub fn build_full_orientation_function_evidence_sources(
     roster_spans: &[FunctionSpan],
 ) -> Result<Vec<OrientationFunctionEvidenceSource>, String> {
@@ -910,7 +909,6 @@ pub fn build_bounded_orientation_role_batch_specs(
 /// Reproduce the backend's bounded-source partition as evidence metadata.
 /// Selected functions are exact; the roster complement is signature-only and
 /// therefore will not receive a function-body evidence binding.
-#[allow(dead_code)] // S-ORI3-3 wires the staged projector into `/api/orient`.
 pub fn build_bounded_orientation_function_evidence_sources(
     roster_spans: &[FunctionSpan],
     selection: &OrientationSourceSelection,
@@ -953,7 +951,6 @@ pub fn build_bounded_orientation_function_evidence_sources(
     ))
 }
 
-#[allow(dead_code)] // Reachable with the staged S-ORI3-3 projector entrypoints.
 fn validate_orientation_evidence_roster(
     roster_spans: &[FunctionSpan],
 ) -> Result<HashSet<&str>, String> {
@@ -978,7 +975,6 @@ fn validate_orientation_evidence_roster(
     Ok(roster_ids)
 }
 
-#[allow(dead_code)] // Reachable with the staged S-ORI3-3 projector entrypoints.
 fn project_orientation_function_evidence_sources(
     roster_spans: &[FunctionSpan],
     exact_ids: &HashSet<&str>,
@@ -1140,7 +1136,6 @@ pub fn build_bounded_orientation_skeleton_prompt(
 
 /// Build one stage-B role prompt from an immutable, already validated skeleton
 /// and one backend-owned batch. No global roster or other batch source is added.
-#[allow(dead_code)] // S-ORI3-3 replaces the temporary legacy route import.
 pub fn build_orientation_role_batch_prompt(
     frozen: &OrientationSkeleton,
     spec: &OrientationRoleBatchSpec,
@@ -1212,7 +1207,6 @@ pub fn build_orientation_role_batch_prompt(
 
 /// Build the single allowed stage-B correction request without widening either
 /// the frozen coordinate set or the original batch boundary.
-#[allow(dead_code)] // S-ORI3-3 replaces the temporary legacy route import.
 pub fn build_orientation_role_batch_correction_prompt(
     frozen: &OrientationSkeleton,
     spec: &OrientationRoleBatchSpec,
@@ -1220,76 +1214,6 @@ pub fn build_orientation_role_batch_correction_prompt(
     validation_error: &str,
 ) -> (String, String) {
     let (system, mut user) = build_orientation_role_batch_prompt(frozen, spec);
-    user.push_str("【上次无效输出；仅用于纠错，不是事实】\n");
-    user.push_str(original_output);
-    user.push('\n');
-    user.push_str("【确定性校验错误】\n");
-    user.push_str(validation_error);
-    user.push('\n');
-    user.push_str("请在完全相同的冻结骨架和当前批次边界内重写 JSON；不得扩大任何 ID 集合。\n");
-    (system, user)
-}
-
-/// Temporary ORI2 prompt retained only until S-ORI3-3 connects the production
-/// route to draft parsing and backend evidence materialization.
-pub(crate) fn build_legacy_orientation_role_batch_prompt(
-    frozen: &OrientationSkeleton,
-    spec: &OrientationRoleBatchSpec,
-) -> (String, String) {
-    let system = r#"你是 Fluid 的函数角色定向助手。请在后端已校验并冻结的文件定向骨架中，为当前唯一批次归类函数角色。
-只输出一个 JSON 对象，禁止额外文字或 Markdown 代码围栏。JSON 只能包含 functionRoles 与 supportingCapabilities；禁止输出或改写骨架字段、批次边界、schemaVersion、orientationId、filePath 或 coverage。
-
-语言约束：所有面向读者的自然语言说明必须使用简体中文，源码标识符与通行技术术语可保留必要英文。
-
-硬约束：
-1. 当前批次每个 fnId 必须在 functionRoles 中恰好出现一次；禁止漏失、重复或创造批外 fnId。
-2. lane 只能是 core 或 supporting。core 必须引用至少一个冻结 flowId；supporting 必须输出 flowIds: []。
-3. actor、flow、evidence 引用只能来自冻结骨架。不能新增、改写或猜测 ID。
-4. supportingCapabilities.functionIds 只能引用本批 supporting 函数；核心函数不得进入外围能力。
-5. Exact 函数可依据可见函数体保守引用冻结 evidence；SignatureOnly 函数只能依据签名描述，必须使用 evidenceIds: []，且不得放进需要函数体证据的 supportingCapabilities。
-
-字段形状：
-{"functionRoles":[{"fnId":"fnId","lane":"core|supporting","flowIds":["flow_id"],"stage":"...","receivesFromActorIds":["actor_id"],"consumes":["..."],"sendsToActorIds":["actor_id"],"produces":["..."],"why":"...","evidenceIds":["E1"]}],"supportingCapabilities":[{"name":"...","why":"...","functionIds":["fnId"],"evidenceIds":["E1"]}]}"#;
-
-    let frozen_json = serde_json::to_string(frozen)
-        .expect("validated orientation skeleton contains only serializable fields");
-    let boundary_json = serde_json::json!({
-        "index": spec.index,
-        "fnIds": spec.fn_ids,
-    });
-    let mut user = String::new();
-    user.push_str(&format!("【冻结定向骨架(JSON；只读)】{frozen_json}\n"));
-    user.push_str(&format!("【当前批次边界(JSON)】{boundary_json}\n"));
-    user.push_str("【当前批次源码投影】\n");
-    for view in &spec.source_views {
-        match view {
-            OrientationFunctionSourceView::Exact {
-                fn_id,
-                numbered_source,
-            } => {
-                user.push_str(&format!("【Exact fnId={fn_id}】\n{numbered_source}\n"));
-            }
-            OrientationFunctionSourceView::SignatureOnly {
-                fn_id,
-                numbered_signature,
-            } => {
-                user.push_str(&format!(
-                    "【SignatureOnly fnId={fn_id}】\n{numbered_signature}\n"
-                ));
-            }
-        }
-    }
-
-    (system.to_string(), user)
-}
-
-pub(crate) fn build_legacy_orientation_role_batch_correction_prompt(
-    frozen: &OrientationSkeleton,
-    spec: &OrientationRoleBatchSpec,
-    original_output: &str,
-    validation_error: &str,
-) -> (String, String) {
-    let (system, mut user) = build_legacy_orientation_role_batch_prompt(frozen, spec);
     user.push_str("【上次无效输出；仅用于纠错，不是事实】\n");
     user.push_str(original_output);
     user.push('\n');
@@ -3761,11 +3685,6 @@ mod tests {
         assert_eq!(correction_system, system);
         assert!(correction_user.contains("\"exactFnIds\":[\"exact#10\"]"));
         assert!(correction_user.contains("missing role"));
-
-        let (legacy_system, legacy_user) =
-            build_legacy_orientation_role_batch_prompt(&frozen, &spec);
-        assert!(legacy_system.contains("\"evidenceIds\""));
-        assert!(!legacy_user.contains("exactFnIds"));
     }
 
     #[test]
