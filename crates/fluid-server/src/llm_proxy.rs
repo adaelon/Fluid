@@ -19,8 +19,8 @@ use serde::Deserialize;
 use crate::cache_store::{Capsule, LineAnnotation, SelectionExplanation, SelectionKind};
 use crate::orientation::{
     CodeEvidenceRef, FileOrientationCard, FunctionRole, OrientationActor, OrientationCoverage,
-    OrientationFlow, OrientationInvariant, OrientationType, OrientationWalkthrough,
-    SupportingCapability, ORIENTATION_SCHEMA_VERSION,
+    OrientationFlow, OrientationInvariant, OrientationRoleBatch, OrientationSkeleton,
+    OrientationType, OrientationWalkthrough, SupportingCapability, ORIENTATION_SCHEMA_VERSION,
 };
 use crate::web_evidence::{
     parse_web_search_response, EvidenceStatus, SourceLink, WebSearchError, WebSearchResult,
@@ -409,6 +409,29 @@ pub fn parse_orientation_card(
         invariants: raw.invariants,
         evidence: raw.evidence,
         coverage,
+    })
+}
+
+/// Parse only the model-authored stage-A coordinate system. The target type
+/// denies unknown fields, so backend identity, coverage, or role fields cannot
+/// be smuggled through this trust boundary.
+#[allow(dead_code)] // S-ORI2-3 will connect the two-stage route.
+pub fn parse_orientation_skeleton(content: &str) -> anyhow::Result<OrientationSkeleton> {
+    serde_json::from_str(extract_json(content)).map_err(|error| {
+        anyhow::anyhow!(
+            "LLM did not return the expected orientation skeleton JSON: {error}; content: {content}"
+        )
+    })
+}
+
+/// Parse only one model-authored stage-B batch. Unknown fields are rejected by
+/// `OrientationRoleBatch`, leaving batch identity and final card facts backend-owned.
+#[allow(dead_code)] // S-ORI2-3 will connect the two-stage route.
+pub fn parse_orientation_role_batch(content: &str) -> anyhow::Result<OrientationRoleBatch> {
+    serde_json::from_str(extract_json(content)).map_err(|error| {
+        anyhow::anyhow!(
+            "LLM did not return the expected orientation role batch JSON: {error}; content: {content}"
+        )
     })
 }
 
@@ -950,6 +973,39 @@ mod tests {
             .find(|role| role.fn_id == "helper#2")
             .unwrap();
         assert!(helper.flow_ids.is_empty());
+    }
+
+    #[test]
+    fn two_stage_orientation_parsers_keep_backend_facts_out_of_model_json() {
+        let skeleton = serde_json::json!({
+            "purpose": "Explain one file.",
+            "actors": [],
+            "types": [],
+            "coreFlows": [],
+            "walkthrough": { "title": "Example", "input": "input", "steps": [] },
+            "invariants": [],
+            "evidence": []
+        });
+        assert_eq!(
+            parse_orientation_skeleton(&skeleton.to_string())
+                .unwrap()
+                .purpose,
+            "Explain one file."
+        );
+
+        let mut forged_skeleton = skeleton;
+        forged_skeleton["schemaVersion"] = serde_json::json!(999);
+        assert!(parse_orientation_skeleton(&forged_skeleton.to_string()).is_err());
+
+        let batch = serde_json::json!({
+            "functionRoles": [],
+            "supportingCapabilities": []
+        });
+        assert!(parse_orientation_role_batch(&batch.to_string()).is_ok());
+
+        let mut forged_batch = batch;
+        forged_batch["orientationId"] = serde_json::json!("model-owned");
+        assert!(parse_orientation_role_batch(&forged_batch.to_string()).is_err());
     }
 
     #[test]

@@ -20,8 +20,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::graph_loader::{GraphCatalog, GraphEdge, GraphNode, GraphSnapshot, KnowledgeGraph};
 use crate::orientation::{
-    ActorBoundary, CodeEvidenceRef, FileOrientationCard, FunctionLane, FunctionRole,
-    OrientationActor, OrientationFlow, OrientationFlowStep, OrientationType,
+    batch_orientation_role_source_views, ActorBoundary, CodeEvidenceRef, FileOrientationCard,
+    FunctionLane, FunctionRole, OrientationActor, OrientationFlow, OrientationFlowStep,
+    OrientationFunctionSourceView, OrientationRoleBatchSpec, OrientationSkeleton, OrientationType,
     OrientationWalkthrough, WalkthroughStep,
 };
 
@@ -782,6 +783,116 @@ pub fn slice_orientation_sources(
     }
 }
 
+/// Project every verified roster span to exact, absolutely numbered source and
+/// split the views into stable backend batches of at most eight functions.
+#[allow(dead_code)] // S-ORI2-3 will call this from the full-source route.
+pub fn build_full_orientation_role_batch_specs(
+    file_source: &str,
+    roster_spans: &[FunctionSpan],
+) -> Result<Vec<OrientationRoleBatchSpec>, String> {
+    let mut seen = HashSet::new();
+    let mut views = Vec::with_capacity(roster_spans.len());
+    for span in roster_spans {
+        if !seen.insert(span.id.as_str()) {
+            return Err(format!("duplicate roster fnId {:?}", span.id));
+        }
+        let source = slice_span(file_source, span.line_range).ok_or_else(|| {
+            format!(
+                "roster fnId {:?} has an invalid source span {:?}",
+                span.id, span.line_range
+            )
+        })?;
+        views.push(OrientationFunctionSourceView::Exact {
+            fn_id: span.id.clone(),
+            numbered_source: number_lines(&source, span.line_range[0]),
+        });
+    }
+    Ok(batch_orientation_role_source_views(views))
+}
+
+/// Project selected bounded-source functions to exact source and every omitted
+/// roster function to its numbered signature only. The selection must be the
+/// exact roster partition produced by `slice_orientation_sources`.
+#[allow(dead_code)] // S-ORI2-3 will call this from the bounded-source route.
+pub fn build_bounded_orientation_role_batch_specs(
+    file_source: &str,
+    roster_spans: &[FunctionSpan],
+    selection: &OrientationSourceSelection,
+) -> Result<Vec<OrientationRoleBatchSpec>, String> {
+    let mut roster_ids = HashSet::new();
+    for span in roster_spans {
+        if !roster_ids.insert(span.id.as_str()) {
+            return Err(format!("duplicate roster fnId {:?}", span.id));
+        }
+    }
+
+    let mut selected_sources = BTreeMap::new();
+    for source in &selection.sources {
+        if !roster_ids.contains(source.fn_id.as_str()) {
+            return Err(format!(
+                "bounded selection references unknown fnId {:?}",
+                source.fn_id
+            ));
+        }
+        if selected_sources
+            .insert(source.fn_id.as_str(), source.numbered_source.as_str())
+            .is_some()
+        {
+            return Err(format!("bounded selection repeats fnId {:?}", source.fn_id));
+        }
+    }
+
+    let expected_omitted = roster_spans
+        .iter()
+        .filter(|span| !selected_sources.contains_key(span.id.as_str()))
+        .map(|span| span.id.clone())
+        .collect::<Vec<_>>();
+    if selection.omitted_function_ids != expected_omitted {
+        return Err(format!(
+            "bounded omitted fnIds do not match the roster complement: expected {expected_omitted:?}, got {:?}",
+            selection.omitted_function_ids
+        ));
+    }
+
+    let lines = file_source.lines().collect::<Vec<_>>();
+    let mut views = Vec::with_capacity(roster_spans.len());
+    for span in roster_spans {
+        if let Some(selected_numbered_source) = selected_sources.get(span.id.as_str()) {
+            let source = slice_span(file_source, span.line_range).ok_or_else(|| {
+                format!(
+                    "selected roster fnId {:?} has an invalid source span {:?}",
+                    span.id, span.line_range
+                )
+            })?;
+            let numbered_source = number_lines(&source, span.line_range[0]);
+            if numbered_source != *selected_numbered_source {
+                return Err(format!(
+                    "selected source for fnId {:?} no longer matches the active file",
+                    span.id
+                ));
+            }
+            views.push(OrientationFunctionSourceView::Exact {
+                fn_id: span.id.clone(),
+                numbered_source,
+            });
+        } else {
+            let numbered_signature = orientation_signature_lines(&lines, span).join("\n");
+            if numbered_signature.trim().is_empty() {
+                return Err(format!(
+                    "omitted roster fnId {:?} has no valid signature projection",
+                    span.id
+                ));
+            }
+            views.push(OrientationFunctionSourceView::SignatureOnly {
+                fn_id: span.id.clone(),
+                numbered_signature,
+            });
+        }
+    }
+
+    Ok(batch_orientation_role_source_views(views))
+}
+
 /// Build the one bounded-source card-generation prompt after planning. Coverage
 /// is a backend fact: the model receives the exact omitted IDs but does not author
 /// the coverage object that will be cached.
@@ -831,6 +942,170 @@ pub fn build_bounded_orientation_prompt(
     }
 
     (system.to_string(), user)
+}
+
+/// Build the stage-A prompt over the complete active-file source. The requested
+/// JSON deliberately excludes all function-role and backend-owned card fields.
+#[allow(dead_code)] // S-ORI2-3 will connect the two-stage route.
+pub fn build_orientation_skeleton_prompt(
+    file_path: &str,
+    file_source: &str,
+    roster_spans: &[FunctionSpan],
+    ctx: &GenContext,
+) -> (String, String) {
+    let system = r#"你是 Fluid 的文件定向骨架助手，面向零代码基础读者。请依据当前激活文件的完整源码，建立之后所有函数角色都必须服从的只读语义坐标系。
+只输出一个 JSON 对象，禁止额外文字或 Markdown 代码围栏。JSON 只能包含：purpose、actors、types、coreFlows、walkthrough、invariants、evidence。
+
+语言约束：所有面向读者的自然语言说明必须使用简体中文。源码标识符、文件路径、库名、协议名、产品名和通行技术术语可保留必要英文。
+
+硬约束：
+1. actors 使用稳定、具名的真实参与者 ID 与 inside-file/project/external 边界；方向必须由 fromActorId -> toActorId 表达，禁止无主语的“上游/下游”或 upstream/downstream。
+2. types.ownerActorId、coreFlows 的参与者/证据、walkthrough 与 invariants 的 evidenceIds 必须引用本对象已声明 ID，不能悬空。
+3. coreFlows 至少一个，每条 flow 至少一个 step；step 必须点名真实 via、payload、why，并至少引用一个当前源码 evidenceId。
+4. evidence 只能指向当前激活文件，使用下方完整源码中的 1-based inclusive 行号；图谱摘要和模型记忆不是证据。
+5. walkthrough 必须提供具体输入与至少一个贯穿步骤；purpose、flow、step 均说明缺失后果。
+
+字段形状：
+{"purpose":"...","actors":[{"id":"actor_id","name":"...","role":"...","boundary":"inside-file|project|external"}],"types":[{"name":"...","ownerActorId":"actor_id","meaning":"..."}],"coreFlows":[{"id":"flow_id","name":"...","kind":"request|response|control|stats|other","why":"...","steps":[{"fromActorId":"actor_id","via":"真实函数/通道/调用","payload":"真实类型或信号","toActorId":"actor_id","why":"...","evidenceIds":["E1"]}]}],"walkthrough":{"title":"...","input":"具体输入","steps":[{"text":"...","evidenceIds":["E1"]}]},"invariants":[{"text":"...","evidenceIds":["E1"]}],"evidence":[{"id":"E1","filePath":"当前文件路径","startLine":1,"endLine":2,"symbol":"可选符号"}]}"#;
+
+    let mut user = String::new();
+    user.push_str(&format!("【当前激活文件】{file_path}\n"));
+    let roster_json = serde_json::to_string(roster_spans)
+        .expect("verified function spans contain only serializable fields");
+    user.push_str(&format!(
+        "【后端核验函数清单(JSON；仅导航)】{roster_json}\n"
+    ));
+    append_orientation_graph_hints(&mut user, ctx);
+    user.push_str("【完整源码(带 1-based 绝对行号；唯一事实证据)】\n");
+    user.push_str(&number_lines(file_source, 1));
+
+    (system.to_string(), user)
+}
+
+/// Build the stage-A prompt for an oversized file. Only selected exact source
+/// bodies cross the boundary; omitted functions remain outline-only navigation.
+#[allow(dead_code)] // S-ORI2-3 will connect the two-stage route.
+pub fn build_bounded_orientation_skeleton_prompt(
+    file_path: &str,
+    file_source: &str,
+    roster_spans: &[FunctionSpan],
+    ctx: &GenContext,
+    selection: &OrientationSourceSelection,
+) -> (String, String) {
+    let system = r#"你是 Fluid 的文件定向骨架助手，面向零代码基础读者。当前激活文件过大；请只依据文件轮廓与后端提供的一轮精确源码切片，建立之后所有函数角色都必须服从的只读语义坐标系。
+只输出一个 JSON 对象，禁止额外文字或 Markdown 代码围栏。JSON 只能包含：purpose、actors、types、coreFlows、walkthrough、invariants、evidence。
+
+语言约束：所有面向读者的自然语言说明必须使用简体中文。源码标识符、文件路径、库名、协议名、产品名和通行技术术语可保留必要英文。
+
+硬约束：
+1. actors 使用稳定、具名的真实参与者 ID 与 inside-file/project/external 边界；方向必须由 fromActorId -> toActorId 表达，禁止无主语的“上游/下游”或 upstream/downstream。
+2. types.ownerActorId、coreFlows 的参与者/证据、walkthrough 与 invariants 的 evidenceIds 必须引用本对象已声明 ID，不能悬空。
+3. coreFlows 至少一个，每条 flow 至少一个 step；step 必须点名真实 via、payload、why，并至少引用一个下方可见源码 evidenceId。
+4. omittedFunctionIds 对应的函数实现没有提供；不得从签名、轮廓或模型记忆虚构其函数体行为或证据。
+5. evidence 只能指向下方后端精确源码切片，路径只能是当前激活文件，行号为 1-based inclusive；轮廓和图谱摘要不是证据。
+6. walkthrough 必须提供具体输入与至少一个由可见源码支撑的贯穿步骤。
+
+字段形状：
+{"purpose":"...","actors":[{"id":"actor_id","name":"...","role":"...","boundary":"inside-file|project|external"}],"types":[{"name":"...","ownerActorId":"actor_id","meaning":"..."}],"coreFlows":[{"id":"flow_id","name":"...","kind":"request|response|control|stats|other","why":"...","steps":[{"fromActorId":"actor_id","via":"真实函数/通道/调用","payload":"真实类型或信号","toActorId":"actor_id","why":"...","evidenceIds":["E1"]}]}],"walkthrough":{"title":"...","input":"具体输入","steps":[{"text":"...","evidenceIds":["E1"]}]},"invariants":[{"text":"...","evidenceIds":["E1"]}],"evidence":[{"id":"E1","filePath":"当前文件路径","startLine":1,"endLine":2,"symbol":"可选符号"}]}"#;
+
+    let mut user = String::new();
+    user.push_str(&format!("【当前激活文件】{file_path}\n"));
+    let roster_json = serde_json::to_string(roster_spans)
+        .expect("verified function spans contain only serializable fields");
+    user.push_str(&format!(
+        "【后端核验函数清单(JSON；仅导航)】{roster_json}\n"
+    ));
+    let omitted_json = serde_json::to_string(&selection.omitted_function_ids)
+        .expect("omitted function IDs contain only serializable strings");
+    user.push_str(&format!(
+        "【后端确定的 omittedFunctionIds(JSON)】{omitted_json}\n"
+    ));
+    append_orientation_graph_hints(&mut user, ctx);
+    user.push_str("【文件轮廓说明】以下 imports/顶层类型/函数签名仅作导航提示，不是 evidence。\n");
+    user.push_str(&render_orientation_outline(file_source, roster_spans));
+    user.push_str("【后端精确源码切片(带 1-based 绝对行号；唯一函数体证据)】\n");
+    for source in &selection.sources {
+        user.push_str(&render_orientation_source_chunk(
+            &source.fn_id,
+            &source.numbered_source,
+        ));
+    }
+
+    (system.to_string(), user)
+}
+
+/// Build one stage-B role prompt from an immutable, already validated skeleton
+/// and one backend-owned batch. No global roster or other batch source is added.
+#[allow(dead_code)] // S-ORI2-3 will connect the two-stage route.
+pub fn build_orientation_role_batch_prompt(
+    frozen: &OrientationSkeleton,
+    spec: &OrientationRoleBatchSpec,
+) -> (String, String) {
+    let system = r#"你是 Fluid 的函数角色定向助手。请在后端已校验并冻结的文件定向骨架中，为当前唯一批次归类函数角色。
+只输出一个 JSON 对象，禁止额外文字或 Markdown 代码围栏。JSON 只能包含 functionRoles 与 supportingCapabilities；禁止输出或改写骨架字段、批次边界、schemaVersion、orientationId、filePath 或 coverage。
+
+语言约束：所有面向读者的自然语言说明必须使用简体中文，源码标识符与通行技术术语可保留必要英文。
+
+硬约束：
+1. 当前批次每个 fnId 必须在 functionRoles 中恰好出现一次；禁止漏失、重复或创造批外 fnId。
+2. lane 只能是 core 或 supporting。core 必须引用至少一个冻结 flowId；supporting 必须输出 flowIds: []。
+3. actor、flow、evidence 引用只能来自冻结骨架。不能新增、改写或猜测 ID。
+4. supportingCapabilities.functionIds 只能引用本批 supporting 函数；核心函数不得进入外围能力。
+5. Exact 函数可依据可见函数体保守引用冻结 evidence；SignatureOnly 函数只能依据签名描述，必须使用 evidenceIds: []，且不得放进需要函数体证据的 supportingCapabilities。
+
+字段形状：
+{"functionRoles":[{"fnId":"fnId","lane":"core|supporting","flowIds":["flow_id"],"stage":"...","receivesFromActorIds":["actor_id"],"consumes":["..."],"sendsToActorIds":["actor_id"],"produces":["..."],"why":"...","evidenceIds":["E1"]}],"supportingCapabilities":[{"name":"...","why":"...","functionIds":["fnId"],"evidenceIds":["E1"]}]}"#;
+
+    let frozen_json = serde_json::to_string(frozen)
+        .expect("validated orientation skeleton contains only serializable fields");
+    let boundary_json = serde_json::json!({
+        "index": spec.index,
+        "fnIds": spec.fn_ids,
+    });
+    let mut user = String::new();
+    user.push_str(&format!("【冻结定向骨架(JSON；只读)】{frozen_json}\n"));
+    user.push_str(&format!("【当前批次边界(JSON)】{boundary_json}\n"));
+    user.push_str("【当前批次源码投影】\n");
+    for view in &spec.source_views {
+        match view {
+            OrientationFunctionSourceView::Exact {
+                fn_id,
+                numbered_source,
+            } => {
+                user.push_str(&format!("【Exact fnId={fn_id}】\n{numbered_source}\n"));
+            }
+            OrientationFunctionSourceView::SignatureOnly {
+                fn_id,
+                numbered_signature,
+            } => {
+                user.push_str(&format!(
+                    "【SignatureOnly fnId={fn_id}】\n{numbered_signature}\n"
+                ));
+            }
+        }
+    }
+
+    (system.to_string(), user)
+}
+
+/// Build the single allowed stage-B correction request without widening either
+/// the frozen coordinate set or the original batch boundary.
+#[allow(dead_code)] // S-ORI2-4 will connect correction after validation failure.
+pub fn build_orientation_role_batch_correction_prompt(
+    frozen: &OrientationSkeleton,
+    spec: &OrientationRoleBatchSpec,
+    original_output: &str,
+    validation_error: &str,
+) -> (String, String) {
+    let (system, mut user) = build_orientation_role_batch_prompt(frozen, spec);
+    user.push_str("【上次无效输出；仅用于纠错，不是事实】\n");
+    user.push_str(original_output);
+    user.push('\n');
+    user.push_str("【确定性校验错误】\n");
+    user.push_str(validation_error);
+    user.push('\n');
+    user.push_str("请在完全相同的冻结骨架和当前批次边界内重写 JSON；不得扩大任何 ID 集合。\n");
+    (system, user)
 }
 
 fn append_orientation_graph_hints(user: &mut String, ctx: &GenContext) {
@@ -2974,6 +3249,200 @@ mod tests {
         assert!(user.contains("selected_body"));
         assert!(user.contains("\"omitted#3\""));
         assert!(!user.contains("omitted_body_must_stay_private"));
+    }
+
+    #[test]
+    fn orientation_skeleton_prompts_request_no_role_fields_and_hide_omitted_bodies() {
+        let source = concat!(
+            "fn selected() { selected_body(); }\n",
+            "fn omitted() { omitted_body_must_stay_private(); }\n",
+        );
+        let roster = vec![
+            FunctionSpan {
+                id: "selected#1".into(),
+                name: "selected".into(),
+                line_range: [1, 1],
+            },
+            FunctionSpan {
+                id: "omitted#2".into(),
+                name: "omitted".into(),
+                line_range: [2, 2],
+            },
+        ];
+        let context = GenContext {
+            file_summary: None,
+            roster: vec!["selected".into(), "omitted".into()],
+            edges: Vec::new(),
+            callee_summaries: BTreeMap::new(),
+        };
+
+        let (full_system, full_user) =
+            build_orientation_skeleton_prompt("a.rs", source, &roster, &context);
+        assert!(!full_system.contains("functionRoles"));
+        assert!(!full_system.contains("supportingCapabilities"));
+        assert!(full_user.contains("selected_body"));
+        assert!(full_user.contains("omitted_body_must_stay_private"));
+
+        let selection = slice_orientation_sources(
+            source,
+            &roster,
+            &["selected#1".into()],
+            ORIENTATION_FETCH_BUDGET_CHARS,
+        );
+        let (bounded_system, bounded_user) = build_bounded_orientation_skeleton_prompt(
+            "a.rs", source, &roster, &context, &selection,
+        );
+        assert!(!bounded_system.contains("functionRoles"));
+        assert!(!bounded_system.contains("supportingCapabilities"));
+        assert!(bounded_user.contains("selected_body"));
+        assert!(bounded_user.contains("\"omitted#2\""));
+        assert!(!bounded_user.contains("omitted_body_must_stay_private"));
+    }
+
+    #[test]
+    fn orientation_role_batch_specs_follow_roster_and_never_leak_omitted_bodies() {
+        let source = (0..17)
+            .map(|index| format!("fn f{index}() {{ body_{index}(); }}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let roster = (0..17)
+            .map(|index| FunctionSpan {
+                id: format!("f{index}#{}", index + 1),
+                name: format!("f{index}"),
+                line_range: [index + 1, index + 1],
+            })
+            .collect::<Vec<_>>();
+
+        let full = build_full_orientation_role_batch_specs(&source, &roster).unwrap();
+        assert_eq!(
+            full.iter()
+                .map(|batch| batch.fn_ids.len())
+                .collect::<Vec<_>>(),
+            vec![8, 8, 1]
+        );
+        assert_eq!(
+            full.iter()
+                .flat_map(|batch| batch.fn_ids.iter().map(String::as_str))
+                .collect::<Vec<_>>(),
+            roster
+                .iter()
+                .map(|span| span.id.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        let selection = slice_orientation_sources(
+            &source,
+            &roster,
+            &["f0#1".into()],
+            ORIENTATION_FETCH_BUDGET_CHARS,
+        );
+        let bounded =
+            build_bounded_orientation_role_batch_specs(&source, &roster, &selection).unwrap();
+        let first = &bounded[0];
+        assert!(matches!(
+            &first.source_views[0],
+            crate::orientation::OrientationFunctionSourceView::Exact { numbered_source, .. }
+                if numbered_source.contains("body_0")
+        ));
+        assert!(matches!(
+            &first.source_views[1],
+            crate::orientation::OrientationFunctionSourceView::SignatureOnly { numbered_signature, .. }
+                if numbered_signature.contains("fn f1() {") && !numbered_signature.contains("body_1")
+        ));
+
+        let (card, _) = capsule_orientation_fixture();
+        let frozen = crate::orientation::OrientationSkeleton {
+            purpose: card.purpose,
+            actors: card.actors,
+            types: card.types,
+            core_flows: card.core_flows,
+            walkthrough: card.walkthrough,
+            invariants: card.invariants,
+            evidence: card.evidence,
+        };
+        let (_, role_user) = build_orientation_role_batch_prompt(&frozen, first);
+        assert!(role_user.contains("SignatureOnly fnId=f1#2"));
+        assert!(!role_user.contains("body_1"));
+    }
+
+    #[test]
+    fn orientation_role_projection_rejects_duplicate_stale_or_nonpartitioned_input() {
+        let source = "fn one() { body_one(); }\nfn two() { body_two(); }\n";
+        let roster = vec![
+            FunctionSpan {
+                id: "one#1".into(),
+                name: "one".into(),
+                line_range: [1, 1],
+            },
+            FunctionSpan {
+                id: "two#2".into(),
+                name: "two".into(),
+                line_range: [2, 2],
+            },
+        ];
+        let duplicate_roster = vec![roster[0].clone(), roster[0].clone()];
+        assert!(build_full_orientation_role_batch_specs(source, &duplicate_roster).is_err());
+
+        let selection = slice_orientation_sources(
+            source,
+            &roster,
+            &["one#1".into()],
+            ORIENTATION_FETCH_BUDGET_CHARS,
+        );
+        let mut wrong_complement = selection.clone();
+        wrong_complement.omitted_function_ids.clear();
+        assert!(
+            build_bounded_orientation_role_batch_specs(source, &roster, &wrong_complement).is_err()
+        );
+
+        let mut stale_source = selection;
+        stale_source.sources[0].numbered_source.push_str("\nforged");
+        assert!(
+            build_bounded_orientation_role_batch_specs(source, &roster, &stale_source).is_err()
+        );
+    }
+
+    #[test]
+    fn orientation_role_prompts_expose_only_frozen_and_current_batch_boundaries() {
+        let (card, _) = capsule_orientation_fixture();
+        let frozen = crate::orientation::OrientationSkeleton {
+            purpose: card.purpose,
+            actors: card.actors,
+            types: card.types,
+            core_flows: card.core_flows,
+            walkthrough: card.walkthrough,
+            invariants: card.invariants,
+            evidence: card.evidence,
+        };
+        let spec = crate::orientation::OrientationRoleBatchSpec {
+            index: 2,
+            fn_ids: vec!["current#10".into()],
+            source_views: vec![crate::orientation::OrientationFunctionSourceView::Exact {
+                fn_id: "current#10".into(),
+                numbered_source: "  10 | fn current() { current_body(); }".into(),
+            }],
+        };
+
+        let (system, user) = build_orientation_role_batch_prompt(&frozen, &spec);
+        assert!(system.contains("functionRoles"));
+        assert!(system.contains("supportingCapabilities"));
+        assert!(user.contains("\"current#10\""));
+        assert!(user.contains("current_body"));
+        assert!(!user.contains("outside#99"));
+        assert!(!user.contains("schemaVersion"));
+        assert!(!user.contains("orientationId"));
+        assert!(!user.contains("coverage"));
+
+        let (_, correction_user) = build_orientation_role_batch_correction_prompt(
+            &frozen,
+            &spec,
+            "{\"functionRoles\":[]}",
+            "role batch 2 function current#10 has no functionRole",
+        );
+        assert!(correction_user.contains("确定性校验错误"));
+        assert!(correction_user.contains("current#10 has no functionRole"));
+        assert!(correction_user.contains("{\"functionRoles\":[]}"));
+        assert!(!correction_user.contains("outside#99"));
     }
 
     #[test]

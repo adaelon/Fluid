@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 
 pub const ORIENTATION_SCHEMA_VERSION: u32 = 1;
 pub const ORIENTATION_PROMPT_VERSION: &str = "orientation-p3";
+pub const ORIENTATION_ROLE_BATCH_SIZE: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -172,7 +173,7 @@ pub struct FileOrientationCard {
 /// Model-produced stage-A fields. Backend-owned identity and coverage facts are
 /// deliberately absent so they can only enter through the final merge.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OrientationSkeleton {
     pub purpose: String,
     pub actors: Vec<OrientationActor>,
@@ -186,7 +187,7 @@ pub struct OrientationSkeleton {
 /// Model-produced stage-B fields for exactly one backend-defined function
 /// batch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OrientationRoleBatch {
     pub function_roles: Vec<FunctionRole>,
     pub supporting_capabilities: Vec<SupportingCapability>,
@@ -231,6 +232,22 @@ pub struct OrientationRoleBatchSpec {
     pub index: usize,
     pub fn_ids: Vec<String>,
     pub source_views: Vec<OrientationFunctionSourceView>,
+}
+
+/// Partition backend-projected function views without reordering, dropping, or
+/// duplicating any roster entry. Batch indices are zero-based and stable.
+pub fn batch_orientation_role_source_views(
+    source_views: Vec<OrientationFunctionSourceView>,
+) -> Vec<OrientationRoleBatchSpec> {
+    source_views
+        .chunks(ORIENTATION_ROLE_BATCH_SIZE)
+        .enumerate()
+        .map(|(index, views)| OrientationRoleBatchSpec {
+            index,
+            fn_ids: views.iter().map(|view| view.fn_id().to_string()).collect(),
+            source_views: views.to_vec(),
+        })
+        .collect()
 }
 
 /// Backend-owned fields injected exactly once after all role batches validate.
@@ -1634,6 +1651,39 @@ mod tests {
         let mut supporting_flow = valid_role_batch(&["helper"]);
         supporting_flow.function_roles[0].flow_ids = vec!["request-flow".into()];
         assert!(validate_orientation_role_batch(&supporting_flow, &helper_spec, &frozen).is_err());
+    }
+
+    #[test]
+    fn role_source_views_batch_stably_at_eight_and_cover_input_once() {
+        let source_views = (0..17)
+            .map(|index| OrientationFunctionSourceView::Exact {
+                fn_id: format!("fn-{index}"),
+                numbered_source: format!("{} | fn fn_{index}() {{}}", index + 1),
+            })
+            .collect::<Vec<_>>();
+
+        let batches = batch_orientation_role_source_views(source_views);
+
+        assert_eq!(
+            batches
+                .iter()
+                .map(|batch| batch.fn_ids.len())
+                .collect::<Vec<_>>(),
+            vec![8, 8, 1]
+        );
+        assert_eq!(
+            batches
+                .iter()
+                .flat_map(|batch| batch.fn_ids.iter().map(String::as_str))
+                .collect::<Vec<_>>(),
+            (0..17)
+                .map(|index| format!("fn-{index}"))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            batches.iter().map(|batch| batch.index).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
     }
 
     #[test]
