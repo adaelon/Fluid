@@ -1,0 +1,27 @@
+{
+  "functionRoles": [
+    {
+      "fnId": "dispatch_request#7",
+      "lane": "core",
+      "flowIds": ["request-dispatch"],
+      "stage": "分配并发送请求",
+      "receivesFromActorIds": ["request-dispatcher"],
+      "consumes": ["payload"],
+      "sendsToActorIds": ["remote-worker"],
+      "produces": ["RequestId"],
+      "why": "为载荷建立稳定标识并执行外发。"
+    },
+    {
+      "fnId": "archive_request_payload#14",
+      "lane": "supporting",
+      "flowIds": [],
+      "stage": "保守保留归档角色",
+      "receivesFromActorIds": ["request-dispatcher"],
+      "consumes": [],
+      "sendsToActorIds": ["request-dispatcher"],
+      "produces": [],
+      "why": "函数体未进入本次有界源码，只按签名保留归档职责。"
+    }
+  ],
+  "supportingCapabilities": []
+}

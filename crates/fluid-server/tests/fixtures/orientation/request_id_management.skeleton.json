@@ -1,0 +1,67 @@
+{
+  "purpose": "为并发请求分配稳定标识并维护活动请求登记。",
+  "actors": [
+    {
+      "id": "request-caller",
+      "name": "请求调用方",
+      "role": "提交带标签的新请求。",
+      "boundary": "project"
+    },
+    {
+      "id": "request-registry",
+      "name": "请求登记器",
+      "role": "在当前文件内分配并维护请求标识。",
+      "boundary": "inside-file"
+    }
+  ],
+  "types": [
+    {
+      "name": "RequestId",
+      "ownerActorId": "request-registry",
+      "meaning": "一次活动请求的稳定数字标识。"
+    }
+  ],
+  "coreFlows": [
+    {
+      "id": "request-registration",
+      "name": "请求登记",
+      "kind": "request",
+      "why": "请求登记器需要先建立稳定标识再保存标签。",
+      "steps": [
+        {
+          "fromActorId": "request-caller",
+          "via": "begin_request",
+          "payload": "String label",
+          "toActorId": "request-registry",
+          "why": "把新请求标签登记到分配出的 RequestId。",
+          "evidenceIds": ["incident-core"]
+        }
+      ]
+    }
+  ],
+  "walkthrough": {
+    "title": "登记一个请求",
+    "input": "label=sync-user",
+    "steps": [
+      {
+        "text": "请求调用方通过 begin_request 登记标签并取得 RequestId。",
+        "evidenceIds": ["incident-core"]
+      }
+    ]
+  },
+  "invariants": [
+    {
+      "text": "新请求只有在取得 RequestId 后才写入活动登记。",
+      "evidenceIds": ["incident-core"]
+    }
+  ],
+  "evidence": [
+    {
+      "id": "incident-core",
+      "filePath": "request_id_management.rs",
+      "startLine": 11,
+      "endLine": 15,
+      "symbol": "begin_request"
+    }
+  ]
+}

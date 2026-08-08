@@ -1,0 +1,60 @@
+{
+  "functionRoles": [
+    {
+      "fnId": "begin_request#11",
+      "lane": "core",
+      "flowIds": ["request-registration"],
+      "stage": "登记新请求",
+      "receivesFromActorIds": ["request-caller"],
+      "consumes": ["String label"],
+      "sendsToActorIds": ["request-registry"],
+      "produces": ["RequestId"],
+      "why": "串联标识分配与活动标签登记。"
+    },
+    {
+      "fnId": "allocate_request_id#17",
+      "lane": "supporting",
+      "flowIds": [],
+      "stage": "分配请求标识",
+      "receivesFromActorIds": ["request-registry"],
+      "consumes": ["next_request_id"],
+      "sendsToActorIds": ["request-registry"],
+      "produces": ["RequestId"],
+      "why": "为每个新请求产生稳定且递增的标识。"
+    },
+    {
+      "fnId": "release_request_id#23",
+      "lane": "supporting",
+      "flowIds": [],
+      "stage": "释放请求标识",
+      "receivesFromActorIds": ["request-caller"],
+      "consumes": ["RequestId"],
+      "sendsToActorIds": ["request-registry"],
+      "produces": ["已释放标签"],
+      "why": "在请求结束时移除对应的活动登记。"
+    },
+    {
+      "fnId": "active_request_count#27",
+      "lane": "supporting",
+      "flowIds": [],
+      "stage": "统计活动请求",
+      "receivesFromActorIds": ["request-caller"],
+      "consumes": ["活动请求登记"],
+      "sendsToActorIds": ["request-caller"],
+      "produces": ["活动请求数量"],
+      "why": "提供当前尚未释放的请求数量。"
+    }
+  ],
+  "supportingCapabilities": [
+    {
+      "name": "请求标识管理",
+      "why": "集中分配并释放活动请求的稳定标识。",
+      "functionIds": ["allocate_request_id#17", "release_request_id#23"]
+    },
+    {
+      "name": "活动请求统计",
+      "why": "暴露当前活动登记的规模。",
+      "functionIds": ["active_request_count#27"]
+    }
+  ]
+}

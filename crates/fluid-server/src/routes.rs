@@ -4617,9 +4617,235 @@ mod tests {
         card
     }
 
+    fn request_id_incident_source() -> &'static str {
+        include_str!("../tests/fixtures/orientation/request_id_management.rs")
+    }
+
+    fn request_id_incident_roster() -> Vec<FunctionSpan> {
+        vec![
+            FunctionSpan {
+                id: "begin_request#11".into(),
+                name: "begin_request".into(),
+                line_range: [11, 15],
+            },
+            FunctionSpan {
+                id: "allocate_request_id#17".into(),
+                name: "allocate_request_id".into(),
+                line_range: [17, 21],
+            },
+            FunctionSpan {
+                id: "release_request_id#23".into(),
+                name: "release_request_id".into(),
+                line_range: [23, 25],
+            },
+            FunctionSpan {
+                id: "active_request_count#27".into(),
+                name: "active_request_count".into(),
+                line_range: [27, 29],
+            },
+        ]
+    }
+
+    fn bounded_request_id_incident_source() -> String {
+        let oversized_body = (0..1_100)
+            .map(|index| format!("    // archived request payload fixture chunk {index:04}\n"))
+            .collect::<String>();
+        let source = include_str!("../tests/fixtures/orientation/bounded_request_id_management.rs")
+            .replace(
+                "    // __FLUID_OVERSIZED_ARCHIVE_BODY__",
+                oversized_body.trim_end(),
+            );
+        assert!(
+            source.chars().count() > crate::context_assembler::ORIENTATION_SOURCE_BUDGET_CHARS,
+            "bounded incident source must cross the 48k planning boundary"
+        );
+        source
+    }
+
+    fn bounded_request_id_incident_roster(source: &str) -> Vec<FunctionSpan> {
+        vec![
+            FunctionSpan {
+                id: "dispatch_request#7".into(),
+                name: "dispatch_request".into(),
+                line_range: [7, 12],
+            },
+            FunctionSpan {
+                id: "archive_request_payload#14".into(),
+                name: "archive_request_payload".into(),
+                line_range: [14, source.lines().count() as u32],
+            },
+        ]
+    }
+
+    fn orientation_fixture_request_json(
+        req_id: &str,
+        file_path: &str,
+        roster: &[FunctionSpan],
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "reqId": req_id,
+            "filePath": file_path,
+            "rosterSpans": roster,
+        })
+    }
+
+    fn orientation_card_frame(frames: &[serde_json::Value]) -> &serde_json::Value {
+        frames
+            .iter()
+            .find(|frame| frame["kind"] == "card")
+            .and_then(|frame| frame.get("card"))
+            .expect("orientation fixture emits a card")
+    }
+
+    fn role_evidence_id<'a>(card: &'a serde_json::Value, fn_id: &str) -> &'a str {
+        card["functionRoles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|role| role["fnId"] == fn_id)
+            .and_then(|role| role["evidenceIds"].as_array())
+            .filter(|evidence_ids| evidence_ids.len() == 1)
+            .and_then(|evidence_ids| evidence_ids[0].as_str())
+            .unwrap_or_else(|| panic!("Exact role {fn_id:?} must have one evidence anchor"))
+    }
+
+    fn assert_exact_role_matches_verified_span(
+        card: &serde_json::Value,
+        file_path: &str,
+        span: &FunctionSpan,
+    ) {
+        let evidence_id = role_evidence_id(card, &span.id);
+        let evidence = card["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|evidence| evidence["id"] == evidence_id)
+            .unwrap_or_else(|| panic!("role {:?} references missing evidence", span.id));
+        assert_eq!(evidence["filePath"], file_path, "{}", span.id);
+        assert_eq!(evidence["startLine"], span.line_range[0], "{}", span.id);
+        assert_eq!(evidence["endLine"], span.line_range[1], "{}", span.id);
+        assert_eq!(evidence["symbol"], span.name, "{}", span.id);
+    }
+
+    fn assert_capability_covers_verified_members(
+        card: &serde_json::Value,
+        file_path: &str,
+        roster: &[FunctionSpan],
+        capability_name: &str,
+        expected_members: &[&str],
+    ) {
+        let capability = card["supportingCapabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|capability| capability["name"] == capability_name)
+            .unwrap_or_else(|| panic!("missing capability {capability_name:?}"));
+        let members = capability["functionIds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|member| member.as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(members, expected_members);
+
+        let expected_evidence_ids = expected_members
+            .iter()
+            .map(|fn_id| role_evidence_id(card, fn_id))
+            .collect::<Vec<_>>();
+        let capability_evidence_ids = capability["evidenceIds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|evidence_id| evidence_id.as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(capability_evidence_ids, expected_evidence_ids);
+
+        for fn_id in expected_members {
+            let span = roster
+                .iter()
+                .find(|span| span.id == *fn_id)
+                .unwrap_or_else(|| panic!("missing fixture span {fn_id:?}"));
+            assert_exact_role_matches_verified_span(card, file_path, span);
+        }
+    }
+
+    fn assert_all_capabilities_cover_verified_members(
+        card: &serde_json::Value,
+        file_path: &str,
+        roster: &[FunctionSpan],
+        require_capability: bool,
+    ) {
+        let capabilities = card["supportingCapabilities"].as_array().unwrap();
+        if require_capability {
+            assert!(
+                !capabilities.is_empty(),
+                "full-source provider smoke must exercise capability materialization"
+            );
+        }
+        for capability in capabilities {
+            let members = capability["functionIds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|fn_id| fn_id.as_str().unwrap())
+                .collect::<Vec<_>>();
+            assert!(
+                !members.is_empty(),
+                "provider capability must contain at least one function"
+            );
+            let expected_evidence_ids = members
+                .iter()
+                .map(|fn_id| role_evidence_id(card, fn_id))
+                .collect::<Vec<_>>();
+            let actual_evidence_ids = capability["evidenceIds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|evidence_id| evidence_id.as_str().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(actual_evidence_ids, expected_evidence_ids);
+            for fn_id in members {
+                let span = roster
+                    .iter()
+                    .find(|span| span.id == fn_id)
+                    .unwrap_or_else(|| panic!("provider capability uses unknown fnId {fn_id:?}"));
+                assert_exact_role_matches_verified_span(card, file_path, span);
+            }
+        }
+    }
+
+    fn real_provider_orientation_state(root: &Path) -> AppState {
+        #[cfg(windows)]
+        let config = {
+            let local_app_data = std::env::var_os("LOCALAPPDATA");
+            let env_path = crate::settings::windows_env_path(local_app_data.as_deref())
+                .expect("Windows Fluid runtime config path must resolve");
+            LlmConfig::from_env_file(&env_path)
+                .expect("Windows Fluid runtime config must be readable")
+        };
+        #[cfg(not(windows))]
+        let config = {
+            let _ = dotenvy::dotenv();
+            LlmConfig::from_env()
+        };
+        assert!(
+            config.key_set(),
+            "OPENCODE_API_KEY must be configured at runtime"
+        );
+        make_state_with_config(root, config)
+    }
+
     async fn orientation_ws_frames(
         app: &OrientationAppServer,
         request: serde_json::Value,
+    ) -> Vec<serde_json::Value> {
+        orientation_ws_frames_with_timeout(app, request, Duration::from_secs(2)).await
+    }
+
+    async fn orientation_ws_frames_with_timeout(
+        app: &OrientationAppServer,
+        request: serde_json::Value,
+        frame_timeout: Duration,
     ) -> Vec<serde_json::Value> {
         let url = format!("{}/api/orient", app.ws_base_url);
         let (mut socket, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
@@ -4630,11 +4856,11 @@ mod tests {
 
         let mut frames = Vec::new();
         for _ in 0..8 {
-            let next = tokio::time::timeout(Duration::from_secs(2), socket.next())
+            let next = tokio::time::timeout(frame_timeout, socket.next())
                 .await
-                .expect("orientation fixture frame timed out")
-                .expect("orientation fixture socket closed")
-                .expect("orientation fixture socket error");
+                .unwrap_or_else(|_| panic!("orientation frame timed out after {frame_timeout:?}"))
+                .expect("orientation socket closed")
+                .expect("orientation socket error");
             let frame = serde_json::from_str::<serde_json::Value>(&next.into_text().unwrap())
                 .expect("orientation frame JSON");
             let terminal = matches!(frame["kind"].as_str(), Some("done" | "error"));
@@ -4924,6 +5150,215 @@ mod tests {
         assert!(requests
             .iter()
             .all(|request| request.get("response_format").is_none()));
+    }
+
+    #[tokio::test]
+    async fn orientation_websocket_request_id_incident_binds_every_capability_member_span() {
+        let tmp = TmpDir::new();
+        let file_path = "request_id_management.rs";
+        std::fs::write(tmp.path().join(file_path), request_id_incident_source()).unwrap();
+        let roster = request_id_incident_roster();
+        let skeleton =
+            include_str!("../tests/fixtures/orientation/request_id_management.skeleton.json");
+        let draft = include_str!("../tests/fixtures/orientation/request_id_management.draft.json");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(skeleton).unwrap()["evidence"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1,
+            "the incident skeleton intentionally lacks supporting-function evidence"
+        );
+        let mock = start_orientation_sequence_mock(vec![
+            (StatusCode::OK, skeleton.to_string(), Duration::ZERO),
+            (StatusCode::OK, draft.to_string(), Duration::ZERO),
+        ])
+        .await;
+        let app = start_orientation_app(orientation_state(tmp.path(), &mock)).await;
+
+        let frames = orientation_ws_frames(
+            &app,
+            orientation_fixture_request_json("orient-incident", file_path, &roster),
+        )
+        .await;
+
+        assert_eq!(
+            frame_kinds(&frames),
+            vec!["status", "status", "card", "done"]
+        );
+        let card = orientation_card_frame(&frames);
+        assert_eq!(card["evidence"].as_array().unwrap().len(), roster.len());
+        for span in &roster {
+            assert_exact_role_matches_verified_span(card, file_path, span);
+        }
+        assert_capability_covers_verified_members(
+            card,
+            file_path,
+            &roster,
+            "请求标识管理",
+            &["allocate_request_id#17", "release_request_id#23"],
+        );
+        assert_eq!(mock.requests.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn orientation_websocket_bounded_incident_keeps_signature_only_out_of_evidence_and_capabilities(
+    ) {
+        let tmp = TmpDir::new();
+        let file_path = "bounded_request_id_management.rs";
+        let source = bounded_request_id_incident_source();
+        std::fs::write(tmp.path().join(file_path), &source).unwrap();
+        let roster = bounded_request_id_incident_roster(&source);
+        let mock = start_orientation_sequence_mock(vec![
+            (
+                StatusCode::OK,
+                include_str!(
+                    "../tests/fixtures/orientation/bounded_request_id_management.plan.json"
+                )
+                .to_string(),
+                Duration::ZERO,
+            ),
+            (
+                StatusCode::OK,
+                include_str!(
+                    "../tests/fixtures/orientation/bounded_request_id_management.skeleton.json"
+                )
+                .to_string(),
+                Duration::ZERO,
+            ),
+            (
+                StatusCode::OK,
+                include_str!(
+                    "../tests/fixtures/orientation/bounded_request_id_management.draft.json"
+                )
+                .to_string(),
+                Duration::ZERO,
+            ),
+        ])
+        .await;
+        let app = start_orientation_app(orientation_state(tmp.path(), &mock)).await;
+
+        let frames = orientation_ws_frames(
+            &app,
+            orientation_fixture_request_json("orient-bounded-incident", file_path, &roster),
+        )
+        .await;
+
+        assert_eq!(
+            frame_kinds(&frames),
+            vec!["status", "status", "status", "card", "done"]
+        );
+        let card = orientation_card_frame(&frames);
+        assert_eq!(card["coverage"]["mode"], "bounded-source");
+        assert_eq!(
+            card["coverage"]["omittedFunctionIds"],
+            serde_json::json!(["archive_request_payload#14"])
+        );
+        assert_exact_role_matches_verified_span(card, file_path, &roster[0]);
+        let omitted_role = card["functionRoles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|role| role["fnId"] == "archive_request_payload#14")
+            .unwrap();
+        assert_eq!(omitted_role["evidenceIds"], serde_json::json!([]));
+        assert!(card["supportingCapabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|capability| capability["functionIds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|fn_id| fn_id != "archive_request_payload#14")));
+
+        let requests = mock.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        let role_user = requests[2]
+            .pointer("/messages/1/content")
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        assert!(role_user.contains("SignatureOnly fnId=archive_request_payload#14"));
+        assert!(!role_user.contains("archived request payload fixture chunk"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires configured OPENCODE provider/model and external network"]
+    async fn orientation_websocket_full_source_real_provider_smoke() {
+        let tmp = TmpDir::new();
+        let file_path = "request_id_management.rs";
+        std::fs::write(tmp.path().join(file_path), request_id_incident_source()).unwrap();
+        let roster = request_id_incident_roster();
+        let app = start_orientation_app(real_provider_orientation_state(tmp.path())).await;
+
+        let frames = orientation_ws_frames_with_timeout(
+            &app,
+            orientation_fixture_request_json("orient-real-full", file_path, &roster),
+            Duration::from_secs(120),
+        )
+        .await;
+
+        assert_eq!(
+            frame_kinds(&frames),
+            vec!["status", "status", "card", "done"],
+            "real full-source terminal frame: {:?}",
+            frames.last()
+        );
+        let card = orientation_card_frame(&frames);
+        assert_eq!(card["coverage"]["mode"], "full-source");
+        for span in &roster {
+            assert_exact_role_matches_verified_span(card, file_path, span);
+        }
+        assert_all_capabilities_cover_verified_members(card, file_path, &roster, true);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires configured OPENCODE provider/model and external network"]
+    async fn orientation_websocket_bounded_source_real_provider_smoke() {
+        let tmp = TmpDir::new();
+        let file_path = "bounded_request_id_management.rs";
+        let source = bounded_request_id_incident_source();
+        std::fs::write(tmp.path().join(file_path), &source).unwrap();
+        let roster = bounded_request_id_incident_roster(&source);
+        let app = start_orientation_app(real_provider_orientation_state(tmp.path())).await;
+
+        let frames = orientation_ws_frames_with_timeout(
+            &app,
+            orientation_fixture_request_json("orient-real-bounded", file_path, &roster),
+            Duration::from_secs(120),
+        )
+        .await;
+
+        assert_eq!(
+            frame_kinds(&frames),
+            vec!["status", "status", "status", "card", "done"],
+            "real bounded-source terminal frame: {:?}",
+            frames.last()
+        );
+        let card = orientation_card_frame(&frames);
+        assert_eq!(card["coverage"]["mode"], "bounded-source");
+        assert_eq!(
+            card["coverage"]["omittedFunctionIds"],
+            serde_json::json!(["archive_request_payload#14"])
+        );
+        assert_exact_role_matches_verified_span(card, file_path, &roster[0]);
+        let omitted_role = card["functionRoles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|role| role["fnId"] == "archive_request_payload#14")
+            .expect("bounded smoke keeps the complete roster visible");
+        assert_eq!(omitted_role["evidenceIds"], serde_json::json!([]));
+        assert!(card["supportingCapabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|capability| capability["functionIds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|fn_id| fn_id != "archive_request_payload#14")));
+        assert_all_capabilities_cover_verified_members(card, file_path, &roster, false);
     }
 
     #[tokio::test]

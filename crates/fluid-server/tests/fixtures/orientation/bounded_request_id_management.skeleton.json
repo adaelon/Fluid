@@ -1,0 +1,67 @@
+{
+  "purpose": "为待发送请求分配标识并把载荷交给远端处理方。",
+  "actors": [
+    {
+      "id": "request-dispatcher",
+      "name": "请求分派器",
+      "role": "在当前文件内分配标识并发出请求。",
+      "boundary": "inside-file"
+    },
+    {
+      "id": "remote-worker",
+      "name": "远端处理方",
+      "role": "接收带稳定标识的请求载荷。",
+      "boundary": "external"
+    }
+  ],
+  "types": [
+    {
+      "name": "RequestId",
+      "ownerActorId": "request-dispatcher",
+      "meaning": "一次外发请求的稳定数字标识。"
+    }
+  ],
+  "coreFlows": [
+    {
+      "id": "request-dispatch",
+      "name": "请求分派",
+      "kind": "request",
+      "why": "远端处理方需要同时收到请求标识与载荷。",
+      "steps": [
+        {
+          "fromActorId": "request-dispatcher",
+          "via": "dispatch_request",
+          "payload": "RequestId + payload",
+          "toActorId": "remote-worker",
+          "why": "把已编号的请求交给远端处理方。",
+          "evidenceIds": ["dispatch-source"]
+        }
+      ]
+    }
+  ],
+  "walkthrough": {
+    "title": "分派一个请求",
+    "input": "payload=user-sync",
+    "steps": [
+      {
+        "text": "请求分派器生成 RequestId 后调用 send_request。",
+        "evidenceIds": ["dispatch-source"]
+      }
+    ]
+  },
+  "invariants": [
+    {
+      "text": "每次外发都携带本次分配的 RequestId。",
+      "evidenceIds": ["dispatch-source"]
+    }
+  ],
+  "evidence": [
+    {
+      "id": "dispatch-source",
+      "filePath": "bounded_request_id_management.rs",
+      "startLine": 7,
+      "endLine": 12,
+      "symbol": "dispatch_request"
+    }
+  ]
+}
