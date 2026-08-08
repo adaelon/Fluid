@@ -169,6 +169,80 @@ pub struct FileOrientationCard {
     pub coverage: OrientationCoverage,
 }
 
+/// Model-produced stage-A fields. Backend-owned identity and coverage facts are
+/// deliberately absent so they can only enter through the final merge.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrientationSkeleton {
+    pub purpose: String,
+    pub actors: Vec<OrientationActor>,
+    pub types: Vec<OrientationType>,
+    pub core_flows: Vec<OrientationFlow>,
+    pub walkthrough: OrientationWalkthrough,
+    pub invariants: Vec<OrientationInvariant>,
+    pub evidence: Vec<CodeEvidenceRef>,
+}
+
+/// Model-produced stage-B fields for exactly one backend-defined function
+/// batch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrientationRoleBatch {
+    pub function_roles: Vec<FunctionRole>,
+    pub supporting_capabilities: Vec<SupportingCapability>,
+}
+
+/// Source projection selected by the backend for one function in a role
+/// batch. Signature-only views intentionally carry no function body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OrientationFunctionSourceView {
+    Exact {
+        fn_id: String,
+        numbered_source: String,
+    },
+    SignatureOnly {
+        fn_id: String,
+        numbered_signature: String,
+    },
+}
+
+impl OrientationFunctionSourceView {
+    fn fn_id(&self) -> &str {
+        match self {
+            Self::Exact { fn_id, .. } | Self::SignatureOnly { fn_id, .. } => fn_id,
+        }
+    }
+
+    fn numbered_source(&self) -> &str {
+        match self {
+            Self::Exact {
+                numbered_source, ..
+            } => numbered_source,
+            Self::SignatureOnly {
+                numbered_signature, ..
+            } => numbered_signature,
+        }
+    }
+}
+
+/// Backend-frozen boundary for one stage-B request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrientationRoleBatchSpec {
+    pub index: usize,
+    pub fn_ids: Vec<String>,
+    pub source_views: Vec<OrientationFunctionSourceView>,
+}
+
+/// Backend-owned fields injected exactly once after all role batches validate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrientationBackendFacts {
+    pub schema_version: u32,
+    pub orientation_id: String,
+    pub file_path: String,
+    pub coverage: OrientationCoverage,
+    pub roster_fn_ids: Vec<String>,
+}
+
 /// Backend-owned facts used to reject invented paths, line numbers, and
 /// functions. The roster must already be verified against the current source.
 pub struct OrientationValidationContext<'a> {
@@ -472,6 +546,395 @@ impl FileOrientationCard {
 
         Ok(())
     }
+}
+
+/// Validate the stage-A trust boundary before its actor, flow, and evidence
+/// IDs are exposed to any stage-B request. For bounded source, `roster_fn_ids`
+/// must contain only functions whose exact source was included; their verified
+/// spans are read from `roster_line_ranges`.
+pub fn validate_orientation_skeleton(
+    skeleton: &OrientationSkeleton,
+    context: &OrientationValidationContext<'_>,
+) -> Result<(), OrientationValidationError> {
+    descriptive("purpose", &skeleton.purpose)?;
+
+    let active_path = normalize_project_path(context.file_path)
+        .ok_or_else(|| OrientationValidationError::new("active file path is unsafe"))?;
+
+    if skeleton.actors.is_empty() {
+        return invalid("actors must not be empty");
+    }
+    let actor_ids = unique_ids("actor", skeleton.actors.iter().map(|actor| &actor.id))?;
+    for actor in &skeleton.actors {
+        nonblank("actor.name", &actor.name)?;
+        descriptive("actor.role", &actor.role)?;
+    }
+
+    if skeleton.evidence.is_empty() {
+        return invalid("evidence must not be empty");
+    }
+    let evidence_ids = unique_ids(
+        "evidence",
+        skeleton.evidence.iter().map(|evidence| &evidence.id),
+    )?;
+    let source_lines = context.source.split('\n').count() as u32;
+    for evidence in &skeleton.evidence {
+        let evidence_path = normalize_project_path(&evidence.file_path).ok_or_else(|| {
+            OrientationValidationError::new(format!(
+                "evidence {} has an unsafe filePath",
+                evidence.id
+            ))
+        })?;
+        if evidence_path != active_path {
+            return invalid(format!(
+                "evidence {} points to {evidence_path:?}, not the active file",
+                evidence.id
+            ));
+        }
+        if evidence.start_line == 0
+            || evidence.start_line > evidence.end_line
+            || evidence.end_line > source_lines
+        {
+            return invalid(format!(
+                "evidence {} has invalid line range {}..={} for {source_lines} lines",
+                evidence.id, evidence.start_line, evidence.end_line
+            ));
+        }
+    }
+
+    if let Some(line_ranges) = context.roster_line_ranges {
+        let mut allowed_ranges = Vec::new();
+        for fn_id in context.roster_fn_ids {
+            let range = line_ranges.get(fn_id).ok_or_else(|| {
+                OrientationValidationError::new(format!(
+                    "bounded-source skeleton function {fn_id:?} has no verified line range"
+                ))
+            })?;
+            allowed_ranges.push(*range);
+        }
+        if allowed_ranges.is_empty() {
+            return invalid("bounded-source skeleton has no included function source");
+        }
+        for evidence in &skeleton.evidence {
+            if !allowed_ranges
+                .iter()
+                .any(|range| range[0] <= evidence.start_line && evidence.end_line <= range[1])
+            {
+                return invalid(format!(
+                    "evidence {} is outside every included bounded-source function span",
+                    evidence.id
+                ));
+            }
+        }
+    }
+
+    if skeleton.core_flows.is_empty() {
+        return invalid("coreFlows must not be empty");
+    }
+    unique_ids("flow", skeleton.core_flows.iter().map(|flow| &flow.id))?;
+    for flow in &skeleton.core_flows {
+        nonblank("flow.name", &flow.name)?;
+        descriptive("flow.why", &flow.why)?;
+        if flow.steps.is_empty() {
+            return invalid(format!("core flow {} has no steps", flow.id));
+        }
+        for (index, step) in flow.steps.iter().enumerate() {
+            nonblank("flow.step.via", &step.via)?;
+            nonblank("flow.step.payload", &step.payload)?;
+            descriptive("flow.step.why", &step.why)?;
+            require_ref(
+                "actor",
+                &step.from_actor_id,
+                &actor_ids,
+                &format!("flow {} step {index} fromActorId", flow.id),
+            )?;
+            require_ref(
+                "actor",
+                &step.to_actor_id,
+                &actor_ids,
+                &format!("flow {} step {index} toActorId", flow.id),
+            )?;
+            require_nonempty_refs(
+                "evidence",
+                &step.evidence_ids,
+                &evidence_ids,
+                &format!("flow {} step {index}", flow.id),
+            )?;
+        }
+    }
+
+    for orientation_type in &skeleton.types {
+        nonblank("type.name", &orientation_type.name)?;
+        descriptive("type.meaning", &orientation_type.meaning)?;
+        require_ref(
+            "actor",
+            &orientation_type.owner_actor_id,
+            &actor_ids,
+            &format!("type {} ownerActorId", orientation_type.name),
+        )?;
+    }
+
+    descriptive("walkthrough.title", &skeleton.walkthrough.title)?;
+    nonblank("walkthrough.input", &skeleton.walkthrough.input)?;
+    if skeleton.walkthrough.steps.is_empty() {
+        return invalid("walkthrough steps must not be empty");
+    }
+    for (index, step) in skeleton.walkthrough.steps.iter().enumerate() {
+        descriptive("walkthrough.step.text", &step.text)?;
+        require_nonempty_refs(
+            "evidence",
+            &step.evidence_ids,
+            &evidence_ids,
+            &format!("walkthrough step {index}"),
+        )?;
+    }
+
+    for (index, invariant) in skeleton.invariants.iter().enumerate() {
+        descriptive("invariant.text", &invariant.text)?;
+        require_nonempty_refs(
+            "evidence",
+            &invariant.evidence_ids,
+            &evidence_ids,
+            &format!("invariant {index}"),
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Validate one stage-B response against both the backend-owned batch boundary
+/// and the immutable IDs accepted at stage A.
+pub fn validate_orientation_role_batch(
+    batch: &OrientationRoleBatch,
+    spec: &OrientationRoleBatchSpec,
+    frozen: &OrientationSkeleton,
+) -> Result<(), OrientationValidationError> {
+    if spec.fn_ids.is_empty() {
+        return invalid(format!("role batch {} has no functions", spec.index));
+    }
+    let spec_fn_ids = unique_ids("role batch function", spec.fn_ids.iter())?;
+    let source_view_ids = unique_ids(
+        "role batch source view",
+        spec.source_views.iter().map(|view| match view {
+            OrientationFunctionSourceView::Exact { fn_id, .. }
+            | OrientationFunctionSourceView::SignatureOnly { fn_id, .. } => fn_id,
+        }),
+    )?;
+    for view in &spec.source_views {
+        nonblank("role batch source view", view.numbered_source())?;
+        if !spec_fn_ids.contains(view.fn_id()) {
+            return invalid(format!(
+                "role batch {} source view references out-of-batch fnId {:?}",
+                spec.index,
+                view.fn_id()
+            ));
+        }
+    }
+    for fn_id in &spec_fn_ids {
+        if !source_view_ids.contains(fn_id) {
+            return invalid(format!(
+                "role batch {} function {fn_id:?} has no source view",
+                spec.index
+            ));
+        }
+    }
+
+    let actor_ids = unique_ids("frozen actor", frozen.actors.iter().map(|actor| &actor.id))?;
+    let flow_ids = unique_ids("frozen flow", frozen.core_flows.iter().map(|flow| &flow.id))?;
+    let evidence_ids = unique_ids(
+        "frozen evidence",
+        frozen.evidence.iter().map(|evidence| &evidence.id),
+    )?;
+
+    let role_fn_ids = unique_ids(
+        "function role",
+        batch.function_roles.iter().map(|role| &role.fn_id),
+    )?;
+    let mut role_lanes = BTreeMap::new();
+    for role in &batch.function_roles {
+        if !spec_fn_ids.contains(role.fn_id.as_str()) {
+            return invalid(format!(
+                "role batch {} references out-of-batch fnId {:?}",
+                spec.index, role.fn_id
+            ));
+        }
+        role_lanes.insert(role.fn_id.as_str(), role.lane);
+        descriptive("functionRole.stage", &role.stage)?;
+        descriptive("functionRole.why", &role.why)?;
+        match role.lane {
+            FunctionLane::Core if role.flow_ids.is_empty() => {
+                return invalid(format!(
+                    "core function {:?} must reference at least one flow",
+                    role.fn_id
+                ));
+            }
+            FunctionLane::Supporting if !role.flow_ids.is_empty() => {
+                return invalid(format!(
+                    "supporting function {:?} must not reference core flows",
+                    role.fn_id
+                ));
+            }
+            FunctionLane::Core | FunctionLane::Supporting => {}
+        }
+        require_refs(
+            "flow",
+            &role.flow_ids,
+            &flow_ids,
+            &format!("functionRole {}", role.fn_id),
+        )?;
+        require_refs(
+            "actor",
+            &role.receives_from_actor_ids,
+            &actor_ids,
+            &format!("functionRole {} receivesFromActorIds", role.fn_id),
+        )?;
+        require_refs(
+            "actor",
+            &role.sends_to_actor_ids,
+            &actor_ids,
+            &format!("functionRole {} sendsToActorIds", role.fn_id),
+        )?;
+        require_refs(
+            "evidence",
+            &role.evidence_ids,
+            &evidence_ids,
+            &format!("functionRole {}", role.fn_id),
+        )?;
+    }
+    for fn_id in &spec_fn_ids {
+        if !role_fn_ids.contains(fn_id) {
+            return invalid(format!(
+                "role batch {} function {fn_id:?} has no functionRole",
+                spec.index
+            ));
+        }
+    }
+
+    for capability in &batch.supporting_capabilities {
+        nonblank("supportingCapability.name", &capability.name)?;
+        descriptive("supportingCapability.why", &capability.why)?;
+        if capability.function_ids.is_empty() {
+            return invalid(format!(
+                "supporting capability {:?} has no functions",
+                capability.name
+            ));
+        }
+        for fn_id in &capability.function_ids {
+            if !spec_fn_ids.contains(fn_id.as_str()) {
+                return invalid(format!(
+                    "supporting capability {:?} references out-of-batch fnId {fn_id:?}",
+                    capability.name
+                ));
+            }
+            let Some(lane) = role_lanes.get(fn_id.as_str()) else {
+                return invalid(format!(
+                    "supporting capability {:?} references fnId {fn_id:?} without a role",
+                    capability.name
+                ));
+            };
+            if *lane != FunctionLane::Supporting {
+                return invalid(format!(
+                    "core function {fn_id:?} also appears in supporting capabilities"
+                ));
+            }
+        }
+        require_nonempty_refs(
+            "evidence",
+            &capability.evidence_ids,
+            &evidence_ids,
+            &format!("supporting capability {}", capability.name),
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Combine validated stage outputs without guessing or repairing model data.
+/// Function roles are placed in backend-roster order; supporting capabilities
+/// retain batch order. The caller must still run `FileOrientationCard::validate`
+/// with freshly verified source facts before caching or sending the card.
+pub fn merge_orientation_card(
+    skeleton: OrientationSkeleton,
+    batches: Vec<(OrientationRoleBatchSpec, OrientationRoleBatch)>,
+    backend: OrientationBackendFacts,
+) -> Result<FileOrientationCard, OrientationValidationError> {
+    let roster_ids = unique_ids("roster function", backend.roster_fn_ids.iter())?;
+    let omitted_ids = unique_ids(
+        "omitted function",
+        backend.coverage.omitted_function_ids.iter(),
+    )?;
+    for fn_id in &omitted_ids {
+        if !roster_ids.contains(fn_id) {
+            return invalid(format!(
+                "coverage references unknown omitted fnId {fn_id:?}"
+            ));
+        }
+    }
+    if backend.coverage.mode == OrientationCoverageMode::FullSource && !omitted_ids.is_empty() {
+        return invalid("full-source coverage cannot omit functions");
+    }
+
+    let mut covered_spec_ids = BTreeSet::new();
+    let mut roles_by_id = BTreeMap::new();
+    let mut supporting_capabilities = Vec::new();
+    for (spec, batch) in batches {
+        validate_orientation_role_batch(&batch, &spec, &skeleton)?;
+        for fn_id in &spec.fn_ids {
+            if !roster_ids.contains(fn_id.as_str()) {
+                return invalid(format!(
+                    "role batch {} references fnId {fn_id:?} outside the backend roster",
+                    spec.index
+                ));
+            }
+            if !covered_spec_ids.insert(fn_id.clone()) {
+                return invalid(format!(
+                    "fnId {fn_id:?} appears in more than one role batch"
+                ));
+            }
+        }
+        for role in batch.function_roles {
+            let fn_id = role.fn_id.clone();
+            if roles_by_id.insert(fn_id.clone(), role).is_some() {
+                return invalid(format!(
+                    "fnId {fn_id:?} appears in more than one role batch"
+                ));
+            }
+        }
+        supporting_capabilities.extend(batch.supporting_capabilities);
+    }
+
+    for fn_id in &backend.roster_fn_ids {
+        if !covered_spec_ids.contains(fn_id) {
+            return invalid(format!(
+                "roster function {fn_id:?} has no role batch coverage"
+            ));
+        }
+    }
+    let mut function_roles = Vec::with_capacity(backend.roster_fn_ids.len());
+    for fn_id in &backend.roster_fn_ids {
+        let role = roles_by_id.remove(fn_id).ok_or_else(|| {
+            OrientationValidationError::new(format!(
+                "roster function {fn_id:?} has no merged functionRole"
+            ))
+        })?;
+        function_roles.push(role);
+    }
+
+    Ok(FileOrientationCard {
+        schema_version: backend.schema_version,
+        orientation_id: backend.orientation_id,
+        file_path: backend.file_path,
+        purpose: skeleton.purpose,
+        actors: skeleton.actors,
+        types: skeleton.types,
+        core_flows: skeleton.core_flows,
+        supporting_capabilities,
+        function_roles,
+        walkthrough: skeleton.walkthrough,
+        invariants: skeleton.invariants,
+        evidence: skeleton.evidence,
+        coverage: backend.coverage,
+    })
 }
 
 fn invalid<T>(message: impl Into<String>) -> Result<T, OrientationValidationError> {
@@ -829,6 +1292,68 @@ mod tests {
         }
     }
 
+    fn valid_skeleton() -> OrientationSkeleton {
+        let card = valid_card("unused-backend-id".into());
+        OrientationSkeleton {
+            purpose: card.purpose,
+            actors: card.actors,
+            types: card.types,
+            core_flows: card.core_flows,
+            walkthrough: card.walkthrough,
+            invariants: card.invariants,
+            evidence: card.evidence,
+        }
+    }
+
+    fn role_batch_spec(index: usize, fn_ids: &[&str]) -> OrientationRoleBatchSpec {
+        OrientationRoleBatchSpec {
+            index,
+            fn_ids: fn_ids.iter().map(|fn_id| (*fn_id).to_string()).collect(),
+            source_views: fn_ids
+                .iter()
+                .map(|fn_id| OrientationFunctionSourceView::Exact {
+                    fn_id: (*fn_id).to_string(),
+                    numbered_source: format!("1 | fn {fn_id}() {{}}"),
+                })
+                .collect(),
+        }
+    }
+
+    fn valid_role_batch(fn_ids: &[&str]) -> OrientationRoleBatch {
+        let card = valid_card("unused-backend-id".into());
+        let allowed = fn_ids.iter().copied().collect::<BTreeSet<_>>();
+        OrientationRoleBatch {
+            function_roles: card
+                .function_roles
+                .into_iter()
+                .filter(|role| allowed.contains(role.fn_id.as_str()))
+                .collect(),
+            supporting_capabilities: card
+                .supporting_capabilities
+                .into_iter()
+                .filter_map(|mut capability| {
+                    capability
+                        .function_ids
+                        .retain(|fn_id| allowed.contains(fn_id.as_str()));
+                    (!capability.function_ids.is_empty()).then_some(capability)
+                })
+                .collect(),
+        }
+    }
+
+    fn backend_facts(roster_fn_ids: Vec<String>) -> OrientationBackendFacts {
+        OrientationBackendFacts {
+            schema_version: ORIENTATION_SCHEMA_VERSION,
+            orientation_id: "orientation-merged".into(),
+            file_path: "src/a.rs".into(),
+            coverage: OrientationCoverage {
+                mode: OrientationCoverageMode::FullSource,
+                omitted_function_ids: Vec::new(),
+            },
+            roster_fn_ids,
+        }
+    }
+
     #[test]
     fn valid_card_round_trips_and_validates() {
         let roster = roster();
@@ -993,6 +1518,164 @@ mod tests {
         let mut english = valid_card("orientation-1".into());
         english.core_flows[0].why = "Needed by the downstream consumer.".into();
         assert!(english.validate(&context).is_err());
+    }
+
+    #[test]
+    fn skeleton_validator_rejects_dangling_actor_evidence_and_empty_core_flows() {
+        let roster = roster();
+        let context = validation_context(&roster);
+        validate_orientation_skeleton(&valid_skeleton(), &context).unwrap();
+
+        let mut dangling_actor = valid_skeleton();
+        dangling_actor.core_flows[0].steps[0].to_actor_id = "missing".into();
+        assert!(validate_orientation_skeleton(&dangling_actor, &context).is_err());
+
+        let mut dangling_evidence = valid_skeleton();
+        dangling_evidence.walkthrough.steps[0].evidence_ids = vec!["missing".into()];
+        assert!(validate_orientation_skeleton(&dangling_evidence, &context).is_err());
+
+        let mut no_core_flows = valid_skeleton();
+        no_core_flows.core_flows.clear();
+        assert!(validate_orientation_skeleton(&no_core_flows, &context).is_err());
+
+        let mut empty_core_flow = valid_skeleton();
+        empty_core_flow.core_flows[0].steps.clear();
+        assert!(validate_orientation_skeleton(&empty_core_flow, &context).is_err());
+    }
+
+    #[test]
+    fn skeleton_validator_enforces_bounded_source_evidence_ranges() {
+        let included = vec!["fetch".to_string()];
+        let line_ranges = BTreeMap::from([
+            ("fetch".to_string(), [1, 3]),
+            ("helper".to_string(), [4, 4]),
+        ]);
+        let context = OrientationValidationContext {
+            file_path: "src/a.rs",
+            source: validation_source(),
+            roster_fn_ids: &included,
+            roster_line_ranges: Some(&line_ranges),
+        };
+
+        let mut outside = valid_skeleton();
+        assert!(validate_orientation_skeleton(&outside, &context).is_err());
+
+        outside.evidence.retain(|evidence| evidence.id == "E1");
+        validate_orientation_skeleton(&outside, &context).unwrap();
+    }
+
+    #[test]
+    fn role_batch_validator_rejects_missing_duplicate_and_out_of_batch_functions() {
+        let frozen = valid_skeleton();
+        let spec = role_batch_spec(0, &["fetch", "helper"]);
+        validate_orientation_role_batch(&valid_role_batch(&["fetch", "helper"]), &spec, &frozen)
+            .unwrap();
+
+        let mut missing = valid_role_batch(&["fetch", "helper"]);
+        missing.function_roles.pop();
+        assert!(validate_orientation_role_batch(&missing, &spec, &frozen).is_err());
+
+        let mut duplicate = valid_role_batch(&["fetch", "helper"]);
+        duplicate
+            .function_roles
+            .push(duplicate.function_roles[0].clone());
+        assert!(validate_orientation_role_batch(&duplicate, &spec, &frozen).is_err());
+
+        let mut outside = valid_role_batch(&["fetch", "helper"]);
+        outside.function_roles[0].fn_id = "outside".into();
+        assert!(validate_orientation_role_batch(&outside, &spec, &frozen).is_err());
+    }
+
+    #[test]
+    fn role_batch_validator_requires_one_source_view_per_batch_function() {
+        let frozen = valid_skeleton();
+        let batch = valid_role_batch(&["helper"]);
+
+        let mut missing = role_batch_spec(0, &["helper"]);
+        missing.source_views.clear();
+        assert!(validate_orientation_role_batch(&batch, &missing, &frozen).is_err());
+
+        let mut outside = role_batch_spec(0, &["helper"]);
+        outside.source_views[0] = OrientationFunctionSourceView::Exact {
+            fn_id: "outside".into(),
+            numbered_source: "1 | fn outside() {}".into(),
+        };
+        assert!(validate_orientation_role_batch(&batch, &outside, &frozen).is_err());
+
+        let signature_only = OrientationRoleBatchSpec {
+            index: 0,
+            fn_ids: vec!["helper".into()],
+            source_views: vec![OrientationFunctionSourceView::SignatureOnly {
+                fn_id: "helper".into(),
+                numbered_signature: "4 | fn helper()".into(),
+            }],
+        };
+        validate_orientation_role_batch(&batch, &signature_only, &frozen).unwrap();
+    }
+
+    #[test]
+    fn role_batch_validator_rejects_ids_outside_the_frozen_skeleton() {
+        let frozen = valid_skeleton();
+        let fetch_spec = role_batch_spec(0, &["fetch"]);
+
+        let mut actor = valid_role_batch(&["fetch"]);
+        actor.function_roles[0].receives_from_actor_ids = vec!["missing".into()];
+        assert!(validate_orientation_role_batch(&actor, &fetch_spec, &frozen).is_err());
+
+        let mut flow = valid_role_batch(&["fetch"]);
+        flow.function_roles[0].flow_ids = vec!["missing".into()];
+        assert!(validate_orientation_role_batch(&flow, &fetch_spec, &frozen).is_err());
+
+        let helper_spec = role_batch_spec(1, &["helper"]);
+        let mut evidence = valid_role_batch(&["helper"]);
+        evidence.supporting_capabilities[0].evidence_ids = vec!["missing".into()];
+        assert!(validate_orientation_role_batch(&evidence, &helper_spec, &frozen).is_err());
+
+        let mut supporting_flow = valid_role_batch(&["helper"]);
+        supporting_flow.function_roles[0].flow_ids = vec!["request-flow".into()];
+        assert!(validate_orientation_role_batch(&supporting_flow, &helper_spec, &frozen).is_err());
+    }
+
+    #[test]
+    fn merge_orders_multiple_batches_by_roster_and_preserves_final_validation() {
+        let frozen = valid_skeleton();
+        let batches = vec![
+            (role_batch_spec(0, &["fetch"]), valid_role_batch(&["fetch"])),
+            (
+                role_batch_spec(1, &["helper"]),
+                valid_role_batch(&["helper"]),
+            ),
+        ];
+        let roster = vec!["helper".to_string(), "fetch".to_string()];
+
+        let card = merge_orientation_card(frozen, batches, backend_facts(roster.clone())).unwrap();
+
+        assert_eq!(
+            card.function_roles
+                .iter()
+                .map(|role| role.fn_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["helper", "fetch"]
+        );
+        assert_eq!(card.supporting_capabilities[0].name, "Local helper");
+        card.validate(&validation_context(&roster)).unwrap();
+    }
+
+    #[test]
+    fn merge_rejects_missing_or_duplicate_cross_batch_roster_coverage() {
+        let frozen = valid_skeleton();
+        let roster = roster();
+
+        let missing = vec![(role_batch_spec(0, &["fetch"]), valid_role_batch(&["fetch"]))];
+        assert!(
+            merge_orientation_card(frozen.clone(), missing, backend_facts(roster.clone())).is_err()
+        );
+
+        let duplicate = vec![
+            (role_batch_spec(0, &["fetch"]), valid_role_batch(&["fetch"])),
+            (role_batch_spec(1, &["fetch"]), valid_role_batch(&["fetch"])),
+        ];
+        assert!(merge_orientation_card(frozen, duplicate, backend_facts(roster)).is_err());
     }
 
     #[test]
