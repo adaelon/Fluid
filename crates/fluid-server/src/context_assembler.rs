@@ -21,9 +21,10 @@ use serde::{Deserialize, Serialize};
 use crate::graph_loader::{GraphCatalog, GraphEdge, GraphNode, GraphSnapshot, KnowledgeGraph};
 use crate::orientation::{
     batch_orientation_role_source_views, ActorBoundary, CodeEvidenceRef, FileOrientationCard,
-    FunctionLane, FunctionRole, OrientationActor, OrientationFlow, OrientationFlowStep,
-    OrientationFunctionSourceView, OrientationRoleBatchSpec, OrientationSkeleton, OrientationType,
-    OrientationWalkthrough, WalkthroughStep,
+    FunctionLane, FunctionRole, OrientationActor, OrientationEvidenceSourceKind, OrientationFlow,
+    OrientationFlowStep, OrientationFunctionEvidenceSource, OrientationFunctionSourceView,
+    OrientationRoleBatchSpec, OrientationSkeleton, OrientationType, OrientationWalkthrough,
+    WalkthroughStep,
 };
 
 /// A function as located by the frontend's tree-sitter pass (技术方案 §3).
@@ -809,6 +810,21 @@ pub fn build_full_orientation_role_batch_specs(
     Ok(batch_orientation_role_source_views(views))
 }
 
+/// Project every verified roster span to backend-owned exact evidence metadata
+/// without changing roster order. Source text remains owned by the role-batch
+/// specs; this projection carries only the stable identity and full span used
+/// later by `bind_exact_function_evidence`.
+#[allow(dead_code)] // S-ORI3-3 wires the staged projector into `/api/orient`.
+pub fn build_full_orientation_function_evidence_sources(
+    roster_spans: &[FunctionSpan],
+) -> Result<Vec<OrientationFunctionEvidenceSource>, String> {
+    let roster_ids = validate_orientation_evidence_roster(roster_spans)?;
+    Ok(project_orientation_function_evidence_sources(
+        roster_spans,
+        &roster_ids,
+    ))
+}
+
 /// Project selected bounded-source functions to exact source and every omitted
 /// roster function to its numbered signature only. The selection must be the
 /// exact roster partition produced by `slice_orientation_sources`.
@@ -889,6 +905,97 @@ pub fn build_bounded_orientation_role_batch_specs(
     }
 
     Ok(batch_orientation_role_source_views(views))
+}
+
+/// Reproduce the backend's bounded-source partition as evidence metadata.
+/// Selected functions are exact; the roster complement is signature-only and
+/// therefore will not receive a function-body evidence binding.
+#[allow(dead_code)] // S-ORI3-3 wires the staged projector into `/api/orient`.
+pub fn build_bounded_orientation_function_evidence_sources(
+    roster_spans: &[FunctionSpan],
+    selection: &OrientationSourceSelection,
+) -> Result<Vec<OrientationFunctionEvidenceSource>, String> {
+    let roster_ids = validate_orientation_evidence_roster(roster_spans)?;
+    let mut exact_ids = HashSet::new();
+    for source in &selection.sources {
+        if !roster_ids.contains(source.fn_id.as_str()) {
+            return Err(format!(
+                "bounded selection references unknown fnId {:?}",
+                source.fn_id
+            ));
+        }
+        if source.numbered_source.trim().is_empty() {
+            return Err(format!(
+                "bounded selection has empty source for fnId {:?}",
+                source.fn_id
+            ));
+        }
+        if !exact_ids.insert(source.fn_id.as_str()) {
+            return Err(format!("bounded selection repeats fnId {:?}", source.fn_id));
+        }
+    }
+
+    let expected_omitted = roster_spans
+        .iter()
+        .filter(|span| !exact_ids.contains(span.id.as_str()))
+        .map(|span| span.id.clone())
+        .collect::<Vec<_>>();
+    if selection.omitted_function_ids != expected_omitted {
+        return Err(format!(
+            "bounded omitted fnIds do not match the roster complement: expected {expected_omitted:?}, got {:?}",
+            selection.omitted_function_ids
+        ));
+    }
+
+    Ok(project_orientation_function_evidence_sources(
+        roster_spans,
+        &exact_ids,
+    ))
+}
+
+#[allow(dead_code)] // Reachable with the staged S-ORI3-3 projector entrypoints.
+fn validate_orientation_evidence_roster(
+    roster_spans: &[FunctionSpan],
+) -> Result<HashSet<&str>, String> {
+    let mut roster_ids = HashSet::new();
+    for span in roster_spans {
+        if span.id.trim().is_empty() {
+            return Err("roster contains an empty fnId".into());
+        }
+        if !roster_ids.insert(span.id.as_str()) {
+            return Err(format!("duplicate roster fnId {:?}", span.id));
+        }
+        if span.name.trim().is_empty() {
+            return Err(format!("roster fnId {:?} has an empty symbol", span.id));
+        }
+        if span.line_range[0] == 0 || span.line_range[0] > span.line_range[1] {
+            return Err(format!(
+                "roster fnId {:?} has an invalid source span {:?}",
+                span.id, span.line_range
+            ));
+        }
+    }
+    Ok(roster_ids)
+}
+
+#[allow(dead_code)] // Reachable with the staged S-ORI3-3 projector entrypoints.
+fn project_orientation_function_evidence_sources(
+    roster_spans: &[FunctionSpan],
+    exact_ids: &HashSet<&str>,
+) -> Vec<OrientationFunctionEvidenceSource> {
+    roster_spans
+        .iter()
+        .map(|span| OrientationFunctionEvidenceSource {
+            fn_id: span.id.clone(),
+            kind: if exact_ids.contains(span.id.as_str()) {
+                OrientationEvidenceSourceKind::Exact
+            } else {
+                OrientationEvidenceSourceKind::SignatureOnly
+            },
+            line_range: span.line_range,
+            symbol: span.name.clone(),
+        })
+        .collect()
 }
 
 /// Build the one bounded-source card-generation prompt after planning. Coverage
@@ -1033,7 +1140,99 @@ pub fn build_bounded_orientation_skeleton_prompt(
 
 /// Build one stage-B role prompt from an immutable, already validated skeleton
 /// and one backend-owned batch. No global roster or other batch source is added.
+#[allow(dead_code)] // S-ORI3-3 replaces the temporary legacy route import.
 pub fn build_orientation_role_batch_prompt(
+    frozen: &OrientationSkeleton,
+    spec: &OrientationRoleBatchSpec,
+) -> (String, String) {
+    let system = r#"你是 Fluid 的函数角色定向助手。请在后端已校验并冻结的文件定向骨架中，为当前唯一批次归类函数角色。
+只输出一个 JSON 对象，禁止额外文字或 Markdown 代码围栏。JSON 只能包含 functionRoles 与 supportingCapabilities 的语义草稿字段；禁止输出或改写骨架字段、批次边界、schemaVersion、orientationId、filePath、coverage 或 evidenceIds。后端负责注入源码证据。
+
+语言约束：所有面向读者的自然语言说明必须使用简体中文，源码标识符与通行技术术语可保留必要英文。
+
+硬约束：
+1. 当前批次每个 fnId 必须在 functionRoles 中恰好出现一次；禁止漏失、重复或创造批外 fnId。
+2. lane 只能是 core 或 supporting。core 必须引用至少一个冻结 flowId；supporting 必须输出 flowIds: []。
+3. actor 与 flow 引用只能来自冻结骨架。不能新增、改写或猜测 ID。
+4. supportingCapabilities.functionIds 只能引用本批同时属于 Exact 且 lane 为 supporting 的函数；核心函数与 SignatureOnly 函数不得进入外围能力。
+5. Exact 函数可依据可见函数体描述语义；SignatureOnly 函数只能依据签名给出保守角色，不得虚构函数体行为。函数角色与外围能力的证据均由后端按已核验 Exact 函数跨度确定性绑定。
+
+字段形状：
+{"functionRoles":[{"fnId":"fnId","lane":"core|supporting","flowIds":["flow_id"],"stage":"...","receivesFromActorIds":["actor_id"],"consumes":["..."],"sendsToActorIds":["actor_id"],"produces":["..."],"why":"..."}],"supportingCapabilities":[{"name":"...","why":"...","functionIds":["fnId"]}]}"#;
+
+    let frozen_json = serde_json::to_string(frozen)
+        .expect("validated orientation skeleton contains only serializable fields");
+    let exact_fn_ids = spec
+        .source_views
+        .iter()
+        .filter_map(|view| match view {
+            OrientationFunctionSourceView::Exact { fn_id, .. } => Some(fn_id),
+            OrientationFunctionSourceView::SignatureOnly { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    let signature_only_fn_ids = spec
+        .source_views
+        .iter()
+        .filter_map(|view| match view {
+            OrientationFunctionSourceView::Exact { .. } => None,
+            OrientationFunctionSourceView::SignatureOnly { fn_id, .. } => Some(fn_id),
+        })
+        .collect::<Vec<_>>();
+    let boundary_json = serde_json::json!({
+        "index": spec.index,
+        "fnIds": spec.fn_ids,
+        "exactFnIds": exact_fn_ids,
+        "signatureOnlyFnIds": signature_only_fn_ids,
+    });
+    let mut user = String::new();
+    user.push_str(&format!("【冻结定向骨架(JSON；只读)】{frozen_json}\n"));
+    user.push_str(&format!("【当前批次边界(JSON)】{boundary_json}\n"));
+    user.push_str("【当前批次源码投影】\n");
+    for view in &spec.source_views {
+        match view {
+            OrientationFunctionSourceView::Exact {
+                fn_id,
+                numbered_source,
+            } => {
+                user.push_str(&format!("【Exact fnId={fn_id}】\n{numbered_source}\n"));
+            }
+            OrientationFunctionSourceView::SignatureOnly {
+                fn_id,
+                numbered_signature,
+            } => {
+                user.push_str(&format!(
+                    "【SignatureOnly fnId={fn_id}】\n{numbered_signature}\n"
+                ));
+            }
+        }
+    }
+
+    (system.to_string(), user)
+}
+
+/// Build the single allowed stage-B correction request without widening either
+/// the frozen coordinate set or the original batch boundary.
+#[allow(dead_code)] // S-ORI3-3 replaces the temporary legacy route import.
+pub fn build_orientation_role_batch_correction_prompt(
+    frozen: &OrientationSkeleton,
+    spec: &OrientationRoleBatchSpec,
+    original_output: &str,
+    validation_error: &str,
+) -> (String, String) {
+    let (system, mut user) = build_orientation_role_batch_prompt(frozen, spec);
+    user.push_str("【上次无效输出；仅用于纠错，不是事实】\n");
+    user.push_str(original_output);
+    user.push('\n');
+    user.push_str("【确定性校验错误】\n");
+    user.push_str(validation_error);
+    user.push('\n');
+    user.push_str("请在完全相同的冻结骨架和当前批次边界内重写 JSON；不得扩大任何 ID 集合。\n");
+    (system, user)
+}
+
+/// Temporary ORI2 prompt retained only until S-ORI3-3 connects the production
+/// route to draft parsing and backend evidence materialization.
+pub(crate) fn build_legacy_orientation_role_batch_prompt(
     frozen: &OrientationSkeleton,
     spec: &OrientationRoleBatchSpec,
 ) -> (String, String) {
@@ -1084,15 +1283,13 @@ pub fn build_orientation_role_batch_prompt(
     (system.to_string(), user)
 }
 
-/// Build the single allowed stage-B correction request without widening either
-/// the frozen coordinate set or the original batch boundary.
-pub fn build_orientation_role_batch_correction_prompt(
+pub(crate) fn build_legacy_orientation_role_batch_correction_prompt(
     frozen: &OrientationSkeleton,
     spec: &OrientationRoleBatchSpec,
     original_output: &str,
     validation_error: &str,
 ) -> (String, String) {
-    let (system, mut user) = build_orientation_role_batch_prompt(frozen, spec);
+    let (system, mut user) = build_legacy_orientation_role_batch_prompt(frozen, spec);
     user.push_str("【上次无效输出；仅用于纠错，不是事实】\n");
     user.push_str(original_output);
     user.push('\n');
@@ -3362,6 +3559,78 @@ mod tests {
     }
 
     #[test]
+    fn orientation_function_evidence_sources_follow_verified_roster_and_selection() {
+        let source = "fn selected() { selected_body(); }\nfn omitted() { omitted_body(); }\n";
+        let roster = vec![
+            FunctionSpan {
+                id: "selected#1".into(),
+                name: "selected".into(),
+                line_range: [1, 1],
+            },
+            FunctionSpan {
+                id: "omitted#2".into(),
+                name: "omitted".into(),
+                line_range: [2, 2],
+            },
+        ];
+
+        let full = build_full_orientation_function_evidence_sources(&roster).unwrap();
+        assert_eq!(
+            full.iter()
+                .map(|source| {
+                    (
+                        source.fn_id.as_str(),
+                        source.kind,
+                        source.line_range,
+                        source.symbol.as_str(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "selected#1",
+                    crate::orientation::OrientationEvidenceSourceKind::Exact,
+                    [1, 1],
+                    "selected",
+                ),
+                (
+                    "omitted#2",
+                    crate::orientation::OrientationEvidenceSourceKind::Exact,
+                    [2, 2],
+                    "omitted",
+                ),
+            ]
+        );
+
+        let selection = slice_orientation_sources(
+            source,
+            &roster,
+            &["selected#1".into()],
+            ORIENTATION_FETCH_BUDGET_CHARS,
+        );
+        let bounded =
+            build_bounded_orientation_function_evidence_sources(&roster, &selection).unwrap();
+        assert_eq!(
+            bounded
+                .iter()
+                .map(|source| (source.fn_id.as_str(), source.kind, source.line_range))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "selected#1",
+                    crate::orientation::OrientationEvidenceSourceKind::Exact,
+                    [1, 1],
+                ),
+                (
+                    "omitted#2",
+                    crate::orientation::OrientationEvidenceSourceKind::SignatureOnly,
+                    [2, 2],
+                ),
+            ]
+        );
+    }
+
+    #[test]
     fn orientation_role_projection_rejects_duplicate_stale_or_nonpartitioned_input() {
         let source = "fn one() { body_one(); }\nfn two() { body_two(); }\n";
         let roster = vec![
@@ -3378,6 +3647,7 @@ mod tests {
         ];
         let duplicate_roster = vec![roster[0].clone(), roster[0].clone()];
         assert!(build_full_orientation_role_batch_specs(source, &duplicate_roster).is_err());
+        assert!(build_full_orientation_function_evidence_sources(&duplicate_roster).is_err());
 
         let selection = slice_orientation_sources(
             source,
@@ -3389,6 +3659,10 @@ mod tests {
         wrong_complement.omitted_function_ids.clear();
         assert!(
             build_bounded_orientation_role_batch_specs(source, &roster, &wrong_complement).is_err()
+        );
+        assert!(
+            build_bounded_orientation_function_evidence_sources(&roster, &wrong_complement)
+                .is_err()
         );
 
         let mut stale_source = selection;
@@ -3439,6 +3713,59 @@ mod tests {
         assert!(correction_user.contains("current#10 has no functionRole"));
         assert!(correction_user.contains("{\"functionRoles\":[]}"));
         assert!(!correction_user.contains("outside#99"));
+    }
+
+    #[test]
+    fn orientation_role_prompt_requests_only_draft_fields_and_publishes_source_boundary() {
+        let (card, _) = capsule_orientation_fixture();
+        let frozen = crate::orientation::OrientationSkeleton {
+            purpose: card.purpose,
+            actors: card.actors,
+            types: card.types,
+            core_flows: card.core_flows,
+            walkthrough: card.walkthrough,
+            invariants: card.invariants,
+            evidence: card.evidence,
+        };
+        let spec = crate::orientation::OrientationRoleBatchSpec {
+            index: 0,
+            fn_ids: vec!["exact#10".into(), "omitted#11".into()],
+            source_views: vec![
+                crate::orientation::OrientationFunctionSourceView::Exact {
+                    fn_id: "exact#10".into(),
+                    numbered_source: "10 | fn exact() { exact_body(); }".into(),
+                },
+                crate::orientation::OrientationFunctionSourceView::SignatureOnly {
+                    fn_id: "omitted#11".into(),
+                    numbered_signature: "11 | fn omitted() {".into(),
+                },
+            ],
+        };
+
+        let (system, user) = build_orientation_role_batch_prompt(&frozen, &spec);
+
+        assert!(system.contains("后端负责注入源码证据"));
+        assert!(!system.contains("\"evidenceIds\""));
+        assert!(!system.contains("引用冻结 evidence"));
+        assert!(user.contains("\"exactFnIds\":[\"exact#10\"]"));
+        assert!(user.contains("\"signatureOnlyFnIds\":[\"omitted#11\"]"));
+        assert!(user.contains("exact_body"));
+        assert!(!user.contains("omitted_body"));
+
+        let (correction_system, correction_user) = build_orientation_role_batch_correction_prompt(
+            &frozen,
+            &spec,
+            "{\"functionRoles\":[]}",
+            "missing role",
+        );
+        assert_eq!(correction_system, system);
+        assert!(correction_user.contains("\"exactFnIds\":[\"exact#10\"]"));
+        assert!(correction_user.contains("missing role"));
+
+        let (legacy_system, legacy_user) =
+            build_legacy_orientation_role_batch_prompt(&frozen, &spec);
+        assert!(legacy_system.contains("\"evidenceIds\""));
+        assert!(!legacy_user.contains("exactFnIds"));
     }
 
     #[test]

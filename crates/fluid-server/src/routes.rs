@@ -36,7 +36,8 @@ use crate::context_assembler::{
     build_bounded_orientation_skeleton_prompt, build_explain_decl_prompt,
     build_explain_line_prompt, build_file_set_query_prompt, build_file_set_query_prompt_with_map,
     build_full_orientation_role_batch_specs, build_gen_prompt,
-    build_orientation_role_batch_correction_prompt, build_orientation_role_batch_prompt,
+    build_legacy_orientation_role_batch_correction_prompt as build_orientation_role_batch_correction_prompt,
+    build_legacy_orientation_role_batch_prompt as build_orientation_role_batch_prompt,
     build_orientation_skeleton_prompt, build_orientation_source_planning_prompt,
     build_query_prompt, build_query_prompt_with_map, build_query_source_planning_prompt,
     build_selection_explanation_prompt, build_selection_private_context,
@@ -53,7 +54,8 @@ use crate::graph_loader::{GraphCatalog, GraphNode, KnowledgeGraph};
 #[cfg(test)]
 use crate::llm_proxy::parse_orientation_card;
 use crate::llm_proxy::{
-    parse_fetch_plan, parse_generation, parse_line_annotation, parse_orientation_role_batch,
+    parse_fetch_plan, parse_generation,
+    parse_legacy_orientation_role_batch as parse_orientation_role_batch, parse_line_annotation,
     parse_orientation_skeleton, parse_orientation_source_plan, parse_selection_explanation,
     LlmProxy, SseDecoder,
 };

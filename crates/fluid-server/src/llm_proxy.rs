@@ -23,7 +23,9 @@ use crate::orientation::{
     OrientationInvariant, OrientationType, OrientationWalkthrough, SupportingCapability,
     ORIENTATION_SCHEMA_VERSION,
 };
-use crate::orientation::{FunctionRole, OrientationRoleBatch, OrientationSkeleton};
+use crate::orientation::{
+    FunctionRole, OrientationRoleBatch, OrientationRoleBatchDraft, OrientationSkeleton,
+};
 use crate::web_evidence::{
     parse_web_search_response, EvidenceStatus, SourceLink, WebSearchError, WebSearchResult,
 };
@@ -427,9 +429,23 @@ pub fn parse_orientation_skeleton(content: &str) -> anyhow::Result<OrientationSk
     })
 }
 
-/// Parse only one model-authored stage-B batch. Unknown fields are rejected by
-/// `OrientationRoleBatch`, leaving batch identity and final card facts backend-owned.
-pub fn parse_orientation_role_batch(content: &str) -> anyhow::Result<OrientationRoleBatch> {
+/// Parse only one model-authored stage-B semantic draft. Unknown fields are
+/// rejected by `OrientationRoleBatchDraft`, so evidence, batch identity, and
+/// final card facts remain backend-owned.
+#[allow(dead_code)] // S-ORI3-3 replaces the temporary legacy route import.
+pub fn parse_orientation_role_batch(content: &str) -> anyhow::Result<OrientationRoleBatchDraft> {
+    serde_json::from_str(extract_json(content)).map_err(|error| {
+        anyhow::anyhow!(
+            "LLM did not return the expected orientation role batch JSON: {error}; content: {content}"
+        )
+    })
+}
+
+/// Temporary ORI2 parser retained only until S-ORI3-3 moves the production
+/// route through draft materialization.
+pub(crate) fn parse_legacy_orientation_role_batch(
+    content: &str,
+) -> anyhow::Result<OrientationRoleBatch> {
     serde_json::from_str(extract_json(content)).map_err(|error| {
         anyhow::anyhow!(
             "LLM did not return the expected orientation role batch JSON: {error}; content: {content}"
@@ -1000,14 +1016,48 @@ mod tests {
         assert!(parse_orientation_skeleton(&forged_skeleton.to_string()).is_err());
 
         let batch = serde_json::json!({
-            "functionRoles": [],
-            "supportingCapabilities": []
+            "functionRoles": [{
+                "fnId": "helper#2",
+                "lane": "supporting",
+                "flowIds": [],
+                "stage": "准备本地状态",
+                "receivesFromActorIds": ["worker"],
+                "consumes": ["work"],
+                "sendsToActorIds": ["worker"],
+                "produces": ["prepared work"],
+                "why": "为核心路径准备稳定输入"
+            }],
+            "supportingCapabilities": [{
+                "name": "本地准备",
+                "why": "隔离外围准备逻辑",
+                "functionIds": ["helper#2"]
+            }]
         });
-        assert!(parse_orientation_role_batch(&batch.to_string()).is_ok());
+        let parsed: crate::orientation::OrientationRoleBatchDraft =
+            parse_orientation_role_batch(&batch.to_string()).unwrap();
+        assert_eq!(parsed.function_roles[0].fn_id, "helper#2");
 
-        let mut forged_batch = batch;
-        forged_batch["orientationId"] = serde_json::json!("model-owned");
-        assert!(parse_orientation_role_batch(&forged_batch.to_string()).is_err());
+        for (field, value) in [
+            ("orientationId", serde_json::json!("model-owned")),
+            ("coverage", serde_json::json!({ "mode": "full-source" })),
+        ] {
+            let mut forged_batch = batch.clone();
+            forged_batch[field] = value;
+            assert!(parse_orientation_role_batch(&forged_batch.to_string()).is_err());
+        }
+
+        let mut forged_evidence = batch;
+        forged_evidence["functionRoles"][0]["evidenceIds"] = serde_json::json!(["E1"]);
+        assert!(parse_orientation_role_batch(&forged_evidence.to_string()).is_err());
+
+        let mut forged_capability_evidence = forged_evidence;
+        forged_capability_evidence["functionRoles"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("evidenceIds");
+        forged_capability_evidence["supportingCapabilities"][0]["evidenceIds"] =
+            serde_json::json!(["E1"]);
+        assert!(parse_orientation_role_batch(&forged_capability_evidence.to_string()).is_err());
     }
 
     #[test]
