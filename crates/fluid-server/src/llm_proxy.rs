@@ -17,11 +17,13 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::cache_store::{Capsule, LineAnnotation, SelectionExplanation, SelectionKind};
+#[cfg(test)]
 use crate::orientation::{
-    CodeEvidenceRef, FileOrientationCard, FunctionRole, OrientationActor, OrientationCoverage,
-    OrientationFlow, OrientationInvariant, OrientationRoleBatch, OrientationSkeleton,
-    OrientationType, OrientationWalkthrough, SupportingCapability, ORIENTATION_SCHEMA_VERSION,
+    CodeEvidenceRef, FileOrientationCard, OrientationActor, OrientationCoverage, OrientationFlow,
+    OrientationInvariant, OrientationType, OrientationWalkthrough, SupportingCapability,
+    ORIENTATION_SCHEMA_VERSION,
 };
+use crate::orientation::{FunctionRole, OrientationRoleBatch, OrientationSkeleton};
 use crate::web_evidence::{
     parse_web_search_response, EvidenceStatus, SourceLink, WebSearchError, WebSearchResult,
 };
@@ -364,6 +366,7 @@ pub fn parse_generation(
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg(test)]
 struct RawOrientationCard {
     purpose: String,
     actors: Vec<OrientationActor>,
@@ -383,6 +386,7 @@ struct RawOrientationCard {
 /// Parse the model-authored semantic portion of an orientation card. Cache,
 /// schema, file identity, and full/bounded coverage are backend facts, so the
 /// model never gets to choose or echo them into the trusted artifact.
+#[cfg(test)]
 pub fn parse_orientation_card(
     content: &str,
     orientation_id: &str,
@@ -415,7 +419,6 @@ pub fn parse_orientation_card(
 /// Parse only the model-authored stage-A coordinate system. The target type
 /// denies unknown fields, so backend identity, coverage, or role fields cannot
 /// be smuggled through this trust boundary.
-#[allow(dead_code)] // S-ORI2-3 will connect the two-stage route.
 pub fn parse_orientation_skeleton(content: &str) -> anyhow::Result<OrientationSkeleton> {
     serde_json::from_str(extract_json(content)).map_err(|error| {
         anyhow::anyhow!(
@@ -426,7 +429,6 @@ pub fn parse_orientation_skeleton(content: &str) -> anyhow::Result<OrientationSk
 
 /// Parse only one model-authored stage-B batch. Unknown fields are rejected by
 /// `OrientationRoleBatch`, leaving batch identity and final card facts backend-owned.
-#[allow(dead_code)] // S-ORI2-3 will connect the two-stage route.
 pub fn parse_orientation_role_batch(content: &str) -> anyhow::Result<OrientationRoleBatch> {
     serde_json::from_str(extract_json(content)).map_err(|error| {
         anyhow::anyhow!(

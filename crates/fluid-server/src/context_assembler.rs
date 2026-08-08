@@ -785,7 +785,6 @@ pub fn slice_orientation_sources(
 
 /// Project every verified roster span to exact, absolutely numbered source and
 /// split the views into stable backend batches of at most eight functions.
-#[allow(dead_code)] // S-ORI2-3 will call this from the full-source route.
 pub fn build_full_orientation_role_batch_specs(
     file_source: &str,
     roster_spans: &[FunctionSpan],
@@ -813,7 +812,6 @@ pub fn build_full_orientation_role_batch_specs(
 /// Project selected bounded-source functions to exact source and every omitted
 /// roster function to its numbered signature only. The selection must be the
 /// exact roster partition produced by `slice_orientation_sources`.
-#[allow(dead_code)] // S-ORI2-3 will call this from the bounded-source route.
 pub fn build_bounded_orientation_role_batch_specs(
     file_source: &str,
     roster_spans: &[FunctionSpan],
@@ -896,6 +894,7 @@ pub fn build_bounded_orientation_role_batch_specs(
 /// Build the one bounded-source card-generation prompt after planning. Coverage
 /// is a backend fact: the model receives the exact omitted IDs but does not author
 /// the coverage object that will be cached.
+#[cfg(test)]
 pub fn build_bounded_orientation_prompt(
     file_path: &str,
     file_source: &str,
@@ -946,7 +945,6 @@ pub fn build_bounded_orientation_prompt(
 
 /// Build the stage-A prompt over the complete active-file source. The requested
 /// JSON deliberately excludes all function-role and backend-owned card fields.
-#[allow(dead_code)] // S-ORI2-3 will connect the two-stage route.
 pub fn build_orientation_skeleton_prompt(
     file_path: &str,
     file_source: &str,
@@ -984,7 +982,6 @@ pub fn build_orientation_skeleton_prompt(
 
 /// Build the stage-A prompt for an oversized file. Only selected exact source
 /// bodies cross the boundary; omitted functions remain outline-only navigation.
-#[allow(dead_code)] // S-ORI2-3 will connect the two-stage route.
 pub fn build_bounded_orientation_skeleton_prompt(
     file_path: &str,
     file_source: &str,
@@ -1036,7 +1033,6 @@ pub fn build_bounded_orientation_skeleton_prompt(
 
 /// Build one stage-B role prompt from an immutable, already validated skeleton
 /// and one backend-owned batch. No global roster or other batch source is added.
-#[allow(dead_code)] // S-ORI2-3 will connect the two-stage route.
 pub fn build_orientation_role_batch_prompt(
     frozen: &OrientationSkeleton,
     spec: &OrientationRoleBatchSpec,
@@ -1356,6 +1352,7 @@ fn capsule_orientation_projection(card: &FileOrientationCard, role: &FunctionRol
 /// are deliberately absent from the requested JSON and injected after parsing.
 /// Graph material is labeled as navigation-only; every accepted fact still has
 /// to cite a line in the complete, numbered active-file source below.
+#[cfg(test)]
 pub fn build_orientation_prompt(
     file_path: &str,
     file_source: &str,
