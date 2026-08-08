@@ -786,15 +786,33 @@ where
                     return;
                 }
             };
-            let selection = slice_orientation_sources(
+            let mut selection = slice_orientation_sources(
                 &work.source,
                 &work.roster_spans,
                 &need,
                 ORIENTATION_FETCH_BUDGET_CHARS,
             );
             if selection.sources.is_empty() {
+                let fallback_need = work
+                    .roster_spans
+                    .iter()
+                    .map(|span| span.id.clone())
+                    .collect::<Vec<_>>();
+                eprintln!(
+                    "[orient] source plan selected no usable fnIds for {}; falling back to {} verified roster entries",
+                    work.file_path,
+                    fallback_need.len()
+                );
+                selection = slice_orientation_sources(
+                    &work.source,
+                    &work.roster_spans,
+                    &fallback_need,
+                    ORIENTATION_FETCH_BUDGET_CHARS,
+                );
+            }
+            if selection.sources.is_empty() {
                 emit(orientation_error(
-                    "orientation source plan selected no usable function source",
+                    "no verified function source fits the orientation fetch budget",
                 ));
                 return;
             }
@@ -4557,13 +4575,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn orientation_websocket_large_file_surfaces_empty_invalid_and_failed_plans() {
+    async fn orientation_websocket_large_file_falls_back_when_plan_has_no_usable_source() {
+        let plans = [
+            serde_json::json!({ "need": [] }).to_string(),
+            serde_json::json!({ "need": ["ghost#404", "fetch", "helper#999"] }).to_string(),
+        ];
+
+        for plan in plans {
+            let tmp = TmpDir::new();
+            std::fs::write(tmp.path().join("large.rs"), bounded_orientation_source()).unwrap();
+            let mock = start_orientation_sequence_mock(vec![
+                (StatusCode::OK, plan, Duration::ZERO),
+                (
+                    StatusCode::OK,
+                    bounded_orientation_card_json().to_string(),
+                    Duration::ZERO,
+                ),
+            ])
+            .await;
+            let app = start_orientation_app(orientation_state(tmp.path(), &mock)).await;
+
+            let frames = orientation_ws_frames(&app, bounded_orientation_request_json()).await;
+            assert_eq!(
+                frame_kinds(&frames),
+                vec!["status", "status", "card", "done"]
+            );
+            assert_eq!(frames[0]["phase"], "planning-source");
+            assert_eq!(frames[1]["phase"], "orienting");
+            assert_eq!(frames[2]["card"]["coverage"]["mode"], "bounded-source");
+            assert_eq!(
+                frames[2]["card"]["coverage"]["omittedFunctionIds"],
+                serde_json::json!([])
+            );
+
+            let requests = mock.requests.lock().unwrap();
+            assert_eq!(
+                requests.len(),
+                2,
+                "fallback still performs one bounded generation"
+            );
+            let generation_user = requests[1]
+                .pointer("/messages/1/content")
+                .and_then(serde_json::Value::as_str)
+                .unwrap();
+            assert!(generation_user.contains("fetch_body_marker"));
+            assert!(generation_user.contains("helper_body_marker"));
+            assert!(generation_user.contains("omitted_body_marker"));
+            assert!(!generation_user.contains("oversized-file-padding"));
+        }
+    }
+
+    #[tokio::test]
+    async fn orientation_websocket_large_file_surfaces_malformed_and_failed_plans() {
         let cases = [
-            (
-                StatusCode::OK,
-                serde_json::json!({ "need": [] }).to_string(),
-                "no usable function source",
-            ),
             (StatusCode::OK, "not-json".to_string(), "source plan parse"),
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
