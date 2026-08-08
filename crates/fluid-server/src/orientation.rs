@@ -193,6 +193,61 @@ pub struct OrientationRoleBatch {
     pub supporting_capabilities: Vec<SupportingCapability>,
 }
 
+/// Model-produced stage-B semantics before backend-owned evidence is attached.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FunctionRoleDraft {
+    pub fn_id: String,
+    pub lane: FunctionLane,
+    #[serde(default)]
+    pub flow_ids: Vec<String>,
+    pub stage: String,
+    pub receives_from_actor_ids: Vec<String>,
+    pub consumes: Vec<String>,
+    pub sends_to_actor_ids: Vec<String>,
+    pub produces: Vec<String>,
+    pub why: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SupportingCapabilityDraft {
+    pub name: String,
+    pub why: String,
+    pub function_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OrientationRoleBatchDraft {
+    pub function_roles: Vec<FunctionRoleDraft>,
+    pub supporting_capabilities: Vec<SupportingCapabilityDraft>,
+}
+
+/// Backend-verified source availability for one roster function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrientationEvidenceSourceKind {
+    Exact,
+    SignatureOnly,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrientationFunctionEvidenceSource {
+    pub fn_id: String,
+    pub kind: OrientationEvidenceSourceKind,
+    pub line_range: [u32; 2],
+    pub symbol: String,
+}
+
+/// Exact-function evidence owned by the backend. `evidence` contains each
+/// referenced anchor once in source-roster order, while `by_fn_id` is the
+/// mechanical projection used by stage-B materialization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrientationFunctionEvidenceBindings {
+    pub by_fn_id: BTreeMap<String, String>,
+    pub evidence: Vec<CodeEvidenceRef>,
+}
+
 /// Source projection selected by the backend for one function in a role
 /// batch. Signature-only views intentionally carry no function body.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -573,9 +628,25 @@ pub fn validate_orientation_skeleton(
     skeleton: &OrientationSkeleton,
     context: &OrientationValidationContext<'_>,
 ) -> Result<(), OrientationValidationError> {
+    validate_orientation_skeleton_with_bounds(
+        skeleton,
+        context.file_path,
+        Some(context.source.split('\n').count() as u32),
+        context.roster_fn_ids,
+        context.roster_line_ranges,
+    )
+}
+
+fn validate_orientation_skeleton_with_bounds(
+    skeleton: &OrientationSkeleton,
+    file_path: &str,
+    source_lines: Option<u32>,
+    roster_fn_ids: &[String],
+    roster_line_ranges: Option<&BTreeMap<String, [u32; 2]>>,
+) -> Result<(), OrientationValidationError> {
     descriptive("purpose", &skeleton.purpose)?;
 
-    let active_path = normalize_project_path(context.file_path)
+    let active_path = normalize_project_path(file_path)
         .ok_or_else(|| OrientationValidationError::new("active file path is unsafe"))?;
 
     if skeleton.actors.is_empty() {
@@ -594,7 +665,6 @@ pub fn validate_orientation_skeleton(
         "evidence",
         skeleton.evidence.iter().map(|evidence| &evidence.id),
     )?;
-    let source_lines = context.source.split('\n').count() as u32;
     for evidence in &skeleton.evidence {
         let evidence_path = normalize_project_path(&evidence.file_path).ok_or_else(|| {
             OrientationValidationError::new(format!(
@@ -608,20 +678,26 @@ pub fn validate_orientation_skeleton(
                 evidence.id
             ));
         }
-        if evidence.start_line == 0
-            || evidence.start_line > evidence.end_line
-            || evidence.end_line > source_lines
-        {
+        if evidence.start_line == 0 || evidence.start_line > evidence.end_line {
             return invalid(format!(
-                "evidence {} has invalid line range {}..={} for {source_lines} lines",
+                "evidence {} has invalid line range {}..={}",
                 evidence.id, evidence.start_line, evidence.end_line
+            ));
+        }
+        if source_lines.is_some_and(|line_count| evidence.end_line > line_count) {
+            return invalid(format!(
+                "evidence {} has invalid line range {}..={} for {} lines",
+                evidence.id,
+                evidence.start_line,
+                evidence.end_line,
+                source_lines.unwrap_or_default()
             ));
         }
     }
 
-    if let Some(line_ranges) = context.roster_line_ranges {
+    if let Some(line_ranges) = roster_line_ranges {
         let mut allowed_ranges = Vec::new();
-        for fn_id in context.roster_fn_ids {
+        for fn_id in roster_fn_ids {
             let range = line_ranges.get(fn_id).ok_or_else(|| {
                 OrientationValidationError::new(format!(
                     "bounded-source skeleton function {fn_id:?} has no verified line range"
@@ -719,13 +795,145 @@ pub fn validate_orientation_skeleton(
     Ok(())
 }
 
-/// Validate one stage-B response against both the backend-owned batch boundary
-/// and the immutable IDs accepted at stage A.
-pub fn validate_orientation_role_batch(
-    batch: &OrientationRoleBatch,
-    spec: &OrientationRoleBatchSpec,
-    frozen: &OrientationSkeleton,
+/// Canonicalize stage-A evidence IDs and attach one backend-owned anchor to
+/// every exact function. The caller remains responsible for validating actual
+/// source length and bounded-source inclusion before and after this pure step;
+/// this function validates the complete structural/reference boundary.
+pub fn bind_exact_function_evidence(
+    mut skeleton: OrientationSkeleton,
+    sources: &[OrientationFunctionEvidenceSource],
+    file_path: &str,
+) -> Result<(OrientationSkeleton, OrientationFunctionEvidenceBindings), OrientationValidationError>
+{
+    validate_orientation_skeleton_with_bounds(&skeleton, file_path, None, &[], None)?;
+    let active_path = normalize_project_path(file_path)
+        .ok_or_else(|| OrientationValidationError::new("active file path is unsafe"))?;
+
+    let mut evidence_id_map = BTreeMap::new();
+    for (index, evidence) in skeleton.evidence.iter_mut().enumerate() {
+        let previous = evidence.id.clone();
+        let canonical = format!("E{}", index + 1);
+        evidence.id = canonical.clone();
+        evidence_id_map.insert(previous, canonical);
+    }
+    for flow in &mut skeleton.core_flows {
+        for (index, step) in flow.steps.iter_mut().enumerate() {
+            rewrite_evidence_ids(
+                &mut step.evidence_ids,
+                &evidence_id_map,
+                &format!("flow {} step {index}", flow.id),
+            )?;
+        }
+    }
+    for (index, step) in skeleton.walkthrough.steps.iter_mut().enumerate() {
+        rewrite_evidence_ids(
+            &mut step.evidence_ids,
+            &evidence_id_map,
+            &format!("walkthrough step {index}"),
+        )?;
+    }
+    for (index, invariant) in skeleton.invariants.iter_mut().enumerate() {
+        rewrite_evidence_ids(
+            &mut invariant.evidence_ids,
+            &evidence_id_map,
+            &format!("invariant {index}"),
+        )?;
+    }
+
+    unique_ids(
+        "function evidence source",
+        sources.iter().map(|source| &source.fn_id),
+    )?;
+    let mut by_fn_id = BTreeMap::new();
+    let mut binding_evidence_ids = Vec::new();
+    let mut seen_binding_evidence_ids = BTreeSet::new();
+    for source in sources {
+        nonblank("function evidence source symbol", &source.symbol)?;
+        if source.line_range[0] == 0 || source.line_range[0] > source.line_range[1] {
+            return invalid(format!(
+                "function evidence source {:?} has invalid line range {}..={}",
+                source.fn_id, source.line_range[0], source.line_range[1]
+            ));
+        }
+        if source.kind == OrientationEvidenceSourceKind::SignatureOnly {
+            continue;
+        }
+
+        let existing = skeleton.evidence.iter().position(|evidence| {
+            normalize_project_path(&evidence.file_path).as_deref() == Some(active_path.as_str())
+                && evidence.start_line == source.line_range[0]
+                && evidence.end_line == source.line_range[1]
+        });
+        let evidence_id = if let Some(index) = existing {
+            let evidence = &mut skeleton.evidence[index];
+            evidence.file_path = active_path.clone();
+            evidence.symbol = Some(source.symbol.clone());
+            evidence.id.clone()
+        } else {
+            let id = format!("E{}", skeleton.evidence.len() + 1);
+            skeleton.evidence.push(CodeEvidenceRef {
+                id: id.clone(),
+                file_path: active_path.clone(),
+                start_line: source.line_range[0],
+                end_line: source.line_range[1],
+                symbol: Some(source.symbol.clone()),
+            });
+            id
+        };
+        by_fn_id.insert(source.fn_id.clone(), evidence_id.clone());
+        if seen_binding_evidence_ids.insert(evidence_id.clone()) {
+            binding_evidence_ids.push(evidence_id);
+        }
+    }
+
+    validate_orientation_skeleton_with_bounds(&skeleton, file_path, None, &[], None)?;
+    let mut binding_evidence = Vec::with_capacity(binding_evidence_ids.len());
+    for evidence_id in binding_evidence_ids {
+        let evidence = skeleton
+            .evidence
+            .iter()
+            .find(|evidence| evidence.id == evidence_id)
+            .ok_or_else(|| {
+                OrientationValidationError::new(format!(
+                    "function evidence binding references missing evidence {evidence_id:?}"
+                ))
+            })?;
+        binding_evidence.push(evidence.clone());
+    }
+
+    Ok((
+        skeleton,
+        OrientationFunctionEvidenceBindings {
+            by_fn_id,
+            evidence: binding_evidence,
+        },
+    ))
+}
+
+fn rewrite_evidence_ids(
+    evidence_ids: &mut [String],
+    replacements: &BTreeMap<String, String>,
+    owner: &str,
 ) -> Result<(), OrientationValidationError> {
+    for evidence_id in evidence_ids {
+        *evidence_id = replacements.get(evidence_id).cloned().ok_or_else(|| {
+            OrientationValidationError::new(format!(
+                "{owner} has dangling evidence reference {evidence_id:?}"
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+fn validate_orientation_role_batch_spec(
+    spec: &OrientationRoleBatchSpec,
+) -> Result<
+    (
+        BTreeSet<&str>,
+        BTreeMap<&str, OrientationEvidenceSourceKind>,
+    ),
+    OrientationValidationError,
+> {
     if spec.fn_ids.is_empty() {
         return invalid(format!("role batch {} has no functions", spec.index));
     }
@@ -737,6 +945,7 @@ pub fn validate_orientation_role_batch(
             | OrientationFunctionSourceView::SignatureOnly { fn_id, .. } => fn_id,
         }),
     )?;
+    let mut source_kinds = BTreeMap::new();
     for view in &spec.source_views {
         nonblank("role batch source view", view.numbered_source())?;
         if !spec_fn_ids.contains(view.fn_id()) {
@@ -746,6 +955,13 @@ pub fn validate_orientation_role_batch(
                 view.fn_id()
             ));
         }
+        let kind = match view {
+            OrientationFunctionSourceView::Exact { .. } => OrientationEvidenceSourceKind::Exact,
+            OrientationFunctionSourceView::SignatureOnly { .. } => {
+                OrientationEvidenceSourceKind::SignatureOnly
+            }
+        };
+        source_kinds.insert(view.fn_id(), kind);
     }
     for fn_id in &spec_fn_ids {
         if !source_view_ids.contains(fn_id) {
@@ -755,6 +971,181 @@ pub fn validate_orientation_role_batch(
             ));
         }
     }
+    Ok((spec_fn_ids, source_kinds))
+}
+
+/// Project backend-owned evidence onto one model-produced semantic draft.
+pub fn materialize_orientation_role_batch(
+    draft: OrientationRoleBatchDraft,
+    spec: &OrientationRoleBatchSpec,
+    frozen: &OrientationSkeleton,
+    bindings: &OrientationFunctionEvidenceBindings,
+) -> Result<OrientationRoleBatch, OrientationValidationError> {
+    let (spec_fn_ids, source_kinds) = validate_orientation_role_batch_spec(spec)?;
+    let frozen_evidence_ids = unique_ids(
+        "frozen evidence",
+        frozen.evidence.iter().map(|evidence| &evidence.id),
+    )?;
+    let binding_evidence_ids = unique_ids(
+        "function binding evidence",
+        bindings.evidence.iter().map(|evidence| &evidence.id),
+    )?;
+    for evidence in &bindings.evidence {
+        require_ref(
+            "frozen evidence",
+            &evidence.id,
+            &frozen_evidence_ids,
+            "function evidence bindings",
+        )?;
+        let frozen_evidence = frozen
+            .evidence
+            .iter()
+            .find(|candidate| candidate.id == evidence.id)
+            .ok_or_else(|| {
+                OrientationValidationError::new(format!(
+                    "function evidence bindings reference missing frozen evidence {:?}",
+                    evidence.id
+                ))
+            })?;
+        if frozen_evidence != evidence {
+            return invalid(format!(
+                "function evidence binding {:?} does not match frozen evidence",
+                evidence.id
+            ));
+        }
+    }
+    for (fn_id, evidence_id) in &bindings.by_fn_id {
+        nonblank("function evidence binding fnId", fn_id)?;
+        require_ref(
+            "binding evidence",
+            evidence_id,
+            &binding_evidence_ids,
+            &format!("function evidence binding {fn_id}"),
+        )?;
+    }
+
+    let OrientationRoleBatchDraft {
+        function_roles: draft_roles,
+        supporting_capabilities: draft_capabilities,
+    } = draft;
+    unique_ids(
+        "function role draft",
+        draft_roles.iter().map(|role| &role.fn_id),
+    )?;
+    let role_lanes = draft_roles
+        .iter()
+        .map(|role| (role.fn_id.clone(), role.lane))
+        .collect::<BTreeMap<_, _>>();
+    let mut function_roles = Vec::with_capacity(draft_roles.len());
+    for role in draft_roles {
+        if !spec_fn_ids.contains(role.fn_id.as_str()) {
+            return invalid(format!(
+                "role batch {} references out-of-batch fnId {:?}",
+                spec.index, role.fn_id
+            ));
+        }
+        let kind = source_kinds
+            .get(role.fn_id.as_str())
+            .copied()
+            .ok_or_else(|| {
+                OrientationValidationError::new(format!(
+                    "role batch {} function {:?} has no source view",
+                    spec.index, role.fn_id
+                ))
+            })?;
+        let evidence_ids = match kind {
+            OrientationEvidenceSourceKind::Exact => {
+                vec![bindings.by_fn_id.get(&role.fn_id).cloned().ok_or_else(|| {
+                    OrientationValidationError::new(format!(
+                        "exact function {:?} has no backend evidence binding",
+                        role.fn_id
+                    ))
+                })?]
+            }
+            OrientationEvidenceSourceKind::SignatureOnly => {
+                if bindings.by_fn_id.contains_key(&role.fn_id) {
+                    return invalid(format!(
+                        "signature-only function {:?} must not have an evidence binding",
+                        role.fn_id
+                    ));
+                }
+                Vec::new()
+            }
+        };
+        function_roles.push(FunctionRole {
+            fn_id: role.fn_id,
+            lane: role.lane,
+            flow_ids: role.flow_ids,
+            stage: role.stage,
+            receives_from_actor_ids: role.receives_from_actor_ids,
+            consumes: role.consumes,
+            sends_to_actor_ids: role.sends_to_actor_ids,
+            produces: role.produces,
+            why: role.why,
+            evidence_ids,
+        });
+    }
+
+    let mut supporting_capabilities = Vec::with_capacity(draft_capabilities.len());
+    for capability in draft_capabilities {
+        let mut evidence_ids = Vec::new();
+        let mut seen_evidence_ids = BTreeSet::new();
+        for fn_id in &capability.function_ids {
+            if !spec_fn_ids.contains(fn_id.as_str()) {
+                return invalid(format!(
+                    "supporting capability {:?} references out-of-batch fnId {fn_id:?}",
+                    capability.name
+                ));
+            }
+            let Some(lane) = role_lanes.get(fn_id) else {
+                return invalid(format!(
+                    "supporting capability {:?} references fnId {fn_id:?} without a role",
+                    capability.name
+                ));
+            };
+            if *lane != FunctionLane::Supporting {
+                return invalid(format!(
+                    "core function {fn_id:?} also appears in supporting capabilities"
+                ));
+            }
+            if source_kinds.get(fn_id.as_str()) != Some(&OrientationEvidenceSourceKind::Exact) {
+                return invalid(format!(
+                    "signature-only function {fn_id:?} cannot appear in supporting capabilities"
+                ));
+            }
+            let evidence_id = bindings.by_fn_id.get(fn_id).ok_or_else(|| {
+                OrientationValidationError::new(format!(
+                    "supporting function {fn_id:?} has no backend evidence binding"
+                ))
+            })?;
+            if seen_evidence_ids.insert(evidence_id.clone()) {
+                evidence_ids.push(evidence_id.clone());
+            }
+        }
+        supporting_capabilities.push(SupportingCapability {
+            name: capability.name,
+            why: capability.why,
+            function_ids: capability.function_ids,
+            evidence_ids,
+        });
+    }
+
+    let batch = OrientationRoleBatch {
+        function_roles,
+        supporting_capabilities,
+    };
+    validate_orientation_role_batch(&batch, spec, frozen)?;
+    Ok(batch)
+}
+
+/// Validate one stage-B response against both the backend-owned batch boundary
+/// and the immutable IDs accepted at stage A.
+pub fn validate_orientation_role_batch(
+    batch: &OrientationRoleBatch,
+    spec: &OrientationRoleBatchSpec,
+    frozen: &OrientationSkeleton,
+) -> Result<(), OrientationValidationError> {
+    let (spec_fn_ids, _) = validate_orientation_role_batch_spec(spec)?;
 
     let actor_ids = unique_ids("frozen actor", frozen.actors.iter().map(|actor| &actor.id))?;
     let flow_ids = unique_ids("frozen flow", frozen.core_flows.iter().map(|flow| &flow.id))?;
@@ -1358,6 +1749,49 @@ mod tests {
         }
     }
 
+    fn valid_role_batch_draft(fn_ids: &[&str]) -> OrientationRoleBatchDraft {
+        let batch = valid_role_batch(fn_ids);
+        OrientationRoleBatchDraft {
+            function_roles: batch
+                .function_roles
+                .into_iter()
+                .map(|role| FunctionRoleDraft {
+                    fn_id: role.fn_id,
+                    lane: role.lane,
+                    flow_ids: role.flow_ids,
+                    stage: role.stage,
+                    receives_from_actor_ids: role.receives_from_actor_ids,
+                    consumes: role.consumes,
+                    sends_to_actor_ids: role.sends_to_actor_ids,
+                    produces: role.produces,
+                    why: role.why,
+                })
+                .collect(),
+            supporting_capabilities: batch
+                .supporting_capabilities
+                .into_iter()
+                .map(|capability| SupportingCapabilityDraft {
+                    name: capability.name,
+                    why: capability.why,
+                    function_ids: capability.function_ids,
+                })
+                .collect(),
+        }
+    }
+
+    fn evidence_source(
+        fn_id: &str,
+        kind: OrientationEvidenceSourceKind,
+        line_range: [u32; 2],
+    ) -> OrientationFunctionEvidenceSource {
+        OrientationFunctionEvidenceSource {
+            fn_id: fn_id.into(),
+            kind,
+            line_range,
+            symbol: fn_id.into(),
+        }
+    }
+
     fn backend_facts(roster_fn_ids: Vec<String>) -> OrientationBackendFacts {
         OrientationBackendFacts {
             schema_version: ORIENTATION_SCHEMA_VERSION,
@@ -1651,6 +2085,248 @@ mod tests {
         let mut supporting_flow = valid_role_batch(&["helper"]);
         supporting_flow.function_roles[0].flow_ids = vec!["request-flow".into()];
         assert!(validate_orientation_role_batch(&supporting_flow, &helper_spec, &frozen).is_err());
+    }
+
+    #[test]
+    fn function_evidence_binding_rewrites_ids_and_stably_binds_exact_spans() {
+        let mut skeleton = valid_skeleton();
+        skeleton.evidence[0].id = "model-z".into();
+        skeleton.evidence[1].id = "model-a".into();
+        skeleton.evidence[1].start_line = 2;
+        skeleton.evidence[1].end_line = 2;
+        skeleton.core_flows[0].steps[0].evidence_ids = vec!["model-z".into()];
+        skeleton.walkthrough.steps[0].evidence_ids = vec!["model-z".into()];
+        skeleton.invariants[0].evidence_ids = vec!["model-z".into()];
+        let sources = vec![
+            evidence_source("helper", OrientationEvidenceSourceKind::Exact, [4, 4]),
+            evidence_source(
+                "omitted",
+                OrientationEvidenceSourceKind::SignatureOnly,
+                [4, 4],
+            ),
+            evidence_source("fetch", OrientationEvidenceSourceKind::Exact, [1, 3]),
+        ];
+
+        let first = bind_exact_function_evidence(skeleton.clone(), &sources, "src/a.rs").unwrap();
+        let second = bind_exact_function_evidence(skeleton, &sources, "src/a.rs").unwrap();
+
+        assert_eq!(first, second, "the same backend facts must bind stably");
+        let (enriched, bindings) = first;
+        assert_eq!(
+            enriched
+                .evidence
+                .iter()
+                .map(|evidence| evidence.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["E1", "E2", "E3"]
+        );
+        assert_eq!(enriched.core_flows[0].steps[0].evidence_ids, vec!["E1"]);
+        assert_eq!(enriched.walkthrough.steps[0].evidence_ids, vec!["E1"]);
+        assert_eq!(enriched.invariants[0].evidence_ids, vec!["E1"]);
+        assert_eq!(bindings.by_fn_id.get("helper"), Some(&"E3".into()));
+        assert_eq!(bindings.by_fn_id.get("fetch"), Some(&"E1".into()));
+        assert!(!bindings.by_fn_id.contains_key("omitted"));
+        assert_eq!(
+            bindings
+                .evidence
+                .iter()
+                .map(|evidence| evidence.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["E3", "E1"]
+        );
+        validate_orientation_skeleton(&enriched, &validation_context(&roster())).unwrap();
+    }
+
+    #[test]
+    fn materialization_fills_empty_capability_evidence_and_final_card_validates() {
+        let sources = vec![
+            evidence_source("fetch", OrientationEvidenceSourceKind::Exact, [1, 3]),
+            evidence_source("helper", OrientationEvidenceSourceKind::Exact, [4, 4]),
+        ];
+        let (frozen, bindings) =
+            bind_exact_function_evidence(valid_skeleton(), &sources, "src/a.rs").unwrap();
+        let spec = role_batch_spec(0, &["fetch", "helper"]);
+
+        let batch = materialize_orientation_role_batch(
+            valid_role_batch_draft(&["fetch", "helper"]),
+            &spec,
+            &frozen,
+            &bindings,
+        )
+        .unwrap();
+
+        assert_eq!(batch.function_roles[0].evidence_ids, vec!["E1"]);
+        assert_eq!(batch.function_roles[1].evidence_ids, vec!["E2"]);
+        assert_eq!(batch.supporting_capabilities[0].evidence_ids, vec!["E2"]);
+        let roster = roster();
+        let card =
+            merge_orientation_card(frozen, vec![(spec, batch)], backend_facts(roster.clone()))
+                .unwrap();
+        card.validate(&validation_context(&roster)).unwrap();
+    }
+
+    #[test]
+    fn materialization_covers_every_capability_member_in_stable_order() {
+        let source = "fn fetch() {\n    send();\n}\nfn helper() {}\nfn helper_two() {}\n";
+        let mut draft = valid_role_batch_draft(&["fetch", "helper"]);
+        draft.function_roles.push(FunctionRoleDraft {
+            fn_id: "helper_two".into(),
+            lane: FunctionLane::Supporting,
+            flow_ids: Vec::new(),
+            stage: "utility".into(),
+            receives_from_actor_ids: vec!["worker".into()],
+            consumes: vec!["work".into()],
+            sends_to_actor_ids: vec!["worker".into()],
+            produces: vec!["prepared work".into()],
+            why: "Prepares a second local state.".into(),
+        });
+        draft.supporting_capabilities[0].function_ids =
+            vec!["helper_two".into(), "helper".into(), "helper_two".into()];
+        let sources = vec![
+            evidence_source("fetch", OrientationEvidenceSourceKind::Exact, [1, 3]),
+            evidence_source("helper", OrientationEvidenceSourceKind::Exact, [4, 4]),
+            evidence_source("helper_two", OrientationEvidenceSourceKind::Exact, [5, 5]),
+        ];
+        let (frozen, bindings) =
+            bind_exact_function_evidence(valid_skeleton(), &sources, "src/a.rs").unwrap();
+        let spec = role_batch_spec(0, &["fetch", "helper", "helper_two"]);
+
+        let batch = materialize_orientation_role_batch(draft, &spec, &frozen, &bindings).unwrap();
+
+        assert_eq!(
+            batch.supporting_capabilities[0].evidence_ids,
+            vec!["E3", "E2"]
+        );
+        let roster = vec!["fetch".into(), "helper".into(), "helper_two".into()];
+        let card =
+            merge_orientation_card(frozen, vec![(spec, batch)], backend_facts(roster.clone()))
+                .unwrap();
+        card.validate(&OrientationValidationContext {
+            file_path: "src/a.rs",
+            source,
+            roster_fn_ids: &roster,
+            roster_line_ranges: None,
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn role_batch_draft_rejects_model_owned_evidence_fields() {
+        let mut value = serde_json::to_value(valid_role_batch_draft(&["helper"])).unwrap();
+        value["functionRoles"][0]["evidenceIds"] = serde_json::json!(["E2"]);
+        assert!(serde_json::from_value::<OrientationRoleBatchDraft>(value).is_err());
+    }
+
+    #[test]
+    fn signature_only_roles_have_no_evidence_and_cannot_enter_capabilities() {
+        let mut skeleton = valid_skeleton();
+        skeleton.evidence.retain(|evidence| evidence.id == "E1");
+        let sources = vec![
+            evidence_source("fetch", OrientationEvidenceSourceKind::Exact, [1, 3]),
+            evidence_source(
+                "helper",
+                OrientationEvidenceSourceKind::SignatureOnly,
+                [4, 4],
+            ),
+        ];
+        let (frozen, bindings) =
+            bind_exact_function_evidence(skeleton, &sources, "src/a.rs").unwrap();
+        assert!(!bindings.by_fn_id.contains_key("helper"));
+        let spec = OrientationRoleBatchSpec {
+            index: 0,
+            fn_ids: vec!["fetch".into(), "helper".into()],
+            source_views: vec![
+                OrientationFunctionSourceView::Exact {
+                    fn_id: "fetch".into(),
+                    numbered_source: "1 | fn fetch() {}".into(),
+                },
+                OrientationFunctionSourceView::SignatureOnly {
+                    fn_id: "helper".into(),
+                    numbered_signature: "4 | fn helper()".into(),
+                },
+            ],
+        };
+        let mut draft = valid_role_batch_draft(&["fetch", "helper"]);
+        draft.supporting_capabilities.clear();
+
+        let batch =
+            materialize_orientation_role_batch(draft.clone(), &spec, &frozen, &bindings).unwrap();
+        assert_eq!(batch.function_roles[1].fn_id, "helper");
+        assert!(batch.function_roles[1].evidence_ids.is_empty());
+
+        let roster = roster();
+        let line_ranges = BTreeMap::from([
+            ("fetch".to_string(), [1, 3]),
+            ("helper".to_string(), [4, 4]),
+        ]);
+        let card = merge_orientation_card(
+            frozen.clone(),
+            vec![(spec.clone(), batch)],
+            OrientationBackendFacts {
+                schema_version: ORIENTATION_SCHEMA_VERSION,
+                orientation_id: "orientation-bounded".into(),
+                file_path: "src/a.rs".into(),
+                coverage: OrientationCoverage {
+                    mode: OrientationCoverageMode::BoundedSource,
+                    omitted_function_ids: vec!["helper".into()],
+                },
+                roster_fn_ids: roster.clone(),
+            },
+        )
+        .unwrap();
+        card.validate(&OrientationValidationContext {
+            file_path: "src/a.rs",
+            source: validation_source(),
+            roster_fn_ids: &roster,
+            roster_line_ranges: Some(&line_ranges),
+        })
+        .unwrap();
+
+        draft
+            .supporting_capabilities
+            .push(SupportingCapabilityDraft {
+                name: "Signature helper".into(),
+                why: "Groups a helper without visible source.".into(),
+                function_ids: vec!["helper".into()],
+            });
+        assert!(materialize_orientation_role_batch(draft, &spec, &frozen, &bindings).is_err());
+    }
+
+    #[test]
+    fn materialization_rejects_core_out_of_batch_and_missing_bindings() {
+        let sources = vec![
+            evidence_source("fetch", OrientationEvidenceSourceKind::Exact, [1, 3]),
+            evidence_source("helper", OrientationEvidenceSourceKind::Exact, [4, 4]),
+        ];
+        let (frozen, bindings) =
+            bind_exact_function_evidence(valid_skeleton(), &sources, "src/a.rs").unwrap();
+        let spec = role_batch_spec(0, &["fetch", "helper"]);
+
+        let mut core = valid_role_batch_draft(&["fetch", "helper"]);
+        core.supporting_capabilities[0].function_ids = vec!["fetch".into()];
+        assert!(materialize_orientation_role_batch(core, &spec, &frozen, &bindings).is_err());
+
+        let mut outside = valid_role_batch_draft(&["fetch", "helper"]);
+        outside.supporting_capabilities[0].function_ids = vec!["unknown".into()];
+        assert!(materialize_orientation_role_batch(outside, &spec, &frozen, &bindings).is_err());
+
+        let helper_spec = role_batch_spec(1, &["helper"]);
+        let mut out_of_batch = valid_role_batch_draft(&["helper"]);
+        out_of_batch.supporting_capabilities[0].function_ids = vec!["fetch".into()];
+        assert!(
+            materialize_orientation_role_batch(out_of_batch, &helper_spec, &frozen, &bindings,)
+                .is_err()
+        );
+
+        let mut missing = bindings;
+        missing.by_fn_id.remove("helper");
+        assert!(materialize_orientation_role_batch(
+            valid_role_batch_draft(&["fetch", "helper"]),
+            &spec,
+            &frozen,
+            &missing,
+        )
+        .is_err());
     }
 
     #[test]
