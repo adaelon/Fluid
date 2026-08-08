@@ -1086,7 +1086,6 @@ pub fn build_orientation_role_batch_prompt(
 
 /// Build the single allowed stage-B correction request without widening either
 /// the frozen coordinate set or the original batch boundary.
-#[allow(dead_code)] // S-ORI2-4 will connect correction after validation failure.
 pub fn build_orientation_role_batch_correction_prompt(
     frozen: &OrientationSkeleton,
     spec: &OrientationRoleBatchSpec,

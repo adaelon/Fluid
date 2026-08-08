@@ -14,7 +14,7 @@ use std::path::{Component, Path};
 use serde::{Deserialize, Serialize};
 
 pub const ORIENTATION_SCHEMA_VERSION: u32 = 1;
-pub const ORIENTATION_PROMPT_VERSION: &str = "orientation-p3";
+pub const ORIENTATION_PROMPT_VERSION: &str = "orientation-p4";
 pub const ORIENTATION_ROLE_BATCH_SIZE: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

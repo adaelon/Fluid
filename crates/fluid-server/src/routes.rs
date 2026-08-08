@@ -35,7 +35,8 @@ use crate::context_assembler::{
     assemble_gen_context, build_bounded_orientation_role_batch_specs,
     build_bounded_orientation_skeleton_prompt, build_explain_decl_prompt,
     build_explain_line_prompt, build_file_set_query_prompt, build_file_set_query_prompt_with_map,
-    build_full_orientation_role_batch_specs, build_gen_prompt, build_orientation_role_batch_prompt,
+    build_full_orientation_role_batch_specs, build_gen_prompt,
+    build_orientation_role_batch_correction_prompt, build_orientation_role_batch_prompt,
     build_orientation_skeleton_prompt, build_orientation_source_planning_prompt,
     build_query_prompt, build_query_prompt_with_map, build_query_source_planning_prompt,
     build_selection_explanation_prompt, build_selection_private_context,
@@ -967,23 +968,66 @@ where
                 return;
             }
         };
-        let batch = match parse_orientation_role_batch(&content) {
+        let first_attempt = match parse_orientation_role_batch(&content) {
+            Ok(batch) => match validate_orientation_role_batch(&batch, &spec, &skeleton) {
+                Ok(()) => Ok(batch),
+                Err(error) => Err(format!("validation error: {error}")),
+            },
+            Err(error) => Err(format!("parse error: {error}")),
+        };
+        let batch = match first_attempt {
             Ok(batch) => batch,
-            Err(error) => {
-                emit(orientation_error(format!(
-                    "orientation role batch {} parse error: {error}",
-                    spec.index + 1
-                )));
-                return;
+            Err(first_error) => {
+                eprintln!(
+                    "[orient] role batch {}/{} {} — correcting protocol error ({})",
+                    spec.index + 1,
+                    batch_count,
+                    work.file_path,
+                    work.llm.model
+                );
+                let (correction_system, correction_user) =
+                    build_orientation_role_batch_correction_prompt(
+                        &skeleton,
+                        &spec,
+                        &content,
+                        &first_error,
+                    );
+                let corrected_content = match work
+                    .llm
+                    .complete(&correction_system, &correction_user)
+                    .await
+                {
+                    Ok(content) => content,
+                    Err(error) => {
+                        emit(orientation_error(format!(
+                            "orientation role batch {} correction LLM error: {error}",
+                            spec.index + 1
+                        )));
+                        return;
+                    }
+                };
+                let corrected_batch = match parse_orientation_role_batch(&corrected_content) {
+                    Ok(batch) => batch,
+                    Err(error) => {
+                        emit(orientation_error(format!(
+                            "orientation role batch {} correction parse error: {error}",
+                            spec.index + 1
+                        )));
+                        return;
+                    }
+                };
+                if let Err(error) =
+                    validate_orientation_role_batch(&corrected_batch, &spec, &skeleton)
+                {
+                    emit(orientation_error(format!(
+                        "orientation role batch {} correction validation error: {error}",
+                        spec.index + 1
+                    )));
+                    return;
+                }
+                corrected_batch
             }
         };
-        if let Err(error) = validate_orientation_role_batch(&batch, &spec, &skeleton) {
-            emit(orientation_error(format!(
-                "orientation role batch {} validation error: {error}",
-                spec.index + 1
-            )));
-            return;
-        }
         role_batches.push((spec, batch));
     }
 
@@ -4857,6 +4901,228 @@ mod tests {
         assert!(!first_batch.contains("f8#9"));
         assert!(second_batch.contains("f8#9"));
         assert!(!second_batch.contains("f7#8"));
+    }
+
+    #[tokio::test]
+    async fn orientation_websocket_role_batch_parse_or_validation_failure_corrects_once() {
+        let mut invalid_reference = orientation_role_batch_json(&orientation_card_json());
+        invalid_reference["functionRoles"][0]["flowIds"] = serde_json::json!(["missing-flow"]);
+        let cases = [
+            ("parse", "not-json".to_string(), "not-json"),
+            ("validation", invalid_reference.to_string(), "missing-flow"),
+        ];
+
+        for (case, invalid_output, invalid_marker) in cases {
+            let tmp = TmpDir::new();
+            std::fs::write(tmp.path().join("a.rs"), orientation_source()).unwrap();
+            let card = orientation_card_json();
+            let mock = start_orientation_sequence_mock(vec![
+                (
+                    StatusCode::OK,
+                    orientation_skeleton_json(&card).to_string(),
+                    Duration::ZERO,
+                ),
+                (StatusCode::OK, invalid_output, Duration::ZERO),
+                (
+                    StatusCode::OK,
+                    orientation_role_batch_json(&card).to_string(),
+                    Duration::ZERO,
+                ),
+            ])
+            .await;
+            let app = start_orientation_app(orientation_state(tmp.path(), &mock)).await;
+
+            let frames = orientation_ws_frames(&app, orientation_request_json()).await;
+            assert_eq!(
+                frame_kinds(&frames),
+                vec!["status", "status", "card", "done"],
+                "{case}"
+            );
+            let hit = orientation_ws_frames(&app, orientation_request_json()).await;
+            assert_eq!(
+                frame_kinds(&hit),
+                vec!["cache-hit", "card", "done"],
+                "{case}"
+            );
+
+            let requests = mock.requests.lock().unwrap();
+            assert_eq!(requests.len(), 3, "{case}");
+            assert_eq!(requests[1]["messages"][0], requests[2]["messages"][0]);
+            let correction_user = requests[2]
+                .pointer("/messages/1/content")
+                .and_then(serde_json::Value::as_str)
+                .unwrap();
+            assert!(correction_user.contains("上次无效输出"), "{case}");
+            assert!(correction_user.contains("确定性校验错误"), "{case}");
+            assert!(correction_user.contains(invalid_marker), "{case}");
+            assert!(correction_user.contains("冻结定向骨架"), "{case}");
+            assert!(correction_user.contains("当前批次边界"), "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn orientation_websocket_correction_rejects_out_of_batch_and_frozen_ids() {
+        let card = orientation_card_json();
+        let mut out_of_batch = orientation_role_batch_json(&card);
+        out_of_batch["functionRoles"][0]["fnId"] = serde_json::json!("ghost#404");
+        let mut out_of_frozen = orientation_role_batch_json(&card);
+        out_of_frozen["functionRoles"][0]["flowIds"] = serde_json::json!(["ghost-flow"]);
+
+        for (case, corrected_output) in [
+            ("out-of-batch", out_of_batch.to_string()),
+            ("out-of-frozen", out_of_frozen.to_string()),
+        ] {
+            let tmp = TmpDir::new();
+            std::fs::write(tmp.path().join("a.rs"), orientation_source()).unwrap();
+            let mock = start_orientation_sequence_mock(vec![
+                (
+                    StatusCode::OK,
+                    orientation_skeleton_json(&card).to_string(),
+                    Duration::ZERO,
+                ),
+                (StatusCode::OK, "not-json".to_string(), Duration::ZERO),
+                (StatusCode::OK, corrected_output, Duration::ZERO),
+            ])
+            .await;
+            let app = start_orientation_app(orientation_state(tmp.path(), &mock)).await;
+
+            let frames = orientation_ws_frames(&app, orientation_request_json()).await;
+            assert_eq!(frames.last().unwrap()["kind"], "error", "{case}");
+            assert!(
+                frames.last().unwrap()["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("correction validation error"),
+                "{case}: {frames:?}"
+            );
+            assert!(!frames.iter().any(|frame| frame["kind"] == "card"));
+            assert!(!frames.iter().any(|frame| frame["kind"] == "done"));
+            assert_eq!(mock.requests.lock().unwrap().len(), 3, "{case}");
+            assert!(!tmp.path().join(".fluid").join("orientations").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn orientation_websocket_failed_correction_new_request_restarts_from_skeleton() {
+        let tmp = TmpDir::new();
+        std::fs::write(tmp.path().join("a.rs"), orientation_source()).unwrap();
+        let card = orientation_card_json();
+        let mock = start_orientation_sequence_mock(vec![
+            (
+                StatusCode::OK,
+                orientation_skeleton_json(&card).to_string(),
+                Duration::ZERO,
+            ),
+            (StatusCode::OK, "not-json".to_string(), Duration::ZERO),
+            (StatusCode::OK, "still-not-json".to_string(), Duration::ZERO),
+            (
+                StatusCode::OK,
+                orientation_skeleton_json(&card).to_string(),
+                Duration::ZERO,
+            ),
+            (
+                StatusCode::OK,
+                orientation_role_batch_json(&card).to_string(),
+                Duration::ZERO,
+            ),
+        ])
+        .await;
+        let app = start_orientation_app(orientation_state(tmp.path(), &mock)).await;
+
+        let failed = orientation_ws_frames(&app, orientation_request_json()).await;
+        assert_eq!(failed.last().unwrap()["kind"], "error");
+        assert!(!failed.iter().any(|frame| frame["kind"] == "card"));
+        assert!(!failed.iter().any(|frame| frame["kind"] == "done"));
+        assert!(!tmp.path().join(".fluid").join("orientations").exists());
+
+        let retried = orientation_ws_frames(&app, orientation_request_json()).await;
+        assert_eq!(retried.last().unwrap()["kind"], "done");
+        let requests = mock.requests.lock().unwrap();
+        assert_eq!(requests.len(), 5);
+        assert_eq!(requests[0]["messages"], requests[3]["messages"]);
+        let first_role_user = requests[1]
+            .pointer("/messages/1/content")
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        let retried_role_user = requests[4]
+            .pointer("/messages/1/content")
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        assert_eq!(first_role_user, retried_role_user);
+        assert!(!retried_role_user.contains("上次无效输出"));
+    }
+
+    #[tokio::test]
+    async fn orientation_websocket_role_batch_provider_failure_is_not_corrected() {
+        let tmp = TmpDir::new();
+        std::fs::write(tmp.path().join("a.rs"), orientation_source()).unwrap();
+        let card = orientation_card_json();
+        let mock = start_orientation_sequence_mock(vec![
+            (
+                StatusCode::OK,
+                orientation_skeleton_json(&card).to_string(),
+                Duration::ZERO,
+            ),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "role provider unavailable".to_string(),
+                Duration::ZERO,
+            ),
+        ])
+        .await;
+        let app = start_orientation_app(orientation_state(tmp.path(), &mock)).await;
+
+        let frames = orientation_ws_frames(&app, orientation_request_json()).await;
+        assert_eq!(frames.last().unwrap()["kind"], "error");
+        assert!(frames.last().unwrap()["message"]
+            .as_str()
+            .unwrap()
+            .contains("role batch 1 LLM error"));
+        assert_eq!(mock.requests.lock().unwrap().len(), 2);
+        assert!(!tmp.path().join(".fluid").join("orientations").exists());
+    }
+
+    #[tokio::test]
+    async fn orientation_websocket_correction_does_not_rerun_successful_batches() {
+        let tmp = TmpDir::new();
+        std::fs::write(tmp.path().join("batched.rs"), batched_orientation_source()).unwrap();
+        let mock = start_orientation_sequence_mock(vec![
+            (
+                StatusCode::OK,
+                batched_orientation_skeleton_json().to_string(),
+                Duration::ZERO,
+            ),
+            (
+                StatusCode::OK,
+                batched_orientation_role_json(0, 8).to_string(),
+                Duration::ZERO,
+            ),
+            (StatusCode::OK, "not-json".to_string(), Duration::ZERO),
+            (
+                StatusCode::OK,
+                batched_orientation_role_json(8, 9).to_string(),
+                Duration::ZERO,
+            ),
+        ])
+        .await;
+        let app = start_orientation_app(orientation_state(tmp.path(), &mock)).await;
+
+        let frames = orientation_ws_frames(&app, batched_orientation_request_json()).await;
+        assert_eq!(frames.last().unwrap()["kind"], "done");
+        let requests = mock.requests.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        let first_batch_user = requests[1]
+            .pointer("/messages/1/content")
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        assert!(first_batch_user.contains("f0#1"));
+        assert!(first_batch_user.contains("f7#8"));
+        let correction_user = requests[3]
+            .pointer("/messages/1/content")
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        assert!(correction_user.contains("f8#9"));
+        assert!(!correction_user.contains("f7#8"));
     }
 
     #[tokio::test]
