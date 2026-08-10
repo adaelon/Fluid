@@ -14,8 +14,9 @@ const props = defineProps<{
   queryOpen: boolean
 }>()
 
-// The query terminal is hidden by default; this bar carries the only affordance
-// to open it, handing the bottom space back to the code area until asked for.
+// The query terminal is hidden by default. StatusBar remains the placement-
+// agnostic show/hide affordance; opening here chooses the dock, while ActivityBar
+// explicitly chooses the sidebar.
 const emit = defineEmits<{ toggleQuery: []; toggleGeneration: [] }>()
 
 const progressText = computed(() => {
@@ -39,7 +40,8 @@ const progressText = computed(() => {
         :class="{ active: queryOpen }"
         type="button"
         :disabled="!path"
-        :title="path ? '追问当前文件' : '打开文件以启用追问'"
+        :title="!path ? '打开文件以启用追问' : queryOpen ? '隐藏追问器' : '在底栏显示追问器'"
+        :aria-label="!path ? '打开文件以启用追问' : queryOpen ? '隐藏追问器' : '在底栏显示追问器'"
         @click="emit('toggleQuery')"
       >
         <svg

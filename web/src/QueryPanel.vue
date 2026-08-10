@@ -86,6 +86,8 @@ const emit = defineEmits<{
   restoreScope: [QueryScopeSpec]
   maximize: []
   restore: []
+  moveSidebar: []
+  moveDock: []
 }>()
 
 const workspace = props.workspace
@@ -107,6 +109,8 @@ const {
 } = workspace
 const renderedEl = ref<HTMLElement | null>(null)
 const codePeekTarget = ref<CodeEvidenceRef | null>(null)
+type QuerySidebarPane = 'history' | 'thread'
+const querySidebarPane = ref<QuerySidebarPane>('history')
 const codePeekViewportWidth = ref(window.innerWidth)
 let codePeekPreferredWidth = loadCodePeekWidth(
   localStorage.getItem(QUERY_PEEK_STORAGE_KEY),
@@ -506,26 +510,41 @@ function selectTurnFromPicker(event: Event): void {
 
 function newTrace() {
   resetTrace()
+  querySidebarPane.value = 'thread'
 }
 
-async function selectHistoryFromPicker(event: Event): Promise<void> {
-  const nextThreadId = (event.currentTarget as HTMLSelectElement).value
+async function selectHistory(nextThreadId: string): Promise<void> {
   if (!nextThreadId) {
     newTrace()
+    return
+  }
+  if (selectedThread.value?.id === nextThreadId) {
+    querySidebarPane.value = 'thread'
     return
   }
   closeCodePeek()
   const result = await workspace.selectHistoryThread(nextThreadId)
   if (result.kind === 'selected') {
     await renderTraceAnswers(result.turns, result.snapshots)
+    querySidebarPane.value = 'thread'
   }
+}
+
+async function selectHistoryFromPicker(event: Event): Promise<void> {
+  await selectHistory((event.currentTarget as HTMLSelectElement).value)
+}
+
+async function selectSidebarHistory(threadId: string): Promise<void> {
+  await selectHistory(threadId)
 }
 
 async function deleteSelectedHistory(): Promise<void> {
   const selectedId = selectedThread.value?.id
   if (!selectedId) return
   closeCodePeek()
-  await workspace.deleteHistoryThread(selectedId)
+  if (await workspace.deleteHistoryThread(selectedId)) {
+    querySidebarPane.value = 'history'
+  }
 }
 
 async function forkSelectedHistory(): Promise<void> {
@@ -637,6 +656,12 @@ watch(
       codePeekResize = null
       codePeekDragging.value = false
       closeCodePeek()
+      if (
+        presentation === 'sidebar'
+        && (selectedThread.value || trace.value || activeQuestion.value || question.value)
+      ) {
+        querySidebarPane.value = 'thread'
+      }
     }
   },
 )
@@ -664,6 +689,7 @@ onBeforeUnmount(() => {
     class="query-panel"
     :class="{
       disabled: !path,
+      sidebar: presentation === 'sidebar',
       focus: presentation === 'focus',
       'peek-open': presentation === 'focus' && codePeekTarget,
       'peek-dragging': codePeekDragging,
@@ -672,7 +698,21 @@ onBeforeUnmount(() => {
     data-testid="query-panel"
   >
     <header class="query-head">
-      <div class="query-head-left">
+      <div v-if="presentation === 'sidebar'" class="query-head-left query-sidebar-head-left">
+        <button
+          v-if="querySidebarPane === 'thread'"
+          class="query-sidebar-back"
+          type="button"
+          aria-label="返回项目追问历史"
+          @click="querySidebarPane = 'history'"
+        >
+          ←
+        </button>
+        <span class="query-title">
+          {{ querySidebarPane === 'history' ? '追问器 · 项目历史' : '追问器 · 线程详情' }}
+        </span>
+      </div>
+      <div v-else class="query-head-left">
         <span class="query-title">
           追问器{{ path ? '' : ' · 未激活' }}{{ presentation === 'focus' ? ' · 专注' : '' }}
         </span>
@@ -720,83 +760,147 @@ onBeforeUnmount(() => {
         </label>
       </div>
       <div class="query-head-actions">
-        <button
-          class="query-tool"
-          type="button"
-          :disabled="!trace && !streaming && !errorMsg"
-          @click="newTrace"
-        >
-          新追问
-        </button>
-        <button
-          class="query-tool query-history-delete"
-          type="button"
-          :disabled="!selectedThread || Boolean(historySelectingId) || Boolean(historyForkingId)"
-          @click="deleteSelectedHistory"
-        >
-          删除
-        </button>
-        <button
-          class="query-tool"
-          :class="{ active: selectionMode }"
-          type="button"
-          :aria-pressed="selectionMode"
-          @click="emit('toggleSelectionMode')"
-        >
-          选择文件
-        </button>
-        <button
-          class="query-tool"
-          type="button"
-          :disabled="selectedCount === 0"
-          @click="emit('clearSelected')"
-        >
-          清空
-        </button>
-        <button
-          v-if="presentation === 'dock'"
-          class="query-presentation-toggle"
-          type="button"
-          title="进入追问专注模式"
-          aria-label="进入追问专注模式"
-          @click="emit('maximize')"
-        >
-          <svg
-            width="13"
-            height="13"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="2"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-            aria-hidden="true"
+        <template v-if="presentation === 'sidebar'">
+          <button
+            class="query-presentation-toggle"
+            type="button"
+            title="移到底栏"
+            aria-label="将追问器移到底栏"
+            @click="emit('moveDock')"
           >
-            <path d="M8 3H3v5M16 3h5v5M8 21H3v-5M16 21h5v-5" />
-          </svg>
-        </button>
-        <button
-          v-else
-          class="query-presentation-toggle"
-          type="button"
-          title="还原追问 dock"
-          aria-label="还原追问 dock"
-          @click="emit('restore')"
-        >
-          <svg
-            width="13"
-            height="13"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="2"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-            aria-hidden="true"
+            <svg
+              width="13"
+              height="13"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              aria-hidden="true"
+            >
+              <path d="M4 5h16v14H4zM4 14h16" />
+            </svg>
+          </button>
+          <button
+            class="query-presentation-toggle"
+            type="button"
+            title="进入追问专注模式"
+            aria-label="进入追问专注模式"
+            @click="emit('maximize')"
           >
-            <path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5" />
-          </svg>
-        </button>
+            <svg
+              width="13"
+              height="13"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              aria-hidden="true"
+            >
+              <path d="M8 3H3v5M16 3h5v5M8 21H3v-5M16 21h5v-5" />
+            </svg>
+          </button>
+        </template>
+        <template v-else>
+          <button
+            class="query-tool"
+            type="button"
+            :disabled="!trace && !streaming && !errorMsg"
+            @click="newTrace"
+          >
+            新追问
+          </button>
+          <button
+            class="query-tool query-history-delete"
+            type="button"
+            :disabled="!selectedThread || Boolean(historySelectingId) || Boolean(historyForkingId)"
+            @click="deleteSelectedHistory"
+          >
+            删除
+          </button>
+          <button
+            class="query-tool"
+            :class="{ active: selectionMode }"
+            type="button"
+            :aria-pressed="selectionMode"
+            @click="emit('toggleSelectionMode')"
+          >
+            选择文件
+          </button>
+          <button
+            class="query-tool"
+            type="button"
+            :disabled="selectedCount === 0"
+            @click="emit('clearSelected')"
+          >
+            清空
+          </button>
+          <button
+            v-if="presentation === 'dock'"
+            class="query-presentation-toggle"
+            type="button"
+            title="移到左栏"
+            aria-label="将追问器移到左栏"
+            @click="emit('moveSidebar')"
+          >
+            <svg
+              width="13"
+              height="13"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              aria-hidden="true"
+            >
+              <path d="M4 5h16v14H4zM10 5v14" />
+            </svg>
+          </button>
+          <button
+            v-if="presentation === 'dock'"
+            class="query-presentation-toggle"
+            type="button"
+            title="进入追问专注模式"
+            aria-label="进入追问专注模式"
+            @click="emit('maximize')"
+          >
+            <svg
+              width="13"
+              height="13"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              aria-hidden="true"
+            >
+              <path d="M8 3H3v5M16 3h5v5M8 21H3v-5M16 21h5v-5" />
+            </svg>
+          </button>
+          <button
+            v-else
+            class="query-presentation-toggle"
+            type="button"
+            title="还原追问器"
+            aria-label="还原追问器"
+            @click="emit('restore')"
+          >
+            <svg
+              width="13"
+              height="13"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              aria-hidden="true"
+            >
+              <path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5" />
+            </svg>
+          </button>
+        </template>
         <button
           class="query-collapse"
           type="button"
@@ -830,6 +934,109 @@ onBeforeUnmount(() => {
         {{ historyWarnings.length }} 条历史记录无法读取；其余线程仍可使用。
       </span>
     </div>
+    <section
+      v-if="presentation === 'sidebar' && querySidebarPane === 'history'"
+      class="query-sidebar-history"
+      data-testid="query-sidebar-history"
+      aria-label="项目追问历史"
+    >
+      <div class="query-sidebar-history-head">
+        <div>
+          <strong>项目历史</strong>
+          <span>{{ historySummaries.length }} 个线程</span>
+        </div>
+        <button class="query-tool" type="button" @click="newTrace">新追问</button>
+      </div>
+      <div class="query-sidebar-history-list">
+        <p v-if="historyLoading" class="query-hint">正在加载项目历史…</p>
+        <p v-else-if="historySummaries.length === 0" class="query-hint">
+          还没有追问线程。新追问会保存在当前项目中。
+        </p>
+        <template v-else>
+          <button
+            v-for="item in historySummaries"
+            :key="item.id"
+            class="query-sidebar-history-item"
+            :class="{ selected: selectedThread?.id === item.id }"
+            type="button"
+            :disabled="Boolean(historySelectingId) || Boolean(historyForkingId)"
+            @click="selectSidebarHistory(item.id)"
+          >
+            <span class="query-sidebar-history-title">{{ item.title }}</span>
+            <span class="query-sidebar-history-meta">
+              {{ item.turnCount }} 轮 · {{ historyScopeLabel(item.scope) }}
+            </span>
+            <span
+              class="query-sidebar-history-freshness"
+              :class="{ stale: item.freshness === 'stale' }"
+            >
+              {{
+                historySelectingId === item.id
+                  ? '读取中…'
+                  : item.freshness === 'fresh'
+                    ? '源码一致'
+                    : item.staleReason === 'source-missing'
+                      ? '范围文件缺失 · 只读'
+                      : '源码已变更 · 只读'
+              }}
+            </span>
+          </button>
+        </template>
+      </div>
+    </section>
+    <template v-if="presentation !== 'sidebar' || querySidebarPane === 'thread'">
+      <div v-if="presentation === 'sidebar'" class="query-sidebar-controls">
+        <div class="query-scope" role="tablist" aria-label="追问范围">
+          <button
+            class="query-scope-btn"
+            :class="{ active: scope === 'current' }"
+            type="button"
+            role="tab"
+            :aria-selected="scope === 'current'"
+            @click="scope = 'current'"
+          >
+            当前文件
+          </button>
+          <button
+            class="query-scope-btn"
+            :class="{ active: scope === 'selected' }"
+            type="button"
+            role="tab"
+            :aria-selected="scope === 'selected'"
+            @click="scope = 'selected'"
+          >
+            {{ selectedLabel }}
+          </button>
+        </div>
+        <div class="query-sidebar-thread-actions">
+          <button class="query-tool" type="button" @click="newTrace">新追问</button>
+          <button
+            class="query-tool query-history-delete"
+            type="button"
+            :disabled="!selectedThread || Boolean(historySelectingId) || Boolean(historyForkingId)"
+            @click="deleteSelectedHistory"
+          >
+            删除
+          </button>
+          <button
+            class="query-tool"
+            :class="{ active: selectionMode }"
+            type="button"
+            :aria-pressed="selectionMode"
+            @click="emit('toggleSelectionMode')"
+          >
+            选文件
+          </button>
+          <button
+            class="query-tool"
+            type="button"
+            :disabled="selectedCount === 0"
+            @click="emit('clearSelected')"
+          >
+            清空
+          </button>
+        </div>
+      </div>
     <div v-if="selectedThread" class="query-history-current">
       <span class="query-history-current-title">{{ selectedThread.title }}</span>
       <span class="query-history-current-meta">
@@ -1255,6 +1462,7 @@ onBeforeUnmount(() => {
           {{ streaming ? '…' : '追问' }}
         </button>
       </form>
+    </template>
     </template>
   </section>
 </template>

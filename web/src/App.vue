@@ -33,7 +33,9 @@ import {
   loadQueryDockHeight,
   queryDockHeightBounds,
   queryDockHeightFromPointer,
-  type QueryPresentation,
+  initialQueryWorkspaceLayout,
+  reduceQueryWorkspaceLayout,
+  type QueryLayoutAction,
 } from './queryLayout'
 import { createQueryWorkspace } from './queryWorkspace'
 
@@ -196,14 +198,20 @@ watch(
   },
 )
 
-// The follow-up query panel is hidden by default — the bottom space goes back to
-// the code area until the user opens it from the status-bar 「💬 追问」 toggle
-// (S10b dock revision). Sticky across file switches; auto-hidden when no file.
-const queryPanelOpen = ref(false)
-const queryPresentation = ref<QueryPresentation>('dock')
+// S-QLEFT-1: App owns only the presentation state for one long-lived QueryPanel.
+// The project-scoped controller below remains the owner of history, draft and
+// stream identity while this reducer moves the surface between sidebar/dock/focus.
+const queryLayoutState = ref(initialQueryWorkspaceLayout())
+const queryPanelOpen = computed(() => queryLayoutState.value.visible)
+const queryPresentation = computed(() => queryLayoutState.value.placement)
+const sidebarView = computed(() => queryLayoutState.value.sidebarView)
 const queryFocusActive = computed(
   () => queryPanelOpen.value && Boolean(current.value) && queryPresentation.value === 'focus',
 )
+
+function transitionQueryLayout(type: QueryLayoutAction['type']): void {
+  queryLayoutState.value = reduceQueryWorkspaceLayout(queryLayoutState.value, { type })
+}
 
 interface QueryPanelHandle {
   handleEscape(): boolean
@@ -308,31 +316,43 @@ function resizeQueryDockForViewport(): void {
 
 function maximizeQueryPanel(): void {
   if (!queryPanelOpen.value || !current.value) return
-  queryPresentation.value = 'focus'
+  transitionQueryLayout('focus')
 }
 
-function restoreQueryDock(): void {
-  queryPresentation.value = 'dock'
+function restoreQueryPlacement(): void {
+  transitionQueryLayout('restore-focus')
 }
 
 function closeQueryPanel(): void {
-  queryWorkspace.resetForClose()
-  queryPresentation.value = 'dock'
-  queryPanelOpen.value = false
+  transitionQueryLayout('close')
 }
 
 function toggleQueryPanel(): void {
-  if (queryPanelOpen.value) closeQueryPanel()
-  else {
-    queryPresentation.value = 'dock'
-    queryPanelOpen.value = true
-  }
+  if (!current.value && !queryPanelOpen.value) return
+  transitionQueryLayout('status-toggle')
+}
+
+function toggleExplorerSidebar(): void {
+  transitionQueryLayout('activity-explorer')
+}
+
+function toggleQuerySidebar(): void {
+  if (!current.value) return
+  transitionQueryLayout('activity-query')
+}
+
+function moveQuerySidebar(): void {
+  transitionQueryLayout('move-sidebar')
+}
+
+function moveQueryDock(): void {
+  transitionQueryLayout('move-dock')
 }
 
 watch(
   () => current.value,
   (file) => {
-    if (!file) closeQueryPanel()
+    if (!file && queryPanelOpen.value) closeQueryPanel()
   },
 )
 
@@ -396,7 +416,7 @@ function onGlobalKey(e: KeyboardEvent) {
     e.preventDefault()
     e.stopImmediatePropagation()
     if (queryPanelComponent.value?.handleEscape()) return
-    restoreQueryDock()
+    transitionQueryLayout('escape')
     return
   }
 
@@ -612,8 +632,20 @@ function closeTab(path: string) {
       :aria-hidden="queryFocusActive ? 'true' : undefined"
       :inert="queryFocusActive"
     >
-      <ActivityBar @open-settings="settingsOpen = true" />
-      <aside class="sidebar" :style="{ width: sidebarWidth + 'px' }">
+      <ActivityBar
+        :sidebar-view="sidebarView"
+        :query-enabled="Boolean(current)"
+        @toggle-explorer="toggleExplorerSidebar"
+        @toggle-query="toggleQuerySidebar"
+        @open-settings="settingsOpen = true"
+      />
+      <aside
+        v-if="sidebarView !== 'hidden'"
+        class="sidebar"
+        :class="{ 'query-sidebar-slot': sidebarView === 'query' }"
+        :style="{ width: sidebarWidth + 'px' }"
+      >
+        <template v-if="sidebarView === 'explorer'">
         <div class="sidebar-title">资源管理器</div>
         <button class="open-folder-pick" :disabled="switching" @click="chooseFolder">
           {{ switching ? '打开中…' : '打开文件夹…' }}
@@ -638,8 +670,10 @@ function closeTab(path: string) {
           @select="open"
           @toggle-selected="toggleSelectedFile"
         />
+        </template>
       </aside>
       <div
+        v-if="sidebarView !== 'hidden'"
         class="resizer"
         @pointerdown="startResize"
         @pointermove="onResize"
@@ -695,14 +729,21 @@ function closeTab(path: string) {
       </main>
     </div>
     <div
-      v-if="queryPanelOpen && current"
+      v-show="queryPanelOpen && current"
       class="query-surface"
       :class="{
+        'query-sidebar': queryPresentation === 'sidebar',
         'query-dock': queryPresentation === 'dock',
         'query-focus-shell': queryPresentation === 'focus',
         dragging: queryPresentation === 'dock' && queryDockDragging,
       }"
-      :style="queryPresentation === 'dock' ? { height: queryDockHeight + 'px' } : undefined"
+      :style="
+        queryPresentation === 'dock'
+          ? { height: queryDockHeight + 'px' }
+          : queryPresentation === 'sidebar'
+            ? { width: sidebarWidth + 'px' }
+            : undefined
+      "
     >
       <div
         v-show="queryPresentation === 'dock'"
@@ -722,7 +763,7 @@ function closeTab(path: string) {
       <QueryPanel
         ref="queryPanelComponent"
         :workspace="queryWorkspace"
-        :path="current.path"
+        :path="current?.path ?? null"
         :ctx="queryCtx"
         :selection-mode="fileSelectionMode"
         :selected-count="selectedFileCount"
@@ -731,7 +772,9 @@ function closeTab(path: string) {
         :presentation="queryPresentation"
         @close="closeQueryPanel"
         @maximize="maximizeQueryPanel"
-        @restore="restoreQueryDock"
+        @restore="restoreQueryPlacement"
+        @move-sidebar="moveQuerySidebar"
+        @move-dock="moveQueryDock"
         @toggle-selection-mode="fileSelectionMode = !fileSelectionMode"
         @clear-selected="clearSelectedFiles"
         @open-evidence="openCodeEvidence"

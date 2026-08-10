@@ -108,6 +108,8 @@ body {
 
 /* — Activity bar: left vertical icon strip — */
 .activity-bar {
+  position: relative;
+  z-index: 12;
   width: 48px;
   flex: none;
   background: var(--bg);
@@ -132,6 +134,11 @@ body {
 .activity-item:hover {
   color: var(--text);
 }
+.activity-item:disabled {
+  color: var(--muted);
+  cursor: default;
+  opacity: 0.35;
+}
 .activity-item.active {
   color: var(--text);
   border-left-color: var(--accent);
@@ -144,6 +151,8 @@ body {
 
 /* — Resizer handle between sidebar and editor — */
 .resizer {
+  position: relative;
+  z-index: 11;
   width: 4px;
   flex: none;
   cursor: col-resize;
@@ -164,6 +173,11 @@ body {
   overflow: auto;
   padding: 8px 0;
   min-height: 0;
+}
+
+.query-sidebar-slot {
+  overflow: hidden;
+  padding: 0;
 }
 
 .sidebar-title {
@@ -1059,6 +1073,18 @@ body {
   background: var(--panel);
 }
 
+.query-sidebar {
+  position: absolute;
+  z-index: 10;
+  top: 0;
+  bottom: 24px;
+  left: 48px;
+  min-width: 0;
+  overflow: hidden;
+  border-right: 1px solid var(--border);
+  box-shadow: 2px 0 5px var(--shadow-chrome);
+}
+
 .query-dock {
   flex: none;
   box-shadow: 0 -2px 6px var(--shadow-chrome);
@@ -1114,6 +1140,48 @@ body {
 
 .query-panel.disabled {
   opacity: 0.7;
+}
+
+.query-panel.sidebar {
+  min-width: 0;
+  overflow-x: hidden;
+}
+
+.query-panel.sidebar .query-head {
+  min-height: 38px;
+  padding: 4px 6px 4px 8px;
+}
+
+.query-sidebar-head-left {
+  gap: 5px;
+  overflow: hidden;
+}
+
+.query-sidebar-head-left .query-title {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.query-sidebar-back {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  font: inherit;
+  cursor: pointer;
+}
+
+.query-sidebar-back:hover {
+  color: var(--text);
+  background: var(--hover);
 }
 
 .query-head {
@@ -1298,6 +1366,168 @@ body {
   opacity: 0.55;
 }
 
+.query-sidebar-history {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.query-sidebar-history-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 9px 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.query-sidebar-history-head > div {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.query-sidebar-history-head strong {
+  color: var(--text);
+  font-size: 12px;
+}
+
+.query-sidebar-history-head span {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.query-sidebar-history-list {
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  align-content: start;
+  gap: 5px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding: 8px;
+}
+
+.query-sidebar-history-list > .query-hint {
+  margin: 6px 3px;
+  line-height: 1.5;
+}
+
+.query-sidebar-history-item {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+  padding: 8px;
+  color: var(--muted);
+  text-align: left;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.query-sidebar-history-item:hover:not(:disabled) {
+  color: var(--text);
+  background: var(--hover);
+}
+
+.query-sidebar-history-item.selected {
+  background: var(--active);
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+}
+
+.query-sidebar-history-item:disabled {
+  cursor: wait;
+  opacity: 0.68;
+}
+
+.query-sidebar-history-title,
+.query-sidebar-history-meta,
+.query-sidebar-history-freshness {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.query-sidebar-history-title {
+  display: -webkit-box;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.query-sidebar-history-meta,
+.query-sidebar-history-freshness {
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.query-sidebar-history-freshness {
+  color: var(--c-normal);
+}
+
+.query-sidebar-history-freshness.stale {
+  color: var(--c-branch);
+}
+
+.query-sidebar-controls {
+  flex: none;
+  display: grid;
+  gap: 6px;
+  padding: 7px 8px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+}
+
+.query-sidebar-controls .query-scope {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.query-sidebar-controls .query-scope-btn {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.query-sidebar-thread-actions {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 4px;
+}
+
+.query-sidebar-thread-actions .query-tool {
+  min-width: 0;
+  padding: 0 3px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.query-panel.sidebar .query-history-notice,
+.query-panel.sidebar .query-history-current {
+  align-items: flex-start;
+  flex-direction: column;
+  gap: 3px;
+  padding: 6px 8px;
+}
+
+.query-panel.sidebar .query-history-current-title,
+.query-panel.sidebar .query-history-current-meta,
+.query-panel.sidebar .query-history-stale,
+.query-panel.sidebar .query-history-waiting {
+  max-width: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
 .query-collapse,
 .query-presentation-toggle {
   display: inline-flex;
@@ -1346,6 +1576,48 @@ body {
 
 .query-answer-content {
   min-width: 0;
+}
+
+.query-panel.sidebar .query-content {
+  min-width: 0;
+}
+
+.query-panel.sidebar .query-answer {
+  min-width: 0;
+  padding: 8px;
+  overflow-x: hidden;
+}
+
+.query-panel.sidebar .query-map-lanes {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.query-panel.sidebar .query-map-head,
+.query-panel.sidebar .query-map-edge,
+.query-panel.sidebar .query-map-lanes p,
+.query-panel.sidebar .query-evidence-summary {
+  align-items: flex-start;
+  flex-direction: column;
+}
+
+.query-panel.sidebar .query-turn-question,
+.query-panel.sidebar .query-turn-answer {
+  grid-template-columns: minmax(0, 1fr);
+  gap: 3px;
+}
+
+.query-panel.sidebar .query-form {
+  min-width: 0;
+  padding: 7px 8px;
+}
+
+.query-panel.sidebar .query-input {
+  min-width: 0;
+}
+
+.query-panel.sidebar .query-send {
+  padding-right: 9px;
+  padding-left: 9px;
 }
 
 .query-panel.focus .query-head {
