@@ -2,7 +2,7 @@
 
 Fluid提供**只读**代码理解环境。在不修改源码任何字节的前提下,用 LLM 为你打开的每个文件生成人类可读的语义投影——函数摘要、逐行解释、可追问——帮你看懂代码每一行在做什么。
 
-> 状态:MVP 功能闭环;代码选区解释与共享联网检索、文件定向卡与源码证据化连续追问均已完成(见 `docs/切片方案-代码选区解释与共享联网检索.md`、`docs/切片方案-文件定向卡与证据化追问.md`)。
+> 状态:MVP 功能闭环;代码选区解释与共享联网检索、文件定向卡、项目级追问历史、陈旧证据护栏及左栏/底栏/专注三态追问均已完成(见 `docs/切片方案-代码选区解释与共享联网检索.md`、`docs/切片方案-文件定向卡与证据化追问.md`、`docs/切片方案-追问线程持久化与左栏工作台.md`)。
 
 ## 核心理念
 
@@ -23,7 +23,9 @@ Fluid提供**只读**代码理解环境。在不修改源码任何字节的前�
 - **流式语义生成**:每个函数一个「胶囊」(签名·摘要·复杂度·IO)+ 重点行尾随式玻璃注释,逐个显影;失败可单点重试。
 - **代码选区解释**:选择任意非空单行代码后点「解释」,临时浮层显示「它是什么 / 这里做什么 / 来源状态」;项目内符号优先临时取源,第三方证据不足时可自动联网。
 - **旁路缓存**:文件定向卡、函数/行与选区解释都落盘 `.fluid/`;相关源码、图谱、模型、Prompt、选区范围或联网模式不变时零 Token 秒显,解释文本始终不回写源码。
-- **证据化连续追问**:当前文件追问先显示确定性方向图,再流式回答;保留当前范围内的原问题与完整追问,关键 `[E#]` 可点击回到精确源码。也可显式选择多个文件做职责/调用/依赖关系追问。两种范围共享供应商托管 Web Search,并显示「网页有来源 / 联网无来源 / 未核验」;联网失败会显式降级后继续本地回答。
+- **项目级证据化追问**:当前文件追问先显示确定性方向图,再流式回答;完整轮次按项目保存,关闭追问器、切换文件或重启 Fluid 后仍可恢复。也可显式选择多个文件做职责/调用/依赖关系追问;两种范围共享供应商托管 Web Search,并显示「网页有来源 / 联网无来源 / 未核验」。
+- **源码版本护栏**:线程绑定当前文件或已选文件集的精确源码版本;源码变化后旧回答仍可读,但续问和代码 `[E#]` 回切会禁用。内容变化可基于当前源码另建零轮次线程,范围文件缺失时只读且不可 fork。
+- **三态追问工作台**:活动栏可在资源管理器、追问器和收起左栏间互斥切换;同一个追问器可在左栏、底栏与专注态间移动,线程、输入与在途请求不因换位而重建。
 - **联网可控**:设置里的「允许联网检索」默认开启,同时控制选区解释与追问器;关闭后不做检索规划或 Web Search,只使用本地上下文。
 - **手动单行补注**:非重点行 hover → 「解释这一行」按需生成。
 - **类 VSCode 壳**:活动栏 / 资源管理器 / 多 tab + 面包屑 / 状态栏 / Open Folder 换根 / 命令面板 / LLM 设置面板。
@@ -40,12 +42,14 @@ Fluid提供**只读**代码理解环境。在不修改源码任何字节的前�
   WebEvidenceService 共享 local → plan → search → fallback 证据编排
   LlmProxy       唯一出网组件,/chat/completions + 可选 /responses Web Search
   CacheStore     旁路缓存 .fluid/
+  QueryThreadStore 项目级完整追问记录 .fluid/query-threads/v1/
   routes         REST + WebSocket 端点
 
 前端 web/  (Vue 3 + Vite + TypeScript)
   CodeMirror 6 只读编辑器 + 幽灵注释 widget(玻璃材质)
   tree-sitter WASM 解析(Python / Rust)→ 函数清单 + 重点行
   GhostStore 内存态 + 视口感知生成调度(并行 WS)
+  QueryWorkspace 单一项目态持有历史、线程选择、流式请求与换根代次
   OrientationState / SelectionState / QueryState 投影激活、选区、连续追问与证据状态
   shell/ 类 VSCode 壳组件
 ```
@@ -120,7 +124,7 @@ cd web && npm install && npm run dev                # Vite 5173,/api 代理到 7
 
 ## 主要端点
 
-`GET /api/identity`、`GET /api/project/tree`、`GET /api/file`、`GET /api/project/graph`、`POST /api/project/open|pick`、`GET|POST /api/settings/llm`、`POST /api/settings/llm/test`、`POST /api/explain-line`、`WS /api/orient`、`WS /api/generate`、`WS /api/explain-selection`、`WS /api/query`、`WS /api/query-files`。
+`GET /api/identity`、`GET /api/project/tree`、`GET /api/file`、`GET /api/project/graph`、`POST /api/project/open|pick`、`GET|POST /api/settings/llm`、`POST /api/settings/llm/test`、`POST /api/explain-line`、`GET|POST /api/query-threads`、`GET|DELETE /api/query-threads/{id}`、`POST /api/query-threads/{id}/fork-current`、`WS /api/orient`、`WS /api/generate`、`WS /api/explain-selection`、`WS /api/query`、`WS /api/query-files`。
 
 ## 开发与验证
 
@@ -143,6 +147,12 @@ node scripts/query-context-check.ts # 追问上下文投影
 node scripts/query-trace-check.ts # 连续追问 scope/revision 轨迹
 node scripts/query-map-check.ts # map 帧序与 E# 链接
 node scripts/query-web-check.ts # 两种 scope 的联网证据状态机
+npx tsx scripts/query-history-check.ts # 项目历史、重启恢复与删除竞态
+npx tsx scripts/query-stale-check.ts # stale 只读、fork 与 E# 护栏
+npx tsx scripts/query-workspace-check.ts # 单一 controller 与请求代次
+node scripts/query-layout-check.ts # dock/focus 尺寸边界
+node scripts/query-presentation-check.ts # 单轮呈现索引
+node scripts/query-sidebar-check.ts # 左栏/底栏/专注布局状态机
 ```
 
 验证纪律:用确定性工具判定对错(编译/测试/脚本),不靠 AI 自评;浏览器交互用本地 fixture 复验,真实供应商 Web Search 仅作补充冒烟。无余额、无能力或无网络时必须记录「未验证」,不得用 fixture 结果冒充真实联网成功。
