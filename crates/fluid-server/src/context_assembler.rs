@@ -1060,7 +1060,7 @@ pub fn build_orientation_skeleton_prompt(
 语言约束：所有面向读者的自然语言说明必须使用简体中文。源码标识符、文件路径、库名、协议名、产品名和通行技术术语可保留必要英文。
 
 硬约束：
-1. actors 使用稳定、具名的真实参与者 ID 与 inside-file/project/external 边界；方向必须由 fromActorId -> toActorId 表达，禁止无主语的“上游/下游”或 upstream/downstream。
+1. actors 使用稳定、具名的真实参与者 ID 与 inside-file/project/external 边界；任何自然语言说明字段都不得出现“上游”“下游”、upstream 或 downstream；该禁令覆盖所有上游/下游字面用法；方向必须直接点名 actors 中已声明的参与者 ID/名称，并由 step.fromActorId -> step.toActorId 给出结构方向。
 2. types.ownerActorId、coreFlows 的参与者/证据、walkthrough 与 invariants 的 evidenceIds 必须引用本对象已声明 ID，不能悬空。
 3. coreFlows 至少一个，每条 flow 至少一个 step；step 必须点名真实 via、payload、why，并至少引用一个当前源码 evidenceId。
 4. evidence 只能指向当前激活文件，使用下方完整源码中的 1-based inclusive 行号；图谱摘要和模型记忆不是证据。
@@ -1098,7 +1098,7 @@ pub fn build_bounded_orientation_skeleton_prompt(
 语言约束：所有面向读者的自然语言说明必须使用简体中文。源码标识符、文件路径、库名、协议名、产品名和通行技术术语可保留必要英文。
 
 硬约束：
-1. actors 使用稳定、具名的真实参与者 ID 与 inside-file/project/external 边界；方向必须由 fromActorId -> toActorId 表达，禁止无主语的“上游/下游”或 upstream/downstream。
+1. actors 使用稳定、具名的真实参与者 ID 与 inside-file/project/external 边界；任何自然语言说明字段都不得出现“上游”“下游”、upstream 或 downstream；该禁令覆盖所有上游/下游字面用法；方向必须直接点名 actors 中已声明的参与者 ID/名称，并由 step.fromActorId -> step.toActorId 给出结构方向。
 2. types.ownerActorId、coreFlows 的参与者/证据、walkthrough 与 invariants 的 evidenceIds 必须引用本对象已声明 ID，不能悬空。
 3. coreFlows 至少一个，每条 flow 至少一个 step；step 必须点名真实 via、payload、why，并至少引用一个下方可见源码 evidenceId。
 4. omittedFunctionIds 对应的函数实现没有提供；不得从签名、轮廓或模型记忆虚构其函数体行为或证据。
@@ -1132,6 +1132,31 @@ pub fn build_bounded_orientation_skeleton_prompt(
     }
 
     (system.to_string(), user)
+}
+
+/// Build the single allowed stage-A correction request while preserving the
+/// original prompt and its source, roster, actor, flow, and evidence boundary.
+#[allow(dead_code)] // S-ORIC-1 freezes the constructor; S-ORIC-2 wires production routing.
+pub fn build_orientation_skeleton_correction_prompt(
+    original_system: &str,
+    original_user: &str,
+    original_output: &str,
+    validation_error: &str,
+) -> (String, String) {
+    let mut user = original_user.to_string();
+    if !user.ends_with('\n') {
+        user.push('\n');
+    }
+    user.push_str("【上次无效输出；仅用于纠错，不是事实】\n");
+    user.push_str(original_output);
+    user.push('\n');
+    user.push_str("【确定性校验错误】\n");
+    user.push_str(validation_error);
+    user.push('\n');
+    user.push_str(
+        "请逐字遵守原 system/user 中的源码选择、函数清单、参与者、flow 与 evidence 边界，重写完整 JSON；不得扩大任何边界。\n",
+    );
+    (original_system.to_string(), user)
 }
 
 /// Build one stage-B role prompt from an immutable, already validated skeleton
@@ -3369,6 +3394,40 @@ mod tests {
     }
 
     #[test]
+    fn orientation_skeleton_prompts_forbid_literal_direction_words() {
+        let source = "fn selected() { selected_body(); }\n";
+        let roster = vec![FunctionSpan {
+            id: "selected#1".into(),
+            name: "selected".into(),
+            line_range: [1, 1],
+        }];
+        let context = GenContext {
+            file_summary: None,
+            roster: vec!["selected".into()],
+            edges: Vec::new(),
+            callee_summaries: BTreeMap::new(),
+        };
+
+        let (full_system, _) = build_orientation_skeleton_prompt("a.rs", source, &roster, &context);
+        let selection = slice_orientation_sources(
+            source,
+            &roster,
+            &["selected#1".into()],
+            ORIENTATION_FETCH_BUDGET_CHARS,
+        );
+        let (bounded_system, _) = build_bounded_orientation_skeleton_prompt(
+            "a.rs", source, &roster, &context, &selection,
+        );
+
+        let literal_direction_rule =
+            "任何自然语言说明字段都不得出现“上游”“下游”、upstream 或 downstream";
+        for system in [&full_system, &bounded_system] {
+            assert!(system.contains(literal_direction_rule));
+            assert!(!system.contains("禁止无主语"));
+        }
+    }
+
+    #[test]
     fn orientation_skeleton_prompts_request_no_role_fields_and_hide_omitted_bodies() {
         let source = concat!(
             "fn selected() { selected_body(); }\n",
@@ -3414,6 +3473,62 @@ mod tests {
         assert!(bounded_user.contains("selected_body"));
         assert!(bounded_user.contains("\"omitted#2\""));
         assert!(!bounded_user.contains("omitted_body_must_stay_private"));
+    }
+
+    #[test]
+    fn orientation_skeleton_correction_prompt_preserves_original_boundary() {
+        let source = concat!(
+            "fn selected() { selected_body(); }\n",
+            "fn omitted() { omitted_body_must_stay_private(); }\n",
+        );
+        let roster = vec![
+            FunctionSpan {
+                id: "selected#1".into(),
+                name: "selected".into(),
+                line_range: [1, 1],
+            },
+            FunctionSpan {
+                id: "omitted#2".into(),
+                name: "omitted".into(),
+                line_range: [2, 2],
+            },
+        ];
+        let context = GenContext {
+            file_summary: None,
+            roster: vec!["selected".into(), "omitted".into()],
+            edges: Vec::new(),
+            callee_summaries: BTreeMap::new(),
+        };
+        let selection = slice_orientation_sources(
+            source,
+            &roster,
+            &["selected#1".into()],
+            ORIENTATION_FETCH_BUDGET_CHARS,
+        );
+        let (original_system, original_user) = build_bounded_orientation_skeleton_prompt(
+            "a.rs", source, &roster, &context, &selection,
+        );
+        let original_output = r#"{"purpose":"使用 downstream 处理请求"}"#;
+        let validation_error = "purpose uses unbound upstream/downstream language; use actor IDs";
+
+        let (correction_system, correction_user) = build_orientation_skeleton_correction_prompt(
+            &original_system,
+            &original_user,
+            original_output,
+            validation_error,
+        );
+
+        assert_eq!(correction_system, original_system);
+        assert!(correction_user.starts_with(&original_user));
+        assert!(correction_user.contains("【上次无效输出；仅用于纠错，不是事实】"));
+        assert!(correction_user.contains(original_output));
+        assert!(correction_user.contains("【确定性校验错误】"));
+        assert!(correction_user.contains(validation_error));
+        assert!(correction_user.contains("重写完整 JSON"));
+        assert!(correction_user.contains("不得扩大任何边界"));
+        assert!(correction_user.contains("selected_body"));
+        assert!(correction_user.contains("\"omitted#2\""));
+        assert!(!correction_user.contains("omitted_body_must_stay_private"));
     }
 
     #[test]
