@@ -5107,7 +5107,10 @@ mod tests {
     #[tokio::test]
     async fn orientation_websocket_miss_then_hit_emits_card_and_uses_full_numbered_prompt() {
         let tmp = TmpDir::new();
-        std::fs::write(tmp.path().join("a.rs"), orientation_source()).unwrap();
+        let source_path = tmp.path().join("a.rs");
+        std::fs::write(&source_path, orientation_source()).unwrap();
+        let source_bytes_before = std::fs::read(&source_path).unwrap();
+        let source_mtime_before = std::fs::metadata(&source_path).unwrap().modified().unwrap();
         let card = orientation_card_json();
         let mock = start_orientation_sequence_mock(vec![
             (
@@ -5153,6 +5156,11 @@ mod tests {
         assert_eq!(frame_kinds(&hit), vec!["cache-hit", "card", "done"]);
         assert_eq!(hit[1]["card"]["orientationId"], orientation_id);
         assert_eq!(hit[1]["card"], miss[2]["card"]);
+        assert_eq!(std::fs::read(&source_path).unwrap(), source_bytes_before);
+        assert_eq!(
+            std::fs::metadata(&source_path).unwrap().modified().unwrap(),
+            source_mtime_before
+        );
 
         let requests = mock.requests.lock().unwrap();
         assert_eq!(
@@ -5904,7 +5912,10 @@ mod tests {
     #[tokio::test]
     async fn orientation_websocket_bounded_skeleton_correction_reuses_one_source_plan() {
         let tmp = TmpDir::new();
-        std::fs::write(tmp.path().join("large.rs"), bounded_orientation_source()).unwrap();
+        let source_path = tmp.path().join("large.rs");
+        std::fs::write(&source_path, bounded_orientation_source()).unwrap();
+        let source_bytes_before = std::fs::read(&source_path).unwrap();
+        let source_mtime_before = std::fs::metadata(&source_path).unwrap().modified().unwrap();
         let card = bounded_orientation_card_json();
         let invalid_output = orientation_skeleton_with_invalid_flow_direction(&card).to_string();
         let mock = start_orientation_sequence_mock(vec![
@@ -5940,6 +5951,11 @@ mod tests {
         );
         let hit = orientation_ws_frames(&app, bounded_orientation_request_json()).await;
         assert_eq!(frame_kinds(&hit), vec!["cache-hit", "card", "done"]);
+        assert_eq!(std::fs::read(&source_path).unwrap(), source_bytes_before);
+        assert_eq!(
+            std::fs::metadata(&source_path).unwrap().modified().unwrap(),
+            source_mtime_before
+        );
 
         let requests = mock.requests.lock().unwrap();
         assert_eq!(
