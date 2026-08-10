@@ -67,6 +67,7 @@ use crate::orientation::{
     OrientationValidationContext, ORIENTATION_PROMPT_VERSION, ORIENTATION_SCHEMA_VERSION,
 };
 use crate::project_reader::{FileNode, ProjectReader, ReadErr};
+use crate::query_history::QueryThreadStore;
 use crate::settings::{mask_key, persist_env, LlmConfig};
 use crate::startup::{FluidIdentity, IDENTITY_PATH};
 use crate::translate::{build_translate_prompt, protect_code, restore_code, split_chunks};
@@ -76,20 +77,23 @@ use crate::web_evidence::{
 };
 use futures_util::stream::{self, StreamExt};
 
-/// The root-bound trio: file reader + optional graph catalog + bypass cache.
-/// All three are rebuilt together when the project root changes (U3 Open Folder),
-/// so they live behind one lock and swap atomically.
+/// Root-bound project services. All are rebuilt together when the project root
+/// changes (U3 Open Folder), so they live behind one lock and swap atomically.
 struct ProjectCtx {
     reader: ProjectReader,
     graphs: GraphCatalog,
     cache: CacheStore,
+    // S-QAPI-1 will expose the first lifecycle consumer. S-QTHREAD-1 only binds
+    // the independent store to the same project-root swap as the reader/cache.
+    #[allow(dead_code)]
+    query_threads: QueryThreadStore,
 }
 
 /// Shared server state. The root-bound `project` swaps on Open Folder (U3); the
 /// LLM backend swaps on a settings change (U5a, ADR-0018). `prompt_version` is a
 /// build constant feeding the cache key.
 pub struct AppState {
-    /// Swappable per-project context (reader + graph + cache). `None` when started
+    /// Swappable per-project context (reader + graph + caches/stores). `None` when started
     /// without a project — the user opens one from the UI (Open Folder), which sets
     /// it via `/api/project/open`. Until then tree is empty and file/gen/query report
     /// "no project open".
@@ -122,6 +126,7 @@ impl AppState {
         reader: ProjectReader,
         graphs: GraphCatalog,
         cache: CacheStore,
+        query_threads: QueryThreadStore,
         llm_config: LlmConfig,
         env_path: PathBuf,
         prompt_version: &'static str,
@@ -131,6 +136,7 @@ impl AppState {
                 reader,
                 graphs,
                 cache,
+                query_threads,
             }),
             llm_config,
             env_path,
@@ -279,9 +285,8 @@ struct OpenResponse {
 
 /// `POST /api/project/open { path }` — switch the served project root (U3, single
 /// root swap). Validates the path is an existing directory, then atomically swaps
-/// in a fresh reader + graph + cache built for the new root (same model/prompt so
-/// the cache key inputs are unchanged). Traversal protection is per-reader, so the
-/// new reader enforces containment against the new root automatically.
+/// in fresh root-bound services (same model/prompt, so cache key inputs are
+/// unchanged). Traversal protection is per service, against the new root.
 async fn open_folder(
     State(state): State<Shared>,
     Json(req): Json<OpenRequest>,
@@ -298,11 +303,22 @@ async fn open_folder(
     };
     let graphs = GraphCatalog::discover(reader.root());
     let cache = CacheStore::new(reader.root(), state.model(), state.prompt_version);
+    let query_threads = match QueryThreadStore::new(reader.root()) {
+        Ok(store) => store,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("cannot open query history store: {error}"),
+            )
+                .into_response()
+        }
+    };
     let root = reader.root().display().to_string();
     *state.project.write().unwrap() = Some(ProjectCtx {
         reader,
         graphs,
         cache,
+        query_threads,
     });
     eprintln!("[open] switched project root to {root}");
     (StatusCode::OK, Json(OpenResponse { root })).into_response()
@@ -3818,6 +3834,7 @@ mod tests {
             ProjectReader::new(root.to_path_buf()).unwrap(),
             GraphCatalog::discover(root),
             CacheStore::new(root, &cfg.model, "p1"),
+            QueryThreadStore::new(root).unwrap(),
             cfg,
             root.join(".env"),
             "p1",
@@ -4045,10 +4062,12 @@ mod tests {
         let reader = ProjectReader::new(root.to_path_buf()).unwrap();
         let graphs = GraphCatalog::discover(root);
         let cache = CacheStore::new(root, state.model(), state.prompt_version);
+        let query_threads = QueryThreadStore::new(root).unwrap();
         *state.project.write().unwrap() = Some(ProjectCtx {
             reader,
             graphs,
             cache,
+            query_threads,
         });
     }
 
@@ -6445,6 +6464,7 @@ mod tests {
             .map(|f| f.path)
             .collect();
         assert_eq!(names, vec!["b.py"]);
+        assert_eq!(proj.query_threads.project_root(), proj.reader.root());
         assert_eq!(proj.reader.read_file("b.py").unwrap(), "y = 2\n");
         assert!(matches!(
             proj.reader.read_file("a.py"),

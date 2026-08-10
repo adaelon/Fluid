@@ -12,6 +12,10 @@ mod llm_proxy;
 #[allow(dead_code)]
 mod orientation;
 mod project_reader;
+// S-QTHREAD-1 lands the project-scoped persistence boundary before S-QAPI-1
+// adds the first route consumer. Keep the staged allowance local to the module.
+#[allow(dead_code)]
+mod query_history;
 mod routes;
 mod settings;
 mod startup;
@@ -30,6 +34,7 @@ use clap::Parser;
 use cache_store::CacheStore;
 use graph_loader::GraphCatalog;
 use project_reader::ProjectReader;
+use query_history::QueryThreadStore;
 use routes::AppState;
 #[cfg(windows)]
 use settings::windows_env_path;
@@ -170,7 +175,16 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             let cache = CacheStore::new(reader.root(), &llm_config.model, PROMPT_VERSION);
-            AppState::new(reader, graphs, cache, llm_config, env_path, PROMPT_VERSION)
+            let query_threads = QueryThreadStore::new(reader.root())?;
+            AppState::new(
+                reader,
+                graphs,
+                cache,
+                query_threads,
+                llm_config,
+                env_path,
+                PROMPT_VERSION,
+            )
         }
         None => {
             println!("No project specified — open a folder from the UI to begin");
