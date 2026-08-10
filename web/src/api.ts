@@ -6,7 +6,6 @@ import type {
   LineAnnotation,
   OrientationFrame,
   QueryFrame,
-  QueryTrace,
   SelectionFrame,
 } from './ghostTypes'
 import type { CapsuleSummary } from './queryContext'
@@ -17,6 +16,33 @@ export interface FileNode {
   path: string
   name: string
   lang: Lang
+}
+
+export type QueryScopeSpec =
+  | { kind: 'current'; paths: [string] }
+  | { kind: 'selected'; paths: [string, string, ...string[]] }
+
+export interface QueryThreadHandle {
+  id: string
+  updatedAt: string
+}
+
+/** Create the zero-turn durable record required before either query socket can
+ * stream. History listing/selection remains a later UI slice. */
+export async function createQueryThread(req: {
+  scope: QueryScopeSpec
+  originalQuestion: string
+}): Promise<QueryThreadHandle> {
+  const res = await fetch('/api/query-threads', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(req),
+  })
+  if (!res.ok) {
+    const detail = (await res.text()).trim()
+    throw new Error(detail || `/api/query-threads -> ${res.status}`)
+  }
+  return (await res.json()) as QueryThreadHandle
 }
 
 /** GET /api/project/tree -> flat FileNode[] (the frontend nests it, see tree.ts). */
@@ -366,10 +392,10 @@ export interface QueryStream {
 export function streamQuery(
   req: {
     reqId: string
+    threadId: string
     filePath: string
     orientationId: string
     question: string
-    trace: QueryTrace
     roster?: string[]
     rosterSpans?: FunctionSpan[]
     capsules?: CapsuleSummary[]
@@ -391,10 +417,10 @@ export function streamQuery(
     sock.send(
       JSON.stringify({
         reqId: req.reqId,
+        threadId: req.threadId,
         filePath: req.filePath,
         orientationId: req.orientationId,
         question: req.question,
-        trace: req.trace,
         roster: req.roster ?? [],
         rosterSpans: req.rosterSpans ?? [],
         capsules: req.capsules ?? [],
@@ -442,9 +468,9 @@ export function streamQuery(
 export function streamQueryFiles(
   req: {
     reqId: string
+    threadId: string
     filePaths: string[]
     question: string
-    trace: QueryTrace
     allowWeb: boolean
   },
   h: QueryHandlers,
@@ -463,9 +489,9 @@ export function streamQueryFiles(
     sock.send(
       JSON.stringify({
         reqId: req.reqId,
+        threadId: req.threadId,
         filePaths: req.filePaths,
         question: req.question,
-        trace: req.trace,
         allowWeb: req.allowWeb,
       }),
     )

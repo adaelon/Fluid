@@ -6,7 +6,12 @@
 // query WebSocket, and turns only known E# citations into source navigation.
 // Switching files or scope vacuums the in-flight Q&A.
 import { computed, ref, watch, nextTick, onMounted, onBeforeUnmount } from 'vue'
-import { streamQuery, streamQueryFiles } from './api'
+import {
+  createQueryThread,
+  streamQuery,
+  streamQueryFiles,
+  type QueryScopeSpec,
+} from './api'
 import type { CodeEvidenceRef, QueryFrame, QueryTrace } from './ghostTypes'
 import { EMPTY_QUERY_CONTEXT, type QueryContext } from './queryContext'
 import CodeEvidencePeek from './CodeEvidencePeek.vue'
@@ -441,7 +446,21 @@ function newTrace() {
   resetTrace()
 }
 
-function ask() {
+async function ensureRequestThread(
+  request: QueryWorkspaceRequest,
+  threadScope: QueryScopeSpec,
+): Promise<string | null> {
+  if (request.threadId) return request.threadId
+  const created = await createQueryThread({
+    scope: threadScope,
+    originalQuestion: request.question,
+  })
+  return workspace.bindThread(request, created.id, created.updatedAt)
+    ? created.id
+    : null
+}
+
+async function ask() {
   const q = question.value.trim()
   if (!q || streaming.value) return
   if (scope.value === 'selected') {
@@ -449,15 +468,38 @@ function ask() {
       workspace.showValidationError(selectedScopeHint.value)
       return
     }
+    const [firstPath, secondPath, ...remainingPaths] = props.selectedPaths
+    if (!firstPath || !secondPath) return
+    const filePaths = [firstPath, secondPath, ...remainingPaths] as [
+      string,
+      string,
+      ...string[],
+    ]
     closeCodePeek()
     const request = workspace.beginRequest(scopeIdentity.value)
     if (!request) return
+    let threadId: string | null
+    try {
+      threadId = await ensureRequestThread(request, {
+        kind: 'selected',
+        paths: filePaths,
+      })
+    }
+    catch (error) {
+      acceptFrame(request, {
+        kind: 'error',
+        reqId: request.requestId,
+        message: error instanceof Error ? error.message : '创建追问线程失败',
+      })
+      return
+    }
+    if (!threadId) return
     const nextStream = streamQueryFiles(
       {
         reqId: request.requestId,
-        filePaths: props.selectedPaths,
+        threadId,
+        filePaths,
         question: request.question,
-        trace: request.trace,
         allowWeb: props.allowWeb,
       },
       {
@@ -467,17 +509,35 @@ function ask() {
     workspace.attachStream(request.generation, nextStream)
     return
   }
-  if (!props.path || !currentOrientationId.value) return
+  const filePath = props.path
+  const orientationId = currentOrientationId.value
+  if (!filePath || !orientationId) return
   closeCodePeek()
   const request = workspace.beginRequest(scopeIdentity.value)
   if (!request) return
+  let threadId: string | null
+  try {
+    threadId = await ensureRequestThread(request, {
+      kind: 'current',
+      paths: [filePath],
+    })
+  }
+  catch (error) {
+    acceptFrame(request, {
+      kind: 'error',
+      reqId: request.requestId,
+      message: error instanceof Error ? error.message : '创建追问线程失败',
+    })
+    return
+  }
+  if (!threadId) return
   const nextStream = streamQuery(
     {
       reqId: request.requestId,
-      filePath: props.path,
-      orientationId: currentOrientationId.value,
+      threadId,
+      filePath,
+      orientationId,
       question: request.question,
-      trace: request.trace,
       roster: props.ctx.roster,
       rosterSpans: props.ctx.rosterSpans,
       capsules: props.ctx.capsules,

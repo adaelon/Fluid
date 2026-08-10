@@ -30,6 +30,7 @@ export interface QueryWorkspaceStream {
 export interface QueryWorkspaceRequest {
   generation: number
   requestId: string
+  threadId: string | null
   identity: QueryScopeIdentity
   question: string
   trace: QueryTrace
@@ -53,7 +54,14 @@ export interface QueryWorkspaceController {
   selectedTurn: Ref<QueryTurnSelection>
   activeQuestion: Ref<string>
   scope: Ref<QueryScope>
+  threadId: Ref<string | null>
+  threadUpdatedAt: Ref<string | null>
   beginRequest(identity: QueryScopeIdentity): QueryWorkspaceRequest | null
+  bindThread(
+    request: QueryWorkspaceRequest,
+    nextThreadId: string,
+    updatedAt: string,
+  ): boolean
   attachStream(generation: number, nextStream: QueryWorkspaceStream): boolean
   acceptFrame(
     request: QueryWorkspaceRequest,
@@ -82,6 +90,8 @@ export function createQueryWorkspace(): QueryWorkspaceController {
   const selectedTurn = ref<QueryTurnSelection>(null)
   const activeQuestion = ref('')
   const scope = ref<QueryScope>('current')
+  const threadId = ref<string | null>(null)
+  const threadUpdatedAt = ref<string | null>(null)
 
   let stream: QueryWorkspaceStream | null = null
   let requestGeneration = 0
@@ -106,6 +116,8 @@ export function createQueryWorkspace(): QueryWorkspaceController {
     traceSnapshots.value = presentation.snapshots
     activeQuestion.value = ''
     viewState.value = idleQueryState()
+    threadId.value = null
+    threadUpdatedAt.value = null
     if (clearQuestion) question.value = ''
   }
 
@@ -129,6 +141,7 @@ export function createQueryWorkspace(): QueryWorkspaceController {
     const request = {
       generation: ++requestGeneration,
       requestId,
+      threadId: threadId.value,
       identity: requestIdentity,
       question: askedQuestion,
       trace: requestTrace,
@@ -137,6 +150,26 @@ export function createQueryWorkspace(): QueryWorkspaceController {
     activeQuestion.value = askedQuestion
     question.value = ''
     return request
+  }
+
+  function bindThread(
+    request: QueryWorkspaceRequest,
+    nextThreadId: string,
+    updatedAt: string,
+  ): boolean {
+    if (
+      request.generation !== requestGeneration ||
+      viewState.value.mode !== 'streaming' ||
+      !nextThreadId ||
+      (threadId.value !== null && threadId.value !== nextThreadId) ||
+      (request.threadId !== null && request.threadId !== nextThreadId)
+    ) {
+      return false
+    }
+    request.threadId = nextThreadId
+    threadId.value = nextThreadId
+    threadUpdatedAt.value = updatedAt
+    return true
   }
 
   function attachStream(
@@ -158,6 +191,19 @@ export function createQueryWorkspace(): QueryWorkspaceController {
   ): QueryWorkspaceFrameResult {
     if (request.generation !== requestGeneration) return { kind: 'ignored' }
     const previous = viewState.value
+    if (frame.reqId !== previous.requestId) return { kind: 'ignored' }
+    if (
+      frame.kind === 'done' &&
+      (!request.threadId || frame.threadId !== request.threadId)
+    ) {
+      viewState.value = reduceQueryFrame(previous, {
+        kind: 'error',
+        reqId: request.requestId,
+        message: '追问线程身份不匹配，完整轮次未接收',
+      })
+      detachStream(true)
+      return { kind: 'error' }
+    }
     const next = reduceQueryFrame(previous, frame)
     if (next === previous && frame.reqId !== previous.requestId) {
       return { kind: 'ignored' }
@@ -171,6 +217,7 @@ export function createQueryWorkspace(): QueryWorkspaceController {
 
     if (frame.kind === 'done' && next.mode === 'done' && next.map) {
       detachStream(false)
+      threadUpdatedAt.value = frame.updatedAt
       const citations = queryAnswerEvidenceCitations(next.answer, next.map.evidence)
       const completed = appendCompletedQueryTurn(
         trace.value,
@@ -223,7 +270,10 @@ export function createQueryWorkspace(): QueryWorkspaceController {
     selectedTurn,
     activeQuestion,
     scope,
+    threadId,
+    threadUpdatedAt,
     beginRequest,
+    bindThread,
     attachStream,
     acceptFrame,
     showValidationError,

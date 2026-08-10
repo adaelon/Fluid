@@ -61,7 +61,12 @@ state = reduceQueryFrame(state, {
 })
 state = reduceQueryFrame(state, { kind: 'delta', reqId: 'q', text: '第一段' })
 state = reduceQueryFrame(state, { kind: 'delta', reqId: 'q', text: '第二段' })
-state = reduceQueryFrame(state, { kind: 'done', reqId: 'q' })
+state = reduceQueryFrame(state, {
+  kind: 'done',
+  reqId: 'q',
+  threadId: 'thread-1',
+  updatedAt: '2026-08-10T10:00:00.000Z',
+})
 check('delta chunks accumulate in order', state.answer === '第一段第二段')
 check(
   'done preserves cited evidence and sources',

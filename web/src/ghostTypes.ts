@@ -207,7 +207,7 @@ export type QueryFrame =
       warning?: string
     }
   | { kind: 'delta'; reqId: string; text: string }
-  | { kind: 'done'; reqId: string }
+  | { kind: 'done'; reqId: string; threadId: string; updatedAt: string }
   | { kind: 'error'; reqId: string; message: string }
 
 export type SelectionKind = '模块' | '类型' | '函数' | '方法' | '变量' | '表达式' | '未知'

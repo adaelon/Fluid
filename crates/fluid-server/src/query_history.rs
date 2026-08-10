@@ -12,12 +12,14 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+#[cfg(test)]
+use std::sync::{atomic::AtomicBool, Arc};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::context_assembler::{validate_query_map, QueryMap};
+use crate::context_assembler::{validate_query_map, QueryMap, QueryTrace, QueryTurn};
 use crate::web_evidence::{EvidenceStatus, SourceLink};
 
 pub const QUERY_THREAD_SCHEMA_VERSION: u32 = 1;
@@ -79,6 +81,32 @@ pub struct QueryThread {
     pub source_revision: String,
     pub original_question: String,
     pub turns: Vec<PersistedQueryTurn>,
+}
+
+impl QueryThread {
+    /// Derive the bounded-prompt input from the complete durable record. The
+    /// caller supplies the already-validated runtime scope identity; prompt
+    /// budgeting remains the responsibility of `render_query_trace`.
+    pub fn to_query_trace(
+        &self,
+        scope_key: impl Into<String>,
+        scope_revision: impl Into<String>,
+    ) -> QueryTrace {
+        QueryTrace {
+            scope_key: scope_key.into(),
+            scope_revision: scope_revision.into(),
+            original_question: self.original_question.clone(),
+            turns: self
+                .turns
+                .iter()
+                .map(|turn| QueryTurn {
+                    question: turn.question.clone(),
+                    answer: turn.answer.clone(),
+                    code_evidence_ids: turn.code_evidence_ids.clone(),
+                })
+                .collect(),
+        }
+    }
 }
 
 /// Freshness is derived from current project bytes every time a thread is read.
@@ -237,6 +265,8 @@ pub fn default_thread_title(question: &str) -> Option<String> {
 pub struct QueryThreadStore {
     project_root: PathBuf,
     dir: PathBuf,
+    #[cfg(test)]
+    fail_next_put: Arc<AtomicBool>,
 }
 
 impl QueryThreadStore {
@@ -251,7 +281,12 @@ impl QueryThreadStore {
             )));
         }
         let dir = project_root.join(".fluid").join("query-threads").join("v1");
-        Ok(Self { project_root, dir })
+        Ok(Self {
+            project_root,
+            dir,
+            #[cfg(test)]
+            fail_next_put: Arc::new(AtomicBool::new(false)),
+        })
     }
 
     pub fn project_root(&self) -> &Path {
@@ -371,6 +406,15 @@ impl QueryThreadStore {
     /// Atomically replace one validated thread record using a same-directory
     /// temporary file. A failed validation or write leaves the previous record.
     pub fn put(&self, thread: &QueryThread) -> Result<(), QueryHistoryError> {
+        #[cfg(test)]
+        if self
+            .fail_next_put
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(QueryHistoryError::Io(io::Error::other(
+                "injected query thread write failure",
+            )));
+        }
         validate_query_thread(thread)?;
         let dir = self.ensure_storage_dir()?;
         let destination = dir.join(record_file_name(&thread.id)?);
@@ -393,6 +437,27 @@ impl QueryThreadStore {
             return Err(QueryHistoryError::Io(error));
         }
         Ok(())
+    }
+
+    /// Append one already-complete turn and atomically replace the whole record.
+    /// Ownership makes a failed write leave the caller's previously loaded value
+    /// and the durable file unchanged.
+    pub fn append_turn(
+        &self,
+        mut thread: QueryThread,
+        turn: PersistedQueryTurn,
+    ) -> Result<QueryThread, QueryHistoryError> {
+        validate_query_thread(&thread)?;
+        thread.updated_at.clone_from(&turn.completed_at);
+        thread.turns.push(turn);
+        self.put(&thread)?;
+        Ok(thread)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_put_for_test(&self) {
+        self.fail_next_put
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn get(&self, id: &str) -> Result<Option<QueryThread>, QueryHistoryError> {
@@ -858,6 +923,7 @@ fn sync_directory_best_effort(_dir: &Path) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context_assembler::render_query_trace;
     use crate::orientation::{
         ActorBoundary, CodeEvidenceRef, OrientationActor, OrientationWalkthrough, WalkthroughStep,
     };
@@ -1070,6 +1136,55 @@ mod tests {
 
         store.put(&thread).unwrap();
         assert_eq!(store.get(THREAD_ID).unwrap(), Some(thread));
+    }
+
+    #[test]
+    fn durable_thread_derives_the_same_bounded_trace_without_truncating_history() {
+        let dir = tempdir_guard::TempDir::new("trace-projection");
+        write_source(dir.path(), "src/a.rs", b"fn a() {}\n");
+        let store = QueryThreadStore::new(dir.path()).unwrap();
+        let revision = store.source_revision(&current("src/a.rs")).unwrap();
+        let mut thread = sample_thread(current("src/a.rs"), revision);
+        for index in 2..=7 {
+            let completed_at = format!("2026-08-10T10:0{index}:00Z");
+            thread.turns.push(PersistedQueryTurn {
+                question: format!("follow-up-{index}"),
+                answer: format!("ANSWER-{index}-{}-END", "long".repeat(80)),
+                map: sample_map("src/a.rs"),
+                evidence: None,
+                code_evidence_ids: vec!["E1".into()],
+                completed_at: completed_at.clone(),
+            });
+            thread.updated_at = completed_at;
+        }
+        store.put(&thread).unwrap();
+
+        let trace = thread.to_query_trace("current:src/a.rs", "runtime-orientation");
+        let expected = QueryTrace {
+            scope_key: "current:src/a.rs".into(),
+            scope_revision: "runtime-orientation".into(),
+            original_question: thread.original_question.clone(),
+            turns: thread
+                .turns
+                .iter()
+                .map(|turn| QueryTurn {
+                    question: turn.question.clone(),
+                    answer: turn.answer.clone(),
+                    code_evidence_ids: turn.code_evidence_ids.clone(),
+                })
+                .collect(),
+        };
+        assert_eq!(
+            trace, expected,
+            "server projection must match the old trace contract"
+        );
+
+        let rendered = render_query_trace(&trace, 240);
+        assert!(rendered.contains(&thread.original_question));
+        assert!(rendered.contains("follow-up-7"));
+        assert!(rendered.contains("已按追问轨迹预算省略"));
+        assert_eq!(thread.turns.len(), 7);
+        assert_eq!(store.get(THREAD_ID).unwrap().unwrap().turns.len(), 7);
     }
 
     #[test]

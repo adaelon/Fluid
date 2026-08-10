@@ -69,6 +69,7 @@ use crate::orientation::{
 };
 use crate::project_reader::{FileNode, ProjectReader, ReadErr};
 use crate::query_history::{
+    normalize_query_scope, PersistedQueryTurn, QueryEvidenceState, QueryFreshness,
     QueryHistoryError, QueryScopeSpec, QueryThread, QueryThreadFreshness, QueryThreadStore,
 };
 use crate::settings::{mask_key, persist_env, LlmConfig};
@@ -2929,13 +2930,19 @@ struct CapsuleSummary {
 struct QueryRequest {
     #[serde(rename = "reqId", default)]
     req_id: String,
+    #[serde(rename = "threadId")]
+    thread_id: String,
     #[serde(rename = "filePath")]
     file_path: String,
     #[serde(rename = "orientationId", default)]
     orientation_id: String,
     question: String,
-    #[serde(default)]
+    /// Server-derived from `threadId` before the request reaches the prompt
+    /// assembler. A client-supplied `trace` field is deliberately ignored.
+    #[serde(skip)]
     trace: Option<QueryTrace>,
+    #[serde(skip)]
+    binding: Option<QueryThreadBinding>,
     /// The function the user is focused on (its source is zoomed in); None = file-level.
     #[serde(default)]
     focus: Option<FunctionSpan>,
@@ -2961,11 +2968,16 @@ struct QueryRequest {
 struct QueryFilesRequest {
     #[serde(rename = "reqId", default)]
     req_id: String,
+    #[serde(rename = "threadId")]
+    thread_id: String,
     #[serde(rename = "filePaths")]
     file_paths: Vec<String>,
     question: String,
-    #[serde(default)]
+    /// Server-derived from the durable thread; never accepted as wire truth.
+    #[serde(skip)]
     trace: Option<QueryTrace>,
+    #[serde(skip)]
+    binding: Option<QueryThreadBinding>,
     #[serde(rename = "allowWeb", default = "default_true")]
     allow_web: bool,
 }
@@ -3005,6 +3017,146 @@ fn validate_query_trace(
         return Err("query trace contains an incomplete turn".into());
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QueryThreadBinding {
+    thread_id: String,
+    project_root: PathBuf,
+    source_revision: String,
+    updated_at: String,
+    turn_count: usize,
+    scope: QueryScopeSpec,
+}
+
+fn load_query_thread_binding(
+    state: &AppState,
+    thread_id: &str,
+    question: &str,
+    requested_scope: QueryScopeSpec,
+) -> Result<(QueryThreadBinding, QueryThread), String> {
+    if thread_id.trim().is_empty() {
+        return Err("threadId is required for query".into());
+    }
+    if question.trim().is_empty() {
+        return Err("query question must not be blank".into());
+    }
+    let requested_scope =
+        normalize_query_scope(&requested_scope).map_err(|error| error.to_string())?;
+    let guard = state.project.read().unwrap();
+    let project = guard
+        .as_ref()
+        .ok_or_else(|| "no project open".to_string())?;
+    let thread = project
+        .query_threads
+        .get(thread_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "query thread not found in the current project".to_string())?;
+    if thread.scope != requested_scope {
+        return Err("query thread scope does not match the requested scope".into());
+    }
+    let freshness = project
+        .query_threads
+        .freshness(&thread)
+        .map_err(|error| error.to_string())?;
+    if freshness.freshness != QueryFreshness::Fresh {
+        let reason = freshness
+            .stale_reason
+            .map_or("unknown".to_string(), |reason| format!("{reason:?}"));
+        return Err(format!(
+            "query thread is stale ({reason}) and cannot continue"
+        ));
+    }
+    if thread.turns.is_empty() && question != thread.original_question {
+        return Err("the first query question must equal the thread originalQuestion".into());
+    }
+    let binding = QueryThreadBinding {
+        thread_id: thread.id.clone(),
+        project_root: project.query_threads.project_root().to_path_buf(),
+        source_revision: thread.source_revision.clone(),
+        updated_at: thread.updated_at.clone(),
+        turn_count: thread.turns.len(),
+        scope: thread.scope.clone(),
+    };
+    Ok((binding, thread))
+}
+
+fn bind_current_query_thread(
+    state: &AppState,
+    request: &mut QueryRequest,
+) -> Result<QueryThreadBinding, String> {
+    let requested_scope = normalize_query_scope(&QueryScopeSpec::Current {
+        paths: vec![request.file_path.clone()],
+    })
+    .map_err(|error| error.to_string())?;
+    let (binding, thread) = load_query_thread_binding(
+        state,
+        &request.thread_id,
+        &request.question,
+        requested_scope,
+    )?;
+    let file_path = binding.scope.paths()[0].clone();
+    request.file_path.clone_from(&file_path);
+    request.trace = Some(thread.to_query_trace(
+        format!("current:{file_path}"),
+        request.orientation_id.clone(),
+    ));
+    request.binding = Some(binding.clone());
+    Ok(binding)
+}
+
+fn bind_selected_query_thread(
+    state: &AppState,
+    request: &mut QueryFilesRequest,
+) -> Result<QueryThreadBinding, String> {
+    let requested_scope = normalize_query_scope(&QueryScopeSpec::Selected {
+        paths: request.file_paths.clone(),
+    })
+    .map_err(|error| error.to_string())?;
+    let (binding, thread) = load_query_thread_binding(
+        state,
+        &request.thread_id,
+        &request.question,
+        requested_scope,
+    )?;
+    request.file_paths = binding.scope.paths().to_vec();
+    let (scope_key, scope_revision) = selected_query_scope_identity(&request.file_paths);
+    request.trace = Some(thread.to_query_trace(scope_key, scope_revision));
+    request.binding = Some(binding.clone());
+    Ok(binding)
+}
+
+fn reload_bound_query_thread(
+    project: &ProjectCtx,
+    binding: &QueryThreadBinding,
+) -> Result<QueryThread, String> {
+    if project.query_threads.project_root() != binding.project_root {
+        return Err("query thread belongs to a different project root".into());
+    }
+    let thread = project
+        .query_threads
+        .get(&binding.thread_id)
+        .map_err(|error| format!("cannot reload query thread: {error}"))?
+        .ok_or_else(|| "query thread is no longer present in the current project".to_string())?;
+    if thread.source_revision != binding.source_revision
+        || thread.updated_at != binding.updated_at
+        || thread.turns.len() != binding.turn_count
+        || thread.scope != binding.scope
+    {
+        return Err(
+            "query thread changed while the answer was streaming; retry the question".into(),
+        );
+    }
+    let freshness = project
+        .query_threads
+        .freshness(&thread)
+        .map_err(|error| format!("cannot recheck query thread freshness: {error}"))?;
+    if freshness.freshness != QueryFreshness::Fresh {
+        return Err(
+            "query source changed while the answer was streaming; turn was not saved".into(),
+        );
+    }
+    Ok(thread)
 }
 
 fn verify_query_orientation(
@@ -3084,7 +3236,12 @@ enum QueryFrame {
     Delta {
         text: String,
     },
-    Done,
+    Done {
+        #[serde(rename = "threadId")]
+        thread_id: String,
+        #[serde(rename = "updatedAt")]
+        updated_at: String,
+    },
     Error {
         message: String,
     },
@@ -3164,6 +3321,11 @@ fn prepare_query_for_snapshot(
     let Some(proj) = guard.as_mut() else {
         return QueryPlan::Err("no project open".into());
     };
+    if let Some(binding) = req.binding.as_ref() {
+        if let Err(message) = reload_bound_query_thread(proj, binding) {
+            return QueryPlan::Err(message);
+        }
+    }
 
     let source = match proj.reader.read_file(&req.file_path) {
         Ok(s) => s,
@@ -3347,6 +3509,11 @@ fn prepare_query_files_for_snapshot(
     let Some(proj) = guard.as_mut() else {
         return QueryFilesPlan::Err("no project open".into());
     };
+    if let Some(binding) = req.binding.as_ref() {
+        if let Err(message) = reload_bound_query_thread(proj, binding) {
+            return QueryFilesPlan::Err(message);
+        }
+    }
     proj.graphs.refresh();
 
     let ctx = match assemble_file_set_context(&proj.graphs, &req.file_paths) {
@@ -3442,6 +3609,154 @@ fn query_evidence(evidence: &EvidenceOutcome) -> QueryFrame {
     }
 }
 
+#[derive(Debug, Clone)]
+struct QueryCompletion {
+    map: QueryMap,
+    evidence: EvidenceOutcome,
+    answer: String,
+}
+
+fn query_answer_prose(answer: &str) -> String {
+    let mut without_fences = String::with_capacity(answer.len());
+    let mut pending_fence = String::new();
+    let mut fence: Option<&str> = None;
+    for segment in answer.split_inclusive('\n') {
+        let line = segment.strip_suffix('\n').unwrap_or(segment);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        match fence {
+            Some(marker) => {
+                pending_fence.push_str(segment);
+                if line == marker {
+                    without_fences.push('\n');
+                    pending_fence.clear();
+                    fence = None;
+                }
+            }
+            None if line.starts_with("```") => {
+                fence = Some("```");
+                pending_fence.push_str(segment);
+            }
+            None if line.starts_with("~~~") => {
+                fence = Some("~~~");
+                pending_fence.push_str(segment);
+            }
+            None => without_fences.push_str(segment),
+        }
+    }
+    if fence.is_some() {
+        without_fences.push_str(&pending_fence);
+    }
+
+    let mut prose = String::with_capacity(without_fences.len());
+    for line in without_fences.split_inclusive('\n') {
+        let bytes = line.as_bytes();
+        let mut copied_until = 0;
+        let mut cursor = 0;
+        while cursor < bytes.len() {
+            if bytes[cursor] != b'`' {
+                cursor += 1;
+                continue;
+            }
+            let opening = cursor;
+            while cursor < bytes.len() && bytes[cursor] == b'`' {
+                cursor += 1;
+            }
+            let mut closing = cursor;
+            while closing < bytes.len() && bytes[closing] != b'`' && bytes[closing] != b'\n' {
+                closing += 1;
+            }
+            if closing >= bytes.len() || bytes[closing] == b'\n' {
+                break;
+            }
+            prose.push_str(&line[copied_until..opening]);
+            while closing < bytes.len() && bytes[closing] == b'`' {
+                closing += 1;
+            }
+            copied_until = closing;
+            cursor = closing;
+        }
+        prose.push_str(&line[copied_until..]);
+    }
+    prose
+}
+
+fn known_query_code_evidence_ids(answer: &str, map: &QueryMap) -> Vec<String> {
+    let known: BTreeSet<&str> = map
+        .evidence
+        .iter()
+        .map(|reference| reference.id.as_str())
+        .collect();
+    let mut seen = BTreeSet::new();
+    let mut ordered = Vec::new();
+    let prose = query_answer_prose(answer);
+    let bytes = prose.as_bytes();
+    let mut index = 0;
+    while index + 4 <= bytes.len() {
+        if bytes[index] != b'[' || bytes[index + 1] != b'E' {
+            index += 1;
+            continue;
+        }
+        let mut end = index + 2;
+        if !bytes
+            .get(end)
+            .is_some_and(|byte| (b'1'..=b'9').contains(byte))
+        {
+            index += 1;
+            continue;
+        }
+        while bytes.get(end).is_some_and(|byte| byte.is_ascii_digit()) {
+            end += 1;
+        }
+        if bytes.get(end) != Some(&b']') {
+            index += 1;
+            continue;
+        }
+        if let Some(id) = prose.get(index + 1..end) {
+            if known.contains(id) && seen.insert(id.to_string()) {
+                ordered.push(id.to_string());
+            }
+        }
+        index = end + 1;
+    }
+    ordered
+}
+
+fn persist_query_completion(
+    state: &AppState,
+    binding: &QueryThreadBinding,
+    question: &str,
+    completion: QueryCompletion,
+) -> Result<(String, String), String> {
+    if completion.answer.trim().is_empty() {
+        return Err("LLM returned an empty answer; query turn was not saved".into());
+    }
+    let mut guard = state.project.write().unwrap();
+    let project = guard
+        .as_mut()
+        .ok_or_else(|| "project changed before the query turn could be saved".to_string())?;
+    let thread = reload_bound_query_thread(project, binding)?;
+
+    let completed_at = current_query_timestamp();
+    let code_evidence_ids = known_query_code_evidence_ids(&completion.answer, &completion.map);
+    let turn = PersistedQueryTurn {
+        question: question.to_string(),
+        answer: completion.answer,
+        map: completion.map,
+        evidence: Some(QueryEvidenceState {
+            status: completion.evidence.status,
+            sources: completion.evidence.sources,
+            warning: completion.evidence.warning,
+        }),
+        code_evidence_ids,
+        completed_at: completed_at.clone(),
+    };
+    let saved = project
+        .query_threads
+        .append_turn(thread, turn)
+        .map_err(|error| format!("cannot save completed query turn: {error}"))?;
+    Ok((saved.id, saved.updated_at))
+}
+
 /// Resolve optional Web evidence after ADR-0017 local source planning has built
 /// the final private prompt. Progress and metadata are emitted before streaming;
 /// only successful web text is appended, wrapped as untrusted evidence.
@@ -3493,38 +3808,35 @@ async fn stream_query_answer<F>(
     user: &str,
     log_scope: &str,
     emit: &mut F,
-) where
+) -> Result<String, String>
+where
     F: FnMut(QueryFrame) + Send,
 {
     let resp = match llm.open_chat_stream(system, user).await {
         Ok(response) => response,
         Err(error) => {
             eprintln!("[{log_scope}] LLM error: {error}");
-            emit(QueryFrame::Error {
-                message: format!("LLM error: {error}"),
-            });
-            return;
+            return Err(format!("LLM error: {error}"));
         }
     };
 
     let mut stream = resp.bytes_stream();
     let mut decoder = SseDecoder::new();
+    let mut answer = String::new();
     while let Some(chunk) = stream.next().await {
         let bytes = match chunk {
             Ok(bytes) => bytes,
             Err(error) => {
                 eprintln!("[{log_scope}] stream error: {error}");
-                emit(QueryFrame::Error {
-                    message: format!("LLM stream error: {error}"),
-                });
-                return;
+                return Err(format!("LLM stream error: {error}"));
             }
         };
         for delta in decoder.push(&String::from_utf8_lossy(&bytes)) {
+            answer.push_str(&delta);
             emit(QueryFrame::Delta { text: delta });
         }
     }
-    emit(QueryFrame::Done);
+    Ok(answer)
 }
 
 fn current_query_evidence_after_plan(
@@ -3540,6 +3852,9 @@ fn current_query_evidence_after_plan(
     let project = guard
         .as_mut()
         .ok_or_else(|| "no project open".to_string())?;
+    if let Some(binding) = req.binding.as_ref() {
+        reload_bound_query_thread(project, binding)?;
+    }
     let active_source = project
         .reader
         .read_file(&req.file_path)
@@ -3590,6 +3905,7 @@ fn current_query_evidence_after_plan(
 
 fn selected_query_evidence_after_plan(
     state: &AppState,
+    binding: Option<&QueryThreadBinding>,
     planned_sources: &BTreeMap<String, String>,
     targets: &[QuerySourceTarget],
     need: &[String],
@@ -3598,6 +3914,9 @@ fn selected_query_evidence_after_plan(
     let project = guard
         .as_mut()
         .ok_or_else(|| "no project open".to_string())?;
+    if let Some(binding) = binding {
+        reload_bound_query_thread(project, binding)?;
+    }
     project.graphs.refresh();
 
     let mut current_sources = BTreeMap::new();
@@ -3632,7 +3951,11 @@ fn selected_query_evidence_after_plan(
 /// Run one current-file query without owning a socket. The synchronous emitter
 /// lets progress frames reach the socket while the worker is awaiting provider IO
 /// and gives fixtures the exact same execution path as production.
-async fn run_query_emitting<F>(state: &AppState, req: QueryRequest, mut emit: F)
+async fn run_query_emitting<F>(
+    state: &AppState,
+    req: QueryRequest,
+    mut emit: F,
+) -> Result<QueryCompletion, String>
 where
     F: FnMut(QueryFrame) + Send,
 {
@@ -3644,10 +3967,7 @@ where
     } = state.llm_snapshot();
     let (system, user, map, dependency_hints) =
         match prepare_query_for_snapshot(state, &req, llm_proxy.as_ref().map(|_| &llm_config)) {
-            QueryPlan::Err(message) => {
-                emit(QueryFrame::Error { message });
-                return;
-            }
+            QueryPlan::Err(message) => return Err(message),
             QueryPlan::Direct {
                 system,
                 user,
@@ -3699,10 +4019,7 @@ where
                     &need,
                 ) {
                     Ok(evidence) => evidence,
-                    Err(message) => {
-                        emit(QueryFrame::Error { message });
-                        return;
-                    }
+                    Err(message) => return Err(message),
                 };
                 if !evidence.is_empty() {
                     let got = evidence
@@ -3719,10 +4036,7 @@ where
                 let focus_ref = focus_name.as_deref().map(|name| QueryFocus { name });
                 let map = match assemble_current_query_map(&orientation, &evidence) {
                     Ok(map) => map,
-                    Err(message) => {
-                        emit(QueryFrame::Error { message });
-                        return;
-                    }
+                    Err(message) => return Err(message),
                 };
                 let (system, user) = build_query_prompt_with_map(
                     &req.question,
@@ -3743,23 +4057,29 @@ where
     let (user, evidence) =
         enrich_query_user(llm, user, &dependency_hints, req.allow_web, &mut emit).await;
     emit(query_status(QueryPhase::Answering, "正在生成追问回答"));
-    emit(QueryFrame::Map { map });
+    emit(QueryFrame::Map { map: map.clone() });
     emit(query_evidence(&evidence));
     eprintln!("[query] {} — streaming ({})", req.file_path, llm.model);
-    stream_query_answer(llm, &system, &user, "query", &mut emit).await;
+    let answer = stream_query_answer(llm, &system, &user, "query", &mut emit).await?;
+    Ok(QueryCompletion {
+        map,
+        evidence,
+        answer,
+    })
 }
 
-async fn run_query_files_emitting<F>(state: &AppState, req: QueryFilesRequest, mut emit: F)
+async fn run_query_files_emitting<F>(
+    state: &AppState,
+    req: QueryFilesRequest,
+    mut emit: F,
+) -> Result<QueryCompletion, String>
 where
     F: FnMut(QueryFrame) + Send,
 {
     let llm_proxy = state.llm_proxy();
     let (system, user, map, dependency_hints) =
         match prepare_query_files_for_snapshot(state, &req, llm_proxy.is_some()) {
-            QueryFilesPlan::Err(message) => {
-                emit(QueryFrame::Error { message });
-                return;
-            }
+            QueryFilesPlan::Err(message) => return Err(message),
             QueryFilesPlan::Direct {
                 system,
                 user,
@@ -3795,14 +4115,16 @@ where
                         Vec::new()
                     }
                 };
-                let evidence =
-                    match selected_query_evidence_after_plan(state, &sources, &targets, &need) {
-                        Ok(evidence) => evidence,
-                        Err(message) => {
-                            emit(QueryFrame::Error { message });
-                            return;
-                        }
-                    };
+                let evidence = match selected_query_evidence_after_plan(
+                    state,
+                    req.binding.as_ref(),
+                    &sources,
+                    &targets,
+                    &need,
+                ) {
+                    Ok(evidence) => evidence,
+                    Err(message) => return Err(message),
+                };
                 if !evidence.is_empty() {
                     let got = evidence
                         .entries
@@ -3813,10 +4135,7 @@ where
                 }
                 let map = match assemble_file_set_query_map(&req.question, &ctx, &evidence) {
                     Ok(map) => map,
-                    Err(message) => {
-                        emit(QueryFrame::Error { message });
-                        return;
-                    }
+                    Err(message) => return Err(message),
                 };
                 let (system, user) = build_file_set_query_prompt_with_map(
                     &req.question,
@@ -3835,14 +4154,19 @@ where
     let (user, evidence) =
         enrich_query_user(llm, user, &dependency_hints, req.allow_web, &mut emit).await;
     emit(query_status(QueryPhase::Answering, "正在生成追问回答"));
-    emit(QueryFrame::Map { map });
+    emit(QueryFrame::Map { map: map.clone() });
     emit(query_evidence(&evidence));
     eprintln!(
         "[query-files] {} files — streaming ({})",
         req.file_paths.len(),
         llm.model
     );
-    stream_query_answer(llm, &system, &user, "query-files", &mut emit).await;
+    let answer = stream_query_answer(llm, &system, &user, "query-files", &mut emit).await?;
+    Ok(QueryCompletion {
+        map,
+        evidence,
+        answer,
+    })
 }
 
 async fn query_ws(ws: WebSocketUpgrade, State(state): State<Shared>) -> impl IntoResponse {
@@ -3863,7 +4187,7 @@ async fn handle_query_socket(mut socket: WebSocket, state: Shared) {
             _ => continue,
         };
 
-        let req: QueryRequest = match serde_json::from_str(&text) {
+        let mut req: QueryRequest = match serde_json::from_str(&text) {
             Ok(r) => r,
             Err(e) => {
                 let _ = send_query_frame(
@@ -3878,13 +4202,22 @@ async fn handle_query_socket(mut socket: WebSocket, state: Shared) {
             }
         };
         let req_id = req.req_id.clone();
+        let binding = match bind_current_query_thread(&state, &mut req) {
+            Ok(binding) => binding,
+            Err(message) => {
+                let _ =
+                    send_query_frame(&mut socket, &req_id, &QueryFrame::Error { message }).await;
+                continue;
+            }
+        };
+        let question = req.question.clone();
         let worker_state = Arc::clone(&state);
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         let worker = tokio::spawn(async move {
             run_query_emitting(&worker_state, req, move |frame| {
                 let _ = sender.send(frame);
             })
-            .await;
+            .await
         });
         while let Some(frame) = receiver.recv().await {
             if send_query_frame(&mut socket, &req_id, &frame)
@@ -3895,7 +4228,25 @@ async fn handle_query_socket(mut socket: WebSocket, state: Shared) {
                 return;
             }
         }
-        let _ = worker.await;
+        let outcome = match worker.await {
+            Ok(outcome) => outcome,
+            Err(error) => Err(format!("query worker failed: {error}")),
+        };
+        let terminal = match outcome.and_then(|completion| {
+            persist_query_completion(&state, &binding, &question, completion)
+        }) {
+            Ok((thread_id, updated_at)) => QueryFrame::Done {
+                thread_id,
+                updated_at,
+            },
+            Err(message) => QueryFrame::Error { message },
+        };
+        if send_query_frame(&mut socket, &req_id, &terminal)
+            .await
+            .is_err()
+        {
+            return;
+        }
     }
 }
 
@@ -3908,7 +4259,7 @@ async fn handle_query_files_socket(mut socket: WebSocket, state: Shared) {
             _ => continue,
         };
 
-        let req: QueryFilesRequest = match serde_json::from_str(&text) {
+        let mut req: QueryFilesRequest = match serde_json::from_str(&text) {
             Ok(r) => r,
             Err(e) => {
                 let _ = send_query_frame(
@@ -3923,13 +4274,22 @@ async fn handle_query_files_socket(mut socket: WebSocket, state: Shared) {
             }
         };
         let req_id = req.req_id.clone();
+        let binding = match bind_selected_query_thread(&state, &mut req) {
+            Ok(binding) => binding,
+            Err(message) => {
+                let _ =
+                    send_query_frame(&mut socket, &req_id, &QueryFrame::Error { message }).await;
+                continue;
+            }
+        };
+        let question = req.question.clone();
         let worker_state = Arc::clone(&state);
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         let worker = tokio::spawn(async move {
             run_query_files_emitting(&worker_state, req, move |frame| {
                 let _ = sender.send(frame);
             })
-            .await;
+            .await
         });
         while let Some(frame) = receiver.recv().await {
             if send_query_frame(&mut socket, &req_id, &frame)
@@ -3940,7 +4300,25 @@ async fn handle_query_files_socket(mut socket: WebSocket, state: Shared) {
                 return;
             }
         }
-        let _ = worker.await;
+        let outcome = match worker.await {
+            Ok(outcome) => outcome,
+            Err(error) => Err(format!("query-files worker failed: {error}")),
+        };
+        let terminal = match outcome.and_then(|completion| {
+            persist_query_completion(&state, &binding, &question, completion)
+        }) {
+            Ok((thread_id, updated_at)) => QueryFrame::Done {
+                thread_id,
+                updated_at,
+            },
+            Err(message) => QueryFrame::Error { message },
+        };
+        if send_query_frame(&mut socket, &req_id, &terminal)
+            .await
+            .is_err()
+        {
+            return;
+        }
     }
 }
 
@@ -7658,11 +8036,47 @@ mod tests {
         }
     }
 
+    fn create_query_test_thread(
+        app: &QueryAppServer,
+        scope: QueryScopeSpec,
+        original_question: &str,
+    ) -> QueryThread {
+        app.state
+            .project
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .query_threads
+            .create_thread(scope, original_question, &current_query_timestamp())
+            .unwrap()
+    }
+
     async fn query_ws_frames(
         app: &QueryAppServer,
         endpoint: &str,
-        request: serde_json::Value,
+        mut request: serde_json::Value,
     ) -> Vec<serde_json::Value> {
+        if request.get("threadId").is_none() {
+            let scope = if endpoint == "/api/query" {
+                QueryScopeSpec::Current {
+                    paths: vec![request["filePath"].as_str().unwrap().to_string()],
+                }
+            } else {
+                QueryScopeSpec::Selected {
+                    paths: request["filePaths"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|path| path.as_str().unwrap().to_string())
+                        .collect(),
+                }
+            };
+            let question = request["question"].as_str().unwrap();
+            let thread = create_query_test_thread(app, scope, question);
+            request["threadId"] = thread.id.into();
+        }
+        request.as_object_mut().unwrap().remove("trace");
         let url = format!("{}{endpoint}", app.ws_base_url);
         let (mut socket, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
         socket
@@ -7784,6 +8198,14 @@ mod tests {
         assert_eq!(kinds.iter().filter(|kind| **kind == "map").count(), 1);
         assert!(!kinds.contains(&"error"));
         assert_eq!(frames[delta]["text"], "fixture answer");
+        assert_eq!(
+            frames[done]["threadId"].as_str().map(str::len),
+            Some(32),
+            "done must identify the durable thread"
+        );
+        assert!(frames[done]["updatedAt"]
+            .as_str()
+            .is_some_and(|value| value.ends_with('Z')));
 
         let map: crate::context_assembler::QueryMap =
             serde_json::from_value(frames[map_index]["map"].clone()).expect("query map frame");
@@ -7814,10 +8236,12 @@ mod tests {
     fn query_req(file_path: &str, focus: Option<[u32; 2]>) -> QueryRequest {
         QueryRequest {
             req_id: "q1".into(),
+            thread_id: "0123456789abcdef0123456789abcdef".into(),
             file_path: file_path.into(),
             orientation_id: String::new(),
             question: "这个函数做什么？".into(),
             trace: None,
+            binding: None,
             focus: focus.map(|lr| FunctionSpan {
                 id: "f#1".into(),
                 name: "f".into(),
@@ -7834,9 +8258,11 @@ mod tests {
     fn query_files_req(file_paths: &[&str]) -> QueryFilesRequest {
         QueryFilesRequest {
             req_id: "qf1".into(),
+            thread_id: "0123456789abcdef0123456789abcdef".into(),
             file_paths: file_paths.iter().map(|p| p.to_string()).collect(),
             question: "这些文件怎么协作？".into(),
             trace: None,
+            binding: None,
             allow_web: true,
         }
     }
@@ -7912,8 +8338,14 @@ mod tests {
         .unwrap();
         assert_eq!(v["kind"], "delta");
         assert_eq!(v["text"], "你好");
-        let v = serde_json::to_value(QueryFrame::Done).unwrap();
+        let v = serde_json::to_value(QueryFrame::Done {
+            thread_id: "0123456789abcdef0123456789abcdef".into(),
+            updated_at: "2026-08-10T12:34:56.789Z".into(),
+        })
+        .unwrap();
         assert_eq!(v["kind"], "done");
+        assert_eq!(v["threadId"], "0123456789abcdef0123456789abcdef");
+        assert_eq!(v["updatedAt"], "2026-08-10T12:34:56.789Z");
         let v = serde_json::to_value(QueryFrame::Error {
             message: "x".into(),
         })
@@ -7925,11 +8357,13 @@ mod tests {
     #[test]
     fn query_requests_default_allow_web_on_for_older_clients() {
         let current: QueryRequest = serde_json::from_value(serde_json::json!({
+            "threadId": "0123456789abcdef0123456789abcdef",
             "filePath": "a.py",
             "question": "?"
         }))
         .unwrap();
         let files: QueryFilesRequest = serde_json::from_value(serde_json::json!({
+            "threadId": "0123456789abcdef0123456789abcdef",
             "filePaths": ["a.py", "b.py"],
             "question": "?"
         }))
@@ -7939,19 +8373,25 @@ mod tests {
     }
 
     #[test]
-    fn query_trace_contract_is_scope_and_revision_bound() {
-        let current: QueryRequest =
-            serde_json::from_value(query_current_json(false, "orientation-a1"))
-                .expect("current trace request");
-        let trace = current.trace.as_ref().expect("current trace");
-        assert!(validate_query_trace(trace, "current:a.py", "orientation-a1").is_ok());
+    fn query_trace_runtime_identity_is_bound_and_wire_trace_is_ignored() {
+        let trace = QueryTrace {
+            scope_key: "current:a.py".into(),
+            scope_revision: "orientation-a1".into(),
+            original_question: "为什么要先校验？".into(),
+            turns: vec![crate::context_assembler::QueryTurn {
+                question: "为什么要先校验？".into(),
+                answer: "纠正：这里还阻止陈旧 revision。".into(),
+                code_evidence_ids: Vec::new(),
+            }],
+        };
+        assert!(validate_query_trace(&trace, "current:a.py", "orientation-a1").is_ok());
         assert!(
-            validate_query_trace(trace, "current:b.py", "orientation-a1")
+            validate_query_trace(&trace, "current:b.py", "orientation-a1")
                 .unwrap_err()
                 .contains("scopeKey")
         );
         assert!(
-            validate_query_trace(trace, "current:a.py", "orientation-a2")
+            validate_query_trace(&trace, "current:a.py", "orientation-a2")
                 .unwrap_err()
                 .contains("scopeRevision")
         );
@@ -7962,6 +8402,14 @@ mod tests {
             validate_query_trace(&incomplete, "current:a.py", "orientation-a1")
                 .unwrap_err()
                 .contains("incomplete turn")
+        );
+
+        let mut wire = query_current_json(false, "orientation-a1");
+        wire["threadId"] = "0123456789abcdef0123456789abcdef".into();
+        let current: QueryRequest = serde_json::from_value(wire).expect("current query request");
+        assert!(
+            current.trace.is_none(),
+            "client trace must not become server truth"
         );
 
         let paths = vec!["b.py".into(), "a.py".into(), "a.py".into()];
@@ -8253,12 +8701,8 @@ mod tests {
         assert!(answer_prompts
             .iter()
             .all(|prompt| prompt.contains("【追问轨迹·原始问题】")));
-        assert!(answer_prompts
-            .iter()
-            .all(|prompt| prompt.contains("纠正：")));
-        assert!(answer_prompts
-            .iter()
-            .all(|prompt| prompt.contains("不是源码证据")));
+        assert!(answer_prompts[0].contains("这个函数做什么？"));
+        assert!(answer_prompts[1].contains("这些文件怎么协作？"));
         assert!(answer_prompts
             .iter()
             .all(|prompt| prompt.contains("【追问方向图（后端确定性组装，不是模型输出）】")));
@@ -8489,6 +8933,394 @@ mod tests {
             assert!(!frames.iter().any(|frame| frame["kind"] == "delta"));
             assert!(!frames.iter().any(|frame| frame["kind"] == "done"));
         }
+    }
+
+    #[tokio::test]
+    async fn query_websocket_persists_before_done_and_replays_the_same_thread() {
+        let tmp = TmpDir::new();
+        write_query_fixture_project(tmp.path());
+        let mock = start_query_mock(
+            r#"{"action":"local"}"#,
+            StatusCode::OK,
+            include_str!("../tests/fixtures/web_search/openai_cited.json"),
+            Duration::ZERO,
+            StatusCode::OK,
+        )
+        .await;
+        let (state, orientation_id) = query_state(tmp.path(), &mock, Duration::from_secs(1));
+        let app = start_query_app(state).await;
+        let client = reqwest::Client::new();
+
+        let created: serde_json::Value = client
+            .post(format!("{}/api/query-threads", app.http_base_url))
+            .json(&serde_json::json!({
+                "scope": { "kind": "current", "paths": ["a.py"] },
+                "originalQuestion": "这个函数做什么？"
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let thread_id = created["id"].as_str().unwrap();
+
+        let mut first = query_current_json(false, &orientation_id);
+        first["threadId"] = thread_id.into();
+        first.as_object_mut().unwrap().remove("trace");
+        let first_frames = query_ws_frames(&app, "/api/query", first).await;
+        assert_query_stream_succeeds(&first_frames, "q-ws");
+        let first_done = first_frames.last().unwrap();
+        assert_eq!(first_done["threadId"], thread_id);
+
+        let first_saved: serde_json::Value = client
+            .get(format!(
+                "{}/api/query-threads/{thread_id}",
+                app.http_base_url
+            ))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(first_saved["turns"].as_array().unwrap().len(), 1);
+        assert_eq!(first_saved["turns"][0]["question"], "这个函数做什么？");
+        assert_eq!(first_saved["turns"][0]["answer"], "fixture answer");
+        assert_eq!(first_done["updatedAt"], first_saved["updatedAt"]);
+
+        let mut second = query_current_json(false, &orientation_id);
+        second["threadId"] = thread_id.into();
+        second["reqId"] = "q-ws-follow-up".into();
+        second["question"] = "那返回值呢？".into();
+        second.as_object_mut().unwrap().remove("trace");
+        let second_frames = query_ws_frames(&app, "/api/query", second).await;
+        assert_query_stream_succeeds(&second_frames, "q-ws-follow-up");
+
+        let second_saved: serde_json::Value = client
+            .get(format!(
+                "{}/api/query-threads/{thread_id}",
+                app.http_base_url
+            ))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(second_saved["turns"].as_array().unwrap().len(), 2);
+        assert_eq!(second_saved["turns"][1]["question"], "那返回值呢？");
+
+        let requests = mock.requests.lock().unwrap();
+        let follow_up_prompt = requests
+            .iter()
+            .rev()
+            .find(|(kind, _)| kind == "answer")
+            .and_then(|(_, body)| body["messages"][1]["content"].as_str())
+            .expect("follow-up answer prompt");
+        assert!(follow_up_prompt.contains("【追问轨迹·原始问题】\n这个函数做什么？"));
+        assert!(follow_up_prompt.contains("【Turn 1】"));
+        assert!(follow_up_prompt.contains("答：fixture answer"));
+    }
+
+    #[tokio::test]
+    async fn query_files_websocket_persists_the_normalized_selected_thread() {
+        let tmp = TmpDir::new();
+        write_query_fixture_project(tmp.path());
+        let mock = start_query_mock(
+            r#"{"action":"local"}"#,
+            StatusCode::OK,
+            include_str!("../tests/fixtures/web_search/openai_cited.json"),
+            Duration::ZERO,
+            StatusCode::OK,
+        )
+        .await;
+        let (state, _) = query_state(tmp.path(), &mock, Duration::from_secs(1));
+        let app = start_query_app(state).await;
+        let thread = create_query_test_thread(
+            &app,
+            QueryScopeSpec::Selected {
+                paths: vec!["b.py".into(), "a.py".into()],
+            },
+            "这些文件怎么协作？",
+        );
+        let mut request = query_files_json(false);
+        request["threadId"] = thread.id.clone().into();
+
+        let frames = query_ws_frames(&app, "/api/query-files", request).await;
+        assert_query_stream_succeeds(&frames, "qf-ws");
+        let saved = app
+            .state
+            .project
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .query_threads
+            .get(&thread.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.scope.paths(), ["a.py", "b.py"]);
+        assert_eq!(saved.turns.len(), 1);
+        assert_eq!(saved.turns[0].question, "这些文件怎么协作？");
+        assert_eq!(frames.last().unwrap()["updatedAt"], saved.updated_at);
+    }
+
+    #[tokio::test]
+    async fn query_websocket_rejects_thread_boundaries_before_any_llm_call() {
+        let tmp = TmpDir::new();
+        write_query_fixture_project(tmp.path());
+        let mock = start_query_mock(
+            r#"{"action":"local"}"#,
+            StatusCode::OK,
+            include_str!("../tests/fixtures/web_search/openai_cited.json"),
+            Duration::ZERO,
+            StatusCode::OK,
+        )
+        .await;
+        let (state, orientation_id) = query_state(tmp.path(), &mock, Duration::from_secs(1));
+        let app = start_query_app(state).await;
+        let stale = create_query_test_thread(
+            &app,
+            QueryScopeSpec::Current {
+                paths: vec!["a.py".into()],
+            },
+            "这个函数做什么？",
+        );
+        std::fs::write(tmp.path().join("a.py"), "def fa():\n    return 2\n").unwrap();
+
+        let mut stale_request = query_current_json(false, &orientation_id);
+        stale_request["threadId"] = stale.id.clone().into();
+        let stale_frames = query_ws_frames(&app, "/api/query", stale_request).await;
+        assert_eq!(stale_frames.len(), 1);
+        assert_eq!(stale_frames[0]["kind"], "error");
+        assert!(stale_frames[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("stale"));
+
+        let fresh = create_query_test_thread(
+            &app,
+            QueryScopeSpec::Current {
+                paths: vec!["a.py".into()],
+            },
+            "这个函数做什么？",
+        );
+        let mut wrong_scope = query_files_json(false);
+        wrong_scope["threadId"] = fresh.id.clone().into();
+        let wrong_scope_frames = query_ws_frames(&app, "/api/query-files", wrong_scope).await;
+        assert_eq!(wrong_scope_frames.len(), 1);
+        assert!(wrong_scope_frames[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("scope"));
+
+        let mut wrong_first = query_current_json(false, &orientation_id);
+        wrong_first["threadId"] = fresh.id.clone().into();
+        wrong_first["question"] = "另一个首问".into();
+        let wrong_first_frames = query_ws_frames(&app, "/api/query", wrong_first).await;
+        assert_eq!(wrong_first_frames.len(), 1);
+        assert!(wrong_first_frames[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("originalQuestion"));
+
+        let other = TmpDir::new();
+        write_query_fixture_project(other.path());
+        let (other_state, other_orientation) =
+            query_state(other.path(), &mock, Duration::from_secs(1));
+        let other_app = start_query_app(other_state).await;
+        let mut cross_project = query_current_json(false, &other_orientation);
+        cross_project["threadId"] = fresh.id.into();
+        let cross_project_frames = query_ws_frames(&other_app, "/api/query", cross_project).await;
+        assert_eq!(cross_project_frames.len(), 1);
+        assert!(cross_project_frames[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("current project"));
+        assert!(mock.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn query_websocket_llm_and_storage_failures_never_append_or_emit_done() {
+        let tmp = TmpDir::new();
+        write_query_fixture_project(tmp.path());
+        let failing_llm = start_query_mock(
+            r#"{"action":"local"}"#,
+            StatusCode::OK,
+            include_str!("../tests/fixtures/web_search/openai_cited.json"),
+            Duration::ZERO,
+            StatusCode::BAD_GATEWAY,
+        )
+        .await;
+        let (state, orientation_id) = query_state(tmp.path(), &failing_llm, Duration::from_secs(1));
+        let app = start_query_app(state).await;
+        let thread = create_query_test_thread(
+            &app,
+            QueryScopeSpec::Current {
+                paths: vec!["a.py".into()],
+            },
+            "这个函数做什么？",
+        );
+        let mut request = query_current_json(false, &orientation_id);
+        request["threadId"] = thread.id.clone().into();
+        let frames = query_ws_frames(&app, "/api/query", request).await;
+        assert_eq!(frames.last().unwrap()["kind"], "error");
+        assert!(!frames.iter().any(|frame| frame["kind"] == "done"));
+        assert!(app
+            .state
+            .project
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .query_threads
+            .get(&thread.id)
+            .unwrap()
+            .unwrap()
+            .turns
+            .is_empty());
+
+        let storage_tmp = TmpDir::new();
+        write_query_fixture_project(storage_tmp.path());
+        let successful_llm = start_query_mock(
+            r#"{"action":"local"}"#,
+            StatusCode::OK,
+            include_str!("../tests/fixtures/web_search/openai_cited.json"),
+            Duration::ZERO,
+            StatusCode::OK,
+        )
+        .await;
+        let (storage_state, storage_orientation) =
+            query_state(storage_tmp.path(), &successful_llm, Duration::from_secs(1));
+        let storage_app = start_query_app(storage_state).await;
+        let storage_thread = create_query_test_thread(
+            &storage_app,
+            QueryScopeSpec::Current {
+                paths: vec!["a.py".into()],
+            },
+            "这个函数做什么？",
+        );
+        storage_app
+            .state
+            .project
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .query_threads
+            .fail_next_put_for_test();
+        let mut storage_request = query_current_json(false, &storage_orientation);
+        storage_request["threadId"] = storage_thread.id.clone().into();
+        let storage_frames = query_ws_frames(&storage_app, "/api/query", storage_request).await;
+        assert_eq!(storage_frames.last().unwrap()["kind"], "error");
+        assert!(storage_frames.last().unwrap()["message"]
+            .as_str()
+            .unwrap()
+            .contains("injected query thread write failure"));
+        assert!(!storage_frames.iter().any(|frame| frame["kind"] == "done"));
+        assert!(storage_app
+            .state
+            .project
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .query_threads
+            .get(&storage_thread.id)
+            .unwrap()
+            .unwrap()
+            .turns
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn duplicate_query_terminal_commit_cannot_append_the_same_turn_twice() {
+        let tmp = TmpDir::new();
+        write_query_fixture_project(tmp.path());
+        let mock = start_query_mock(
+            r#"{"action":"local"}"#,
+            StatusCode::OK,
+            include_str!("../tests/fixtures/web_search/openai_cited.json"),
+            Duration::ZERO,
+            StatusCode::OK,
+        )
+        .await;
+        let (state, orientation_id) = query_state(tmp.path(), &mock, Duration::from_secs(1));
+        let app = start_query_app(state).await;
+        let thread = create_query_test_thread(
+            &app,
+            QueryScopeSpec::Current {
+                paths: vec!["a.py".into()],
+            },
+            "这个函数做什么？",
+        );
+        let mut request = query_current_json(false, &orientation_id);
+        request["threadId"] = thread.id.clone().into();
+        let frames = query_ws_frames(&app, "/api/query", request).await;
+        assert_query_stream_succeeds(&frames, "q-ws");
+
+        let saved = app
+            .state
+            .project
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .query_threads
+            .get(&thread.id)
+            .unwrap()
+            .unwrap();
+        let binding = QueryThreadBinding {
+            thread_id: saved.id.clone(),
+            project_root: app
+                .state
+                .project
+                .read()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .query_threads
+                .project_root()
+                .to_path_buf(),
+            source_revision: saved.source_revision.clone(),
+            updated_at: saved.updated_at.clone(),
+            turn_count: saved.turns.len(),
+            scope: saved.scope.clone(),
+        };
+        let persisted_evidence = saved.turns[0].evidence.clone().unwrap();
+        assert!(known_query_code_evidence_ids(
+            "`[E1]`\n```text\n[E1]\n```\nunknown [E9]",
+            &saved.turns[0].map,
+        )
+        .is_empty());
+        let completion = QueryCompletion {
+            map: saved.turns[0].map.clone(),
+            evidence: EvidenceOutcome {
+                status: persisted_evidence.status,
+                text: None,
+                sources: persisted_evidence.sources,
+                warning: persisted_evidence.warning,
+            },
+            answer: "第二轮只保存一次 [E1]".into(),
+        };
+        persist_query_completion(&app.state, &binding, "后续问题", completion.clone()).unwrap();
+        let duplicate =
+            persist_query_completion(&app.state, &binding, "后续问题", completion).unwrap_err();
+        assert!(duplicate.contains("changed while the answer was streaming"));
+        let final_thread = app
+            .state
+            .project
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .query_threads
+            .get(&thread.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(final_thread.turns.len(), 2);
+        assert_eq!(final_thread.turns[1].code_evidence_ids, ["E1"]);
     }
 
     #[test]
@@ -8769,6 +9601,7 @@ mod tests {
         .unwrap();
         let evidence = selected_query_evidence_after_plan(
             &state,
+            None,
             &plan.sources,
             &plan.targets,
             &["unknown-id".into(), a_id],
