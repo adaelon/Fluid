@@ -38,17 +38,18 @@ use crate::context_assembler::{
     build_file_set_query_prompt_with_map, build_full_orientation_function_evidence_sources,
     build_full_orientation_role_batch_specs, build_gen_prompt,
     build_orientation_role_batch_correction_prompt, build_orientation_role_batch_prompt,
-    build_orientation_skeleton_prompt, build_orientation_source_planning_prompt,
-    build_query_prompt, build_query_prompt_with_map, build_query_source_planning_prompt,
-    build_selection_explanation_prompt, build_selection_private_context,
-    build_untrusted_web_evidence_block, cross_file_query_source_targets, cross_file_targets,
-    extract_selection_site, file_set_query_source_targets, focus_query_source_target,
-    inline_query_source_target, is_dependency_manifest_path, local_query_source_targets,
-    orientation_core_source_targets, orientation_requires_source_planning,
-    rebase_query_source_targets, sample_dependency_manifests, select_query_source_targets,
-    slice_orientation_sources, slice_span, CrossFileTarget, EvidenceCatalog, FileSetContext,
-    FunctionSpan, GenContext, QueryFocus, QueryMap, QuerySourceTarget, QueryTrace, SharedContext,
-    ORIENTATION_FETCH_BUDGET_CHARS, QUERY_FETCH_BUDGET_CHARS,
+    build_orientation_skeleton_correction_prompt, build_orientation_skeleton_prompt,
+    build_orientation_source_planning_prompt, build_query_prompt, build_query_prompt_with_map,
+    build_query_source_planning_prompt, build_selection_explanation_prompt,
+    build_selection_private_context, build_untrusted_web_evidence_block,
+    cross_file_query_source_targets, cross_file_targets, extract_selection_site,
+    file_set_query_source_targets, focus_query_source_target, inline_query_source_target,
+    is_dependency_manifest_path, local_query_source_targets, orientation_core_source_targets,
+    orientation_requires_source_planning, rebase_query_source_targets, sample_dependency_manifests,
+    select_query_source_targets, slice_orientation_sources, slice_span, CrossFileTarget,
+    EvidenceCatalog, FileSetContext, FunctionSpan, GenContext, QueryFocus, QueryMap,
+    QuerySourceTarget, QueryTrace, SharedContext, ORIENTATION_FETCH_BUDGET_CHARS,
+    QUERY_FETCH_BUDGET_CHARS,
 };
 use crate::graph_loader::{GraphCatalog, GraphNode, KnowledgeGraph};
 #[cfg(test)]
@@ -946,15 +947,6 @@ where
         }
     };
     let snapshot_line_ranges = orientation_roster_line_ranges(&work.roster_spans);
-    let skeleton = match parse_orientation_skeleton(&skeleton_content) {
-        Ok(skeleton) => skeleton,
-        Err(error) => {
-            emit(orientation_error(format!(
-                "orientation skeleton parse error: {error}"
-            )));
-            return;
-        }
-    };
     let skeleton_validation = OrientationValidationContext {
         file_path: &work.file_path,
         source: &work.source,
@@ -965,12 +957,59 @@ where
             None
         },
     };
-    if let Err(error) = validate_orientation_skeleton(&skeleton, &skeleton_validation) {
-        emit(orientation_error(format!(
-            "orientation skeleton validation error: {error}"
-        )));
-        return;
-    }
+    let first_attempt = match parse_orientation_skeleton(&skeleton_content) {
+        Ok(skeleton) => match validate_orientation_skeleton(&skeleton, &skeleton_validation) {
+            Ok(()) => Ok(skeleton),
+            Err(error) => Err(format!("validation error: {error}")),
+        },
+        Err(error) => Err(format!("parse error: {error}")),
+    };
+    let skeleton = match first_attempt {
+        Ok(skeleton) => skeleton,
+        Err(first_error) => {
+            eprintln!(
+                "[orient] skeleton {} — correcting protocol error ({})",
+                work.file_path, work.llm.model
+            );
+            let (correction_system, correction_user) = build_orientation_skeleton_correction_prompt(
+                &plan.skeleton_system,
+                &plan.skeleton_user,
+                &skeleton_content,
+                &first_error,
+            );
+            let corrected_content = match work
+                .llm
+                .complete(&correction_system, &correction_user)
+                .await
+            {
+                Ok(content) => content,
+                Err(error) => {
+                    emit(orientation_error(format!(
+                        "orientation skeleton correction LLM error: {error}"
+                    )));
+                    return;
+                }
+            };
+            let corrected_skeleton = match parse_orientation_skeleton(&corrected_content) {
+                Ok(skeleton) => skeleton,
+                Err(error) => {
+                    emit(orientation_error(format!(
+                        "orientation skeleton correction parse error: {error}"
+                    )));
+                    return;
+                }
+            };
+            if let Err(error) =
+                validate_orientation_skeleton(&corrected_skeleton, &skeleton_validation)
+            {
+                emit(orientation_error(format!(
+                    "orientation skeleton correction validation error: {error}"
+                )));
+                return;
+            }
+            corrected_skeleton
+        }
+    };
     let (skeleton, evidence_bindings) =
         match bind_exact_function_evidence(skeleton, &plan.evidence_sources, &work.file_path) {
             Ok(bound) => bound,
@@ -4287,6 +4326,15 @@ mod tests {
         })
     }
 
+    fn orientation_skeleton_with_invalid_flow_direction(
+        card: &serde_json::Value,
+    ) -> serde_json::Value {
+        let mut skeleton = orientation_skeleton_json(card);
+        skeleton["coreFlows"][0]["why"] =
+            serde_json::json!("The upstream caller hands work to the downstream worker.");
+        skeleton
+    }
+
     fn orientation_role_batch_draft_json(card: &serde_json::Value) -> serde_json::Value {
         let mut batch = serde_json::json!({
             "functionRoles": card["functionRoles"].clone(),
@@ -5153,6 +5201,154 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn orientation_websocket_full_source_skeleton_validation_failure_corrects_once_and_caches(
+    ) {
+        let tmp = TmpDir::new();
+        std::fs::write(tmp.path().join("a.rs"), orientation_source()).unwrap();
+        let card = orientation_card_json();
+        let invalid_output = orientation_skeleton_with_invalid_flow_direction(&card).to_string();
+        let mock = start_orientation_sequence_mock(vec![
+            (StatusCode::OK, invalid_output.clone(), Duration::ZERO),
+            (
+                StatusCode::OK,
+                orientation_skeleton_json(&card).to_string(),
+                Duration::ZERO,
+            ),
+            (
+                StatusCode::OK,
+                orientation_role_batch_draft_json(&card).to_string(),
+                Duration::ZERO,
+            ),
+        ])
+        .await;
+        let app = start_orientation_app(orientation_state(tmp.path(), &mock)).await;
+
+        let miss = orientation_ws_frames(&app, orientation_request_json()).await;
+        assert_eq!(frame_kinds(&miss), vec!["status", "status", "card", "done"]);
+        let hit = orientation_ws_frames(&app, orientation_request_json()).await;
+        assert_eq!(frame_kinds(&hit), vec!["cache-hit", "card", "done"]);
+        assert_eq!(hit[1]["card"], miss[2]["card"]);
+
+        let requests = mock.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3, "skeleton -> correction -> role batch");
+        assert_eq!(requests[0]["messages"][0], requests[1]["messages"][0]);
+        let original_user = requests[0]
+            .pointer("/messages/1/content")
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        let correction_user = requests[1]
+            .pointer("/messages/1/content")
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        assert!(correction_user.starts_with(original_user));
+        assert!(correction_user.contains(&invalid_output));
+        assert!(correction_user
+            .contains("flow.why uses unbound upstream/downstream language; use actor IDs"));
+        assert!(correction_user.contains("上次无效输出"));
+        assert!(correction_user.contains("确定性校验错误"));
+        assert!(requests[2]["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("函数角色定向助手"));
+    }
+
+    #[tokio::test]
+    async fn orientation_websocket_skeleton_parse_failure_corrects_once() {
+        let tmp = TmpDir::new();
+        std::fs::write(tmp.path().join("a.rs"), orientation_source()).unwrap();
+        let card = orientation_card_json();
+        let mock = start_orientation_sequence_mock(vec![
+            (StatusCode::OK, "not-json".to_string(), Duration::ZERO),
+            (
+                StatusCode::OK,
+                orientation_skeleton_json(&card).to_string(),
+                Duration::ZERO,
+            ),
+            (
+                StatusCode::OK,
+                orientation_role_batch_draft_json(&card).to_string(),
+                Duration::ZERO,
+            ),
+        ])
+        .await;
+        let app = start_orientation_app(orientation_state(tmp.path(), &mock)).await;
+
+        let frames = orientation_ws_frames(&app, orientation_request_json()).await;
+        assert_eq!(
+            frame_kinds(&frames),
+            vec!["status", "status", "card", "done"]
+        );
+        let requests = mock.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        let correction_user = requests[1]
+            .pointer("/messages/1/content")
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        assert!(correction_user.contains("not-json"));
+        assert!(correction_user.contains("parse error"));
+    }
+
+    #[tokio::test]
+    async fn orientation_websocket_skeleton_correction_failure_is_atomic() {
+        let card = orientation_card_json();
+        let invalid_direction = orientation_skeleton_with_invalid_flow_direction(&card).to_string();
+        let cases = vec![
+            (
+                "correction-provider",
+                vec![
+                    (StatusCode::OK, invalid_direction.clone(), Duration::ZERO),
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "correction unavailable".to_string(),
+                        Duration::ZERO,
+                    ),
+                ],
+                "orientation skeleton correction LLM error",
+            ),
+            (
+                "correction-parse",
+                vec![
+                    (StatusCode::OK, "not-json".to_string(), Duration::ZERO),
+                    (StatusCode::OK, "still-not-json".to_string(), Duration::ZERO),
+                ],
+                "orientation skeleton correction parse error",
+            ),
+            (
+                "correction-validation",
+                vec![
+                    (StatusCode::OK, invalid_direction.clone(), Duration::ZERO),
+                    (StatusCode::OK, invalid_direction.clone(), Duration::ZERO),
+                ],
+                "orientation skeleton correction validation error",
+            ),
+        ];
+
+        for (case, replies, expected_error) in cases {
+            let tmp = TmpDir::new();
+            std::fs::write(tmp.path().join("a.rs"), orientation_source()).unwrap();
+            let mock = start_orientation_sequence_mock(replies).await;
+            let app = start_orientation_app(orientation_state(tmp.path(), &mock)).await;
+
+            let frames = orientation_ws_frames(&app, orientation_request_json()).await;
+            assert_eq!(frame_kinds(&frames), vec!["status", "error"], "{case}");
+            assert!(
+                frames[1]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains(expected_error),
+                "{case}: {frames:?}"
+            );
+            assert!(!frames.iter().any(|frame| frame["kind"] == "card"));
+            assert!(!frames.iter().any(|frame| frame["kind"] == "done"));
+            assert_eq!(mock.requests.lock().unwrap().len(), 2, "{case}");
+            assert!(
+                !tmp.path().join(".fluid").join("orientations").exists(),
+                "{case}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn orientation_websocket_request_id_incident_binds_every_capability_member_span() {
         let tmp = TmpDir::new();
         let file_path = "request_id_management.rs";
@@ -5706,6 +5902,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn orientation_websocket_bounded_skeleton_correction_reuses_one_source_plan() {
+        let tmp = TmpDir::new();
+        std::fs::write(tmp.path().join("large.rs"), bounded_orientation_source()).unwrap();
+        let card = bounded_orientation_card_json();
+        let invalid_output = orientation_skeleton_with_invalid_flow_direction(&card).to_string();
+        let mock = start_orientation_sequence_mock(vec![
+            (
+                StatusCode::OK,
+                serde_json::json!({ "need": ["fetch#5", "helper#8"] }).to_string(),
+                Duration::ZERO,
+            ),
+            (StatusCode::OK, invalid_output.clone(), Duration::ZERO),
+            (
+                StatusCode::OK,
+                orientation_skeleton_json(&card).to_string(),
+                Duration::ZERO,
+            ),
+            (
+                StatusCode::OK,
+                orientation_role_batch_draft_json(&card).to_string(),
+                Duration::ZERO,
+            ),
+        ])
+        .await;
+        let app = start_orientation_app(orientation_state(tmp.path(), &mock)).await;
+
+        let miss = orientation_ws_frames(&app, bounded_orientation_request_json()).await;
+        assert_eq!(
+            frame_kinds(&miss),
+            vec!["status", "status", "status", "card", "done"]
+        );
+        assert_eq!(miss[3]["card"]["coverage"]["mode"], "bounded-source");
+        assert_eq!(
+            miss[3]["card"]["coverage"]["omittedFunctionIds"],
+            serde_json::json!(["omitted#9"])
+        );
+        let hit = orientation_ws_frames(&app, bounded_orientation_request_json()).await;
+        assert_eq!(frame_kinds(&hit), vec!["cache-hit", "card", "done"]);
+
+        let requests = mock.requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            4,
+            "planner -> skeleton -> correction -> role batch"
+        );
+        let planning_system = requests[0]
+            .pointer("/messages/0/content")
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        assert!(planning_system.contains("{\"need\":[\"fnId\"]}"));
+        assert_eq!(requests[1]["messages"][0], requests[2]["messages"][0]);
+        let skeleton_user = requests[1]
+            .pointer("/messages/1/content")
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        let correction_user = requests[2]
+            .pointer("/messages/1/content")
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        assert!(correction_user.starts_with(skeleton_user));
+        for selected in ["fetch_body_marker", "helper_body_marker"] {
+            assert!(skeleton_user.contains(selected));
+            assert!(correction_user.contains(selected));
+        }
+        assert!(skeleton_user.contains("\"omitted#9\""));
+        assert!(correction_user.contains("\"omitted#9\""));
+        assert!(!skeleton_user.contains("omitted_body_marker"));
+        assert!(!correction_user.contains("omitted_body_marker"));
+        assert!(!correction_user.contains("oversized-file-padding"));
+        assert!(correction_user.contains(&invalid_output));
+        let role_user = requests[3]
+            .pointer("/messages/1/content")
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        assert!(role_user.contains("Exact fnId=fetch#5"));
+        assert!(role_user.contains("Exact fnId=helper#8"));
+        assert!(role_user.contains("SignatureOnly fnId=omitted#9"));
+    }
+
+    #[tokio::test]
     async fn orientation_websocket_large_file_plans_once_slices_exact_ids_and_caches_bounded_card()
     {
         let tmp = TmpDir::new();
@@ -5928,7 +6204,13 @@ mod tests {
 
         let frames = orientation_ws_frames(&app, orientation_request_json()).await;
         assert_eq!(frame_kinds(&frames), vec!["status", "error"]);
-        assert!(frames[1]["message"].as_str().unwrap().contains("parse"));
+        assert!(frames[1]["message"]
+            .as_str()
+            .unwrap()
+            .contains("orientation skeleton correction parse error"));
+        assert!(!frames.iter().any(|frame| frame["kind"] == "card"));
+        assert!(!frames.iter().any(|frame| frame["kind"] == "done"));
+        assert_eq!(mock.requests.lock().unwrap().len(), 2);
         assert!(!tmp.path().join(".fluid").join("orientations").exists());
     }
 
@@ -5984,6 +6266,8 @@ mod tests {
         let frames = orientation_ws_frames(&app, orientation_request_json()).await;
         assert_eq!(frame_kinds(&frames), vec!["status", "error"]);
         assert!(frames[1]["message"].as_str().unwrap().contains("LLM error"));
+        assert_eq!(mock.requests.lock().unwrap().len(), 1);
+        assert!(!tmp.path().join(".fluid").join("orientations").exists());
     }
 
     #[tokio::test]

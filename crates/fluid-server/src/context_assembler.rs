@@ -1136,7 +1136,6 @@ pub fn build_bounded_orientation_skeleton_prompt(
 
 /// Build the single allowed stage-A correction request while preserving the
 /// original prompt and its source, roster, actor, flow, and evidence boundary.
-#[allow(dead_code)] // S-ORIC-1 freezes the constructor; S-ORIC-2 wires production routing.
 pub fn build_orientation_skeleton_correction_prompt(
     original_system: &str,
     original_user: &str,
