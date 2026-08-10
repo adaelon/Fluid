@@ -3,7 +3,13 @@ import { computed } from 'vue'
 import type { CodeEvidenceRef, QueryMap } from './ghostTypes'
 import { queryEvidenceById, queryMapUnknownEvidenceIds } from './queryEvidence'
 
-const props = defineProps<{ map: QueryMap }>()
+const props = withDefaults(
+  defineProps<{
+    map: QueryMap
+    codeEvidenceEnabled?: boolean
+  }>(),
+  { codeEvidenceEnabled: true },
+)
 const emit = defineEmits<{ openEvidence: [CodeEvidenceRef] }>()
 
 const unknownEvidenceIds = computed(() => queryMapUnknownEvidenceIds(props.map))
@@ -21,7 +27,13 @@ function evidenceFor(ids: string[]): CodeEvidenceRef[] {
 
 function evidenceLabel(reference: CodeEvidenceRef): string {
   const symbol = reference.symbol ? ` · ${reference.symbol}` : ''
-  return `${reference.id} · ${reference.filePath}:${reference.startLine}-${reference.endLine}${symbol}`
+  const stale = props.codeEvidenceEnabled ? '' : ' · 旧源码证据，当前不可回切'
+  return `${reference.id} · ${reference.filePath}:${reference.startLine}-${reference.endLine}${symbol}${stale}`
+}
+
+function openEvidence(reference: CodeEvidenceRef): void {
+  if (!props.codeEvidenceEnabled) return
+  emit('openEvidence', reference)
 }
 </script>
 
@@ -52,7 +64,9 @@ function evidenceLabel(reference: CodeEvidenceRef): string {
             v-for="reference in evidenceFor(step.evidenceIds)"
             :key="reference.id"
             type="button"
-            @click="emit('openEvidence', reference)"
+            :disabled="!codeEvidenceEnabled"
+            :title="codeEvidenceEnabled ? undefined : '旧源码证据，当前不可回切'"
+            @click="openEvidence(reference)"
           >
             {{ evidenceLabel(reference) }}
           </button>
@@ -85,7 +99,9 @@ function evidenceLabel(reference: CodeEvidenceRef): string {
               v-for="reference in evidenceFor(step.evidenceIds)"
               :key="reference.id"
               type="button"
-              @click="emit('openEvidence', reference)"
+              :disabled="!codeEvidenceEnabled"
+              :title="codeEvidenceEnabled ? undefined : '旧源码证据，当前不可回切'"
+              @click="openEvidence(reference)"
             >
               {{ evidenceLabel(reference) }}
             </button>

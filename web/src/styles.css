@@ -1279,7 +1279,8 @@ body {
   color: #c9a45d;
 }
 
-.query-history-restore {
+.query-history-restore,
+.query-history-fork {
   flex: none;
   height: 20px;
   padding: 0 7px;
@@ -1290,6 +1291,11 @@ body {
   font: inherit;
   font-size: 11px;
   cursor: pointer;
+}
+
+.query-history-fork:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
 }
 
 .query-collapse,
@@ -1783,8 +1789,14 @@ body {
   font-size: 11px;
   cursor: pointer;
 }
-.query-map-evidence-links button:hover {
+.query-map-evidence-links button:not(:disabled):hover {
   background: var(--active);
+}
+
+.query-map-evidence-links button:disabled {
+  color: var(--muted);
+  cursor: not-allowed;
+  opacity: 0.72;
 }
 
 .query-evidence-block {
@@ -1893,6 +1905,12 @@ body {
   text-decoration: underline;
   text-decoration-style: dotted;
   text-underline-offset: 2px;
+}
+
+.query-answer.code-evidence-disabled .query-code-evidence-link {
+  color: var(--muted);
+  cursor: not-allowed;
+  text-decoration-style: dashed;
 }
 
 /* — Document Render View (md/.markdown): the main editor stage shows a formatted

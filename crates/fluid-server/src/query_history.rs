@@ -1350,6 +1350,34 @@ mod tests {
     }
 
     #[test]
+    fn freshness_tracks_every_selected_scope_member() {
+        let dir = tempdir_guard::TempDir::new("selected-freshness");
+        write_source(dir.path(), "src/a.rs", b"fn a() {}\n");
+        write_source(dir.path(), "src/b.rs", b"fn b() {}\n");
+        let store = QueryThreadStore::new(dir.path()).unwrap();
+        let scope = selected(&["src/b.rs", "src/a.rs"]);
+        let revision = store.source_revision(&scope).unwrap();
+        let thread = sample_thread(scope, revision);
+
+        assert_eq!(
+            store.freshness(&thread).unwrap(),
+            QueryThreadFreshness::fresh()
+        );
+
+        fs::write(dir.path().join("src/b.rs"), b"fn b() { 1 }\n").unwrap();
+        assert_eq!(
+            store.freshness(&thread).unwrap(),
+            QueryThreadFreshness::stale(QueryStaleReason::SourceChanged)
+        );
+
+        fs::remove_file(dir.path().join("src/a.rs")).unwrap();
+        assert_eq!(
+            store.freshness(&thread).unwrap(),
+            QueryThreadFreshness::stale(QueryStaleReason::SourceMissing)
+        );
+    }
+
+    #[test]
     fn create_and_fork_current_freeze_only_the_current_source_identity() {
         const FORKED_AT: &str = "2026-08-10T10:02:00Z";
 

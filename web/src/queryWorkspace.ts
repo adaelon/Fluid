@@ -3,6 +3,7 @@ import {
   QueryHistoryApiError,
   createQueryThread,
   deleteQueryThread,
+  forkQueryThreadCurrent,
   getQueryThread,
   listQueryThreads,
   type QueryScopeSpec,
@@ -45,6 +46,7 @@ export interface QueryHistoryClient {
   get(threadId: string): Promise<QueryThread>
   create(req: { scope: QueryScopeSpec; originalQuestion: string }): Promise<QueryThread>
   delete(threadId: string): Promise<void>
+  forkCurrent(threadId: string): Promise<QueryThread>
 }
 
 export type QueryHistorySelectionResult =
@@ -60,6 +62,7 @@ const DEFAULT_QUERY_HISTORY_CLIENT: QueryHistoryClient = {
   get: getQueryThread,
   create: createQueryThread,
   delete: deleteQueryThread,
+  forkCurrent: forkQueryThreadCurrent,
 }
 
 /** Keep server RFC-3339 ordering deterministic even if a proxy/client returns
@@ -87,6 +90,24 @@ function summaryForThread(thread: QueryThread): QueryThreadSummary {
 function scopeKeyForThread(thread: QueryThread): string {
   if (thread.scope.kind === 'current') return `current:${thread.scope.paths[0]}`
   return selectedQueryScope(thread.scope.paths).scopeKey
+}
+
+function scopesEqual(left: QueryScopeSpec, right: QueryScopeSpec): boolean {
+  return left.kind === right.kind
+    && left.paths.length === right.paths.length
+    && left.paths.every((path, index) => path === right.paths[index])
+}
+
+function validCurrentSourceFork(source: QueryThread, forked: QueryThread): boolean {
+  return source.freshness === 'stale'
+    && source.staleReason === 'source-changed'
+    && forked.id !== source.id
+    && forked.freshness === 'fresh'
+    && forked.staleReason === undefined
+    && forked.turns.length === 0
+    && forked.sourceRevision !== source.sourceRevision
+    && forked.originalQuestion === source.originalQuestion
+    && scopesEqual(forked.scope, source.scope)
 }
 
 function traceForThread(thread: QueryThread): QueryTrace {
@@ -145,6 +166,7 @@ export interface QueryWorkspaceController {
   historyWarnings: Ref<QueryThreadWarning[]>
   historyLoading: Ref<boolean>
   historySelectingId: Ref<string | null>
+  historyForkingId: Ref<string | null>
   historyError: Ref<string>
   selectedThread: Ref<QueryThread | null>
   loadProjectHistory(): Promise<boolean>
@@ -152,6 +174,7 @@ export interface QueryWorkspaceController {
   resetForProjectChange(): void
   selectHistoryThread(threadId: string): Promise<QueryHistorySelectionResult>
   deleteHistoryThread(threadId: string): Promise<boolean>
+  forkSelectedThreadCurrent(): Promise<boolean>
   ensureRequestThread(
     request: QueryWorkspaceRequest,
     scope: QueryScopeSpec,
@@ -201,6 +224,7 @@ export function createQueryWorkspace(
   const historyWarnings = ref<QueryThreadWarning[]>([])
   const historyLoading = ref(false)
   const historySelectingId = ref<string | null>(null)
+  const historyForkingId = ref<string | null>(null)
   const historyError = ref('')
   const selectedThread = ref<QueryThread | null>(null)
 
@@ -287,6 +311,7 @@ export function createQueryWorkspace(
     historySelectionSequence++
     historyLoading.value = false
     historySelectingId.value = null
+    historyForkingId.value = null
     historyError.value = ''
     historyWarnings.value = []
     historySummaries.value = []
@@ -305,6 +330,7 @@ export function createQueryWorkspace(
     if (!nextThreadId) return { kind: 'ignored' }
     const generation = projectGeneration
     const sequence = ++historySelectionSequence
+    historyForkingId.value = null
     historySelectingId.value = nextThreadId
     historyError.value = ''
     teardown()
@@ -346,6 +372,7 @@ export function createQueryWorkspace(
     const generation = projectGeneration
     historySelectionSequence++
     historySelectingId.value = null
+    historyForkingId.value = null
     const deletingSelected = selectedThread.value?.id === deletedThreadId
     if (deletingSelected) {
       teardown()
@@ -368,6 +395,50 @@ export function createQueryWorkspace(
     )
     if (deletingSelected) resetTrace(false)
     return true
+  }
+
+  async function forkSelectedThreadCurrent(): Promise<boolean> {
+    const source = selectedThread.value
+    if (
+      !source
+      || source.freshness !== 'stale'
+      || source.staleReason !== 'source-changed'
+    ) {
+      return false
+    }
+    const generation = projectGeneration
+    const sequence = ++historySelectionSequence
+    historySelectingId.value = null
+    historyForkingId.value = source.id
+    historyError.value = ''
+    teardown()
+    try {
+      const forked = await historyClient.forkCurrent(source.id)
+      if (generation !== projectGeneration || sequence !== historySelectionSequence) {
+        return false
+      }
+      if (!validCurrentSourceFork(source, forked)) {
+        historyError.value = '服务端返回的当前源码新线程不满足版本隔离契约'
+        return false
+      }
+      scope.value = forked.scope.kind
+      restoreThreadProjection(forked)
+      upsertHistorySummary(summaryForThread(forked))
+      question.value = forked.originalQuestion
+      return true
+    } catch (error) {
+      if (generation !== projectGeneration || sequence !== historySelectionSequence) {
+        return false
+      }
+      historyError.value = error instanceof Error
+        ? error.message
+        : '基于当前源码新建追问失败'
+      return false
+    } finally {
+      if (generation === projectGeneration && sequence === historySelectionSequence) {
+        historyForkingId.value = null
+      }
+    }
   }
 
   function canContinueSelectedThread(identity: QueryScopeIdentity): boolean {
@@ -408,6 +479,7 @@ export function createQueryWorkspace(
   function resetTrace(clearQuestion = true): void {
     historySelectionSequence++
     historySelectingId.value = null
+    historyForkingId.value = null
     teardown()
     trace.value = null
     const presentation = resetQueryTurnPresentation()
@@ -636,6 +708,7 @@ export function createQueryWorkspace(
     historyWarnings,
     historyLoading,
     historySelectingId,
+    historyForkingId,
     historyError,
     selectedThread,
     loadProjectHistory,
@@ -643,6 +716,7 @@ export function createQueryWorkspace(
     resetForProjectChange,
     selectHistoryThread,
     deleteHistoryThread,
+    forkSelectedThreadCurrent,
     ensureRequestThread,
     canContinueSelectedThread,
     handleScopeIdentityChange,

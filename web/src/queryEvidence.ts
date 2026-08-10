@@ -1,4 +1,23 @@
 import type { CodeEvidenceRef, QueryMap } from './ghostTypes'
+import type { QueryThreadFreshness, QueryThreadStaleReason } from './api'
+
+/** Historical code coordinates are only valid while the server says the
+ * thread still matches current project bytes. No selected thread means the
+ * active live query path, whose evidence remains interactive. */
+export function queryCodeEvidenceNavigationEnabled(
+  freshness: QueryThreadFreshness | undefined,
+): boolean {
+  return freshness !== 'stale'
+}
+
+/** Keep the two backend stale classifications visible and action-oriented. */
+export function queryStaleReasonMessage(
+  reason: QueryThreadStaleReason | undefined,
+): string {
+  return reason === 'source-missing'
+    ? '范围文件缺失，旧源码证据当前不可回切'
+    : '源码已变更，旧源码证据当前不可回切'
+}
 
 /** Collect dangling E# references from backend map structure. The UI keeps this
  * guard even though the Rust producer validates maps, so malformed/older peers

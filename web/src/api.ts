@@ -131,6 +131,15 @@ export async function deleteQueryThread(threadId: string): Promise<void> {
   if (!res.ok) return queryHistoryResponseError(res, endpoint)
 }
 
+/** Rebind a source-changed thread's original question and scope to current
+ * project bytes. The backend returns a distinct fresh record with zero turns. */
+export async function forkQueryThreadCurrent(threadId: string): Promise<QueryThread> {
+  const endpoint = `/api/query-threads/${encodeURIComponent(threadId)}/fork-current`
+  const res = await fetch(endpoint, { method: 'POST' })
+  if (!res.ok) return queryHistoryResponseError(res, endpoint)
+  return (await res.json()) as QueryThread
+}
+
 /** GET /api/project/tree -> flat FileNode[] (the frontend nests it, see tree.ts). */
 export async function fetchTree(): Promise<FileNode[]> {
   const res = await fetch('/api/project/tree')

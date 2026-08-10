@@ -16,7 +16,11 @@ import type { CodeEvidenceRef, QueryFrame, QueryTrace } from './ghostTypes'
 import { EMPTY_QUERY_CONTEXT, type QueryContext } from './queryContext'
 import CodeEvidencePeek from './CodeEvidencePeek.vue'
 import QueryMapView from './QueryMapView.vue'
-import { queryAnswerEvidenceCitations } from './queryEvidence'
+import {
+  queryAnswerEvidenceCitations,
+  queryCodeEvidenceNavigationEnabled,
+  queryStaleReasonMessage,
+} from './queryEvidence'
 import {
   QUERY_PEEK_STORAGE_KEY,
   clampCodePeekWidth,
@@ -97,6 +101,7 @@ const {
   historyWarnings,
   historyLoading,
   historySelectingId,
+  historyForkingId,
   historyError,
   selectedThread,
 } = workspace
@@ -203,6 +208,12 @@ const selectedThreadCanContinue = computed(() =>
 const historyNeedsScopeRestore = computed(() =>
   selectedThread.value?.freshness === 'fresh' && !selectedThreadScopeMatches.value,
 )
+const codeEvidenceEnabled = computed(() =>
+  queryCodeEvidenceNavigationEnabled(selectedThread.value?.freshness),
+)
+const historyStaleMessage = computed(() =>
+  queryStaleReasonMessage(selectedThread.value?.staleReason),
+)
 const historyReadOnly = computed(() =>
   Boolean(selectedThread.value && !selectedThreadCanContinue.value),
 )
@@ -264,8 +275,12 @@ function historyScopeLabel(threadScope: QueryScopeSpec): string {
 function historyOptionLabel(index: number): string {
   const item = historySummaries.value[index]
   if (!item) return ''
-  const stale = item.freshness === 'stale' ? ' · 只读' : ''
-  return `${item.title} · ${item.turnCount} 轮 · ${historyScopeLabel(item.scope)}${stale}`
+  const freshness = item.freshness === 'fresh'
+    ? '源码一致'
+    : item.staleReason === 'source-missing'
+      ? '范围文件缺失 · 只读'
+      : '源码已变更 · 只读'
+  return `${item.title} · ${item.turnCount} 轮 · ${historyScopeLabel(item.scope)} · ${freshness}`
 }
 
 function resetTrace(clearQuestion = true) {
@@ -404,11 +419,12 @@ async function renderTraceAnswers(
     import('dompurify'),
   ])
   if (generation !== answerRenderGeneration) return
-  const htmlByTurn = turns.map((turn, index) =>
-    DOMPurify.sanitize(
-      renderQueryMarkdown(turn.answer, snapshots[index]?.map.evidence ?? []),
-    ),
-  )
+  const htmlByTurn = turns.map((turn, index) => {
+    const evidence = codeEvidenceEnabled.value
+      ? snapshots[index]?.map.evidence ?? []
+      : []
+    return DOMPurify.sanitize(renderQueryMarkdown(turn.answer, evidence))
+  })
   if (generation !== answerRenderGeneration) return
   if (!workspace.applyRenderedAnswers(snapshots, htmlByTurn)) return
   await renderVisibleMath()
@@ -422,6 +438,7 @@ function acceptFrame(request: QueryWorkspaceRequest, frame: QueryFrame) {
 }
 
 function openEvidence(reference: CodeEvidenceRef) {
+  if (!codeEvidenceEnabled.value) return
   if (props.presentation === 'focus') {
     codePeekTarget.value = { ...reference }
     return
@@ -444,6 +461,10 @@ function onAnswerClick(event: MouseEvent) {
   const href = anchor?.getAttribute('href') ?? ''
   const prefix = '#fluid-evidence-'
   if (!anchor || !href.startsWith(prefix)) return
+  if (!codeEvidenceEnabled.value) {
+    event.preventDefault()
+    return
+  }
 
   const turn = anchor.closest<HTMLElement>('[data-query-turn-index]')
   const index = Number(turn?.dataset.queryTurnIndex)
@@ -505,6 +526,11 @@ async function deleteSelectedHistory(): Promise<void> {
   if (!selectedId) return
   closeCodePeek()
   await workspace.deleteHistoryThread(selectedId)
+}
+
+async function forkSelectedHistory(): Promise<void> {
+  closeCodePeek()
+  await workspace.forkSelectedThreadCurrent()
 }
 
 async function ask() {
@@ -615,6 +641,10 @@ watch(
   },
 )
 
+watch(codeEvidenceEnabled, (enabled) => {
+  if (!enabled) closeCodePeek()
+})
+
 watch(
   () => [props.presentation, focusedSelectionKey.value] as const,
   () => void renderVisibleMath(),
@@ -673,7 +703,7 @@ onBeforeUnmount(() => {
           <select
             data-testid="query-history-picker"
             :value="selectedThread?.id ?? ''"
-            :disabled="historyLoading || Boolean(historySelectingId)"
+            :disabled="historyLoading || Boolean(historySelectingId) || Boolean(historyForkingId)"
             @change="selectHistoryFromPicker"
           >
             <option value="">
@@ -701,7 +731,7 @@ onBeforeUnmount(() => {
         <button
           class="query-tool query-history-delete"
           type="button"
-          :disabled="!selectedThread || Boolean(historySelectingId)"
+          :disabled="!selectedThread || Boolean(historySelectingId) || Boolean(historyForkingId)"
           @click="deleteSelectedHistory"
         >
           删除
@@ -803,11 +833,21 @@ onBeforeUnmount(() => {
     <div v-if="selectedThread" class="query-history-current">
       <span class="query-history-current-title">{{ selectedThread.title }}</span>
       <span class="query-history-current-meta">
-        {{ selectedThread.turns.length }} 轮 · {{ historyScopeLabel(selectedThread.scope) }}
+        {{ selectedThread.turns.length }} 轮 · {{ historyScopeLabel(selectedThread.scope) }} ·
+        {{ selectedThread.freshness === 'fresh' ? '源码一致' : '陈旧' }}
       </span>
-      <span v-if="selectedThread.freshness === 'stale'" class="query-history-stale">
-        历史只读
-      </span>
+      <template v-if="selectedThread.freshness === 'stale'">
+        <span class="query-history-stale">历史只读 · {{ historyStaleMessage }}</span>
+        <button
+          v-if="selectedThread.staleReason === 'source-changed'"
+          class="query-history-fork"
+          type="button"
+          :disabled="Boolean(historyForkingId)"
+          @click="forkSelectedHistory"
+        >
+          {{ historyForkingId ? '新建中…' : '基于当前源码新建追问' }}
+        </button>
+      </template>
       <button
         v-else-if="historyNeedsScopeRestore"
         class="query-history-restore"
@@ -875,7 +915,12 @@ onBeforeUnmount(() => {
               </select>
             </label>
 
-            <div ref="renderedEl" class="query-answer" @click="onAnswerClick">
+            <div
+              ref="renderedEl"
+              class="query-answer"
+              :class="{ 'code-evidence-disabled': !codeEvidenceEnabled }"
+              @click="onAnswerClick"
+            >
               <div class="query-answer-content">
                 <article
                   v-if="focusedSelection"
@@ -914,6 +959,7 @@ onBeforeUnmount(() => {
                     <QueryMapView
                       v-if="focusedMap"
                       :map="focusedMap"
+                      :code-evidence-enabled="codeEvidenceEnabled"
                       @open-evidence="openEvidence"
                     />
                     <div v-if="focusedEvidence" class="query-evidence-block">
@@ -977,6 +1023,7 @@ onBeforeUnmount(() => {
                       <QueryMapView
                         v-if="focusedMap"
                         :map="focusedMap"
+                        :code-evidence-enabled="codeEvidenceEnabled"
                         @open-evidence="openEvidence"
                       />
                       <div v-if="focusedEvidence" class="query-evidence-block">
@@ -1045,7 +1092,13 @@ onBeforeUnmount(() => {
           </div>
         </template>
 
-        <div v-else ref="renderedEl" class="query-answer" @click="onAnswerClick">
+        <div
+          v-else
+          ref="renderedEl"
+          class="query-answer"
+          :class="{ 'code-evidence-disabled': !codeEvidenceEnabled }"
+          @click="onAnswerClick"
+        >
           <div class="query-answer-content">
           <div
             v-if="streaming && statusText"
@@ -1060,6 +1113,7 @@ onBeforeUnmount(() => {
           <QueryMapView
             v-if="viewState.map"
             :map="viewState.map"
+            :code-evidence-enabled="codeEvidenceEnabled"
             @open-evidence="openEvidence"
           />
 
@@ -1110,6 +1164,7 @@ onBeforeUnmount(() => {
                   !(viewState.mode === 'done' && index === completedTurns.length - 1)
                 "
                 :map="traceSnapshots[index].map"
+                :code-evidence-enabled="codeEvidenceEnabled"
                 @open-evidence="openEvidence"
               />
               <div class="query-turn-answer">

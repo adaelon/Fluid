@@ -113,6 +113,9 @@ function client(overrides: Partial<QueryHistoryClient> = {}): QueryHistoryClient
     delete: async () => {
       throw new Error('unexpected delete')
     },
+    forkCurrent: async () => {
+      throw new Error('unexpected fork')
+    },
     ...overrides,
   }
 }
