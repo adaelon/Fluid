@@ -4,6 +4,7 @@
 //! - `GET /api/file?path=<rel>`     -> { source: string }
 //! - `GET /api/project/graph`       -> KnowledgeGraph | null   (S2, optional)
 //! - `GET /api/identity`            -> stable local-instance identity
+//! - `/api/query-threads`            -> project query-history lifecycle (S-QAPI-1)
 //! - `WS  /api/orient`              -> validated file-orientation card (S-ORI-2/3)
 //! - `WS  /api/generate`            -> per-function streaming generation (S7)
 //!
@@ -17,7 +18,7 @@ use std::time::Duration;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Query, State,
+        Path, Query, State,
     },
     http::StatusCode,
     response::IntoResponse,
@@ -67,7 +68,9 @@ use crate::orientation::{
     OrientationValidationContext, ORIENTATION_PROMPT_VERSION, ORIENTATION_SCHEMA_VERSION,
 };
 use crate::project_reader::{FileNode, ProjectReader, ReadErr};
-use crate::query_history::QueryThreadStore;
+use crate::query_history::{
+    QueryHistoryError, QueryScopeSpec, QueryThread, QueryThreadFreshness, QueryThreadStore,
+};
 use crate::settings::{mask_key, persist_env, LlmConfig};
 use crate::startup::{FluidIdentity, IDENTITY_PATH};
 use crate::translate::{build_translate_prompt, protect_code, restore_code, split_chunks};
@@ -203,6 +206,18 @@ pub fn router(state: Shared) -> Router {
         .route("/api/project/open", post(open_folder))
         .route("/api/project/pick", post(pick_folder))
         .route(
+            "/api/query-threads",
+            get(list_query_threads).post(create_query_thread),
+        )
+        .route(
+            "/api/query-threads/:thread_id",
+            get(get_query_thread).delete(delete_query_thread),
+        )
+        .route(
+            "/api/query-threads/:thread_id/fork-current",
+            post(fork_query_thread_current),
+        )
+        .route(
             "/api/settings/llm",
             get(get_llm_settings).post(put_llm_settings),
         )
@@ -322,6 +337,209 @@ async fn open_folder(
     });
     eprintln!("[open] switched project root to {root}");
     (StatusCode::OK, Json(OpenResponse { root })).into_response()
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CreateQueryThreadRequest {
+    scope: QueryScopeSpec,
+    original_question: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QueryThreadResponse {
+    #[serde(flatten)]
+    thread: QueryThread,
+    #[serde(flatten)]
+    freshness: QueryThreadFreshness,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QueryThreadSummaryResponse {
+    id: String,
+    title: String,
+    updated_at: String,
+    scope: QueryScopeSpec,
+    turn_count: usize,
+    #[serde(flatten)]
+    freshness: QueryThreadFreshness,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QueryThreadWarningResponse {
+    file: String,
+    message: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QueryThreadListResponse {
+    threads: Vec<QueryThreadSummaryResponse>,
+    warnings: Vec<QueryThreadWarningResponse>,
+}
+
+fn query_thread_response(
+    store: &QueryThreadStore,
+    thread: QueryThread,
+) -> Result<QueryThreadResponse, QueryHistoryError> {
+    let freshness = store.freshness(&thread)?;
+    Ok(QueryThreadResponse { thread, freshness })
+}
+
+fn query_history_error_response(error: QueryHistoryError) -> axum::response::Response {
+    let status = match &error {
+        QueryHistoryError::InvalidScope(_) | QueryHistoryError::InvalidThread(_) => {
+            StatusCode::BAD_REQUEST
+        }
+        QueryHistoryError::SourceMissing(_) => StatusCode::NOT_FOUND,
+        QueryHistoryError::SourceForbidden(_) => StatusCode::FORBIDDEN,
+        QueryHistoryError::ForkUnavailable(_) => StatusCode::CONFLICT,
+        QueryHistoryError::InvalidRecord { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+        QueryHistoryError::Io(_) | QueryHistoryError::StorageEscapesProject(_) => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    };
+    (status, error.to_string()).into_response()
+}
+
+fn query_thread_not_found() -> axum::response::Response {
+    (StatusCode::NOT_FOUND, "query thread not found").into_response()
+}
+
+fn current_query_timestamp() -> String {
+    let now = time::OffsetDateTime::now_utc();
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        now.year(),
+        u8::from(now.month()),
+        now.day(),
+        now.hour(),
+        now.minute(),
+        now.second(),
+        now.millisecond()
+    )
+}
+
+async fn list_query_threads(State(state): State<Shared>) -> impl IntoResponse {
+    let project = state.project.read().unwrap();
+    let Some(project) = project.as_ref() else {
+        return (StatusCode::NOT_FOUND, "no project open").into_response();
+    };
+    let scan = match project.query_threads.list() {
+        Ok(scan) => scan,
+        Err(error) => return query_history_error_response(error),
+    };
+    let mut threads = Vec::with_capacity(scan.threads.len());
+    for thread in scan.threads {
+        let freshness = match project.query_threads.freshness(&thread) {
+            Ok(freshness) => freshness,
+            Err(error) => return query_history_error_response(error),
+        };
+        threads.push(QueryThreadSummaryResponse {
+            id: thread.id,
+            title: thread.title,
+            updated_at: thread.updated_at,
+            scope: thread.scope,
+            turn_count: thread.turns.len(),
+            freshness,
+        });
+    }
+    let warnings = scan
+        .warnings
+        .into_iter()
+        .map(|warning| QueryThreadWarningResponse {
+            file: warning.file,
+            message: warning.message,
+        })
+        .collect();
+    Json(QueryThreadListResponse { threads, warnings }).into_response()
+}
+
+async fn create_query_thread(
+    State(state): State<Shared>,
+    Json(request): Json<CreateQueryThreadRequest>,
+) -> impl IntoResponse {
+    let created_at = current_query_timestamp();
+    let project = state.project.read().unwrap();
+    let Some(project) = project.as_ref() else {
+        return (StatusCode::NOT_FOUND, "no project open").into_response();
+    };
+    let thread = match project.query_threads.create_thread(
+        request.scope,
+        &request.original_question,
+        &created_at,
+    ) {
+        Ok(thread) => thread,
+        Err(error) => return query_history_error_response(error),
+    };
+    match query_thread_response(&project.query_threads, thread) {
+        Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
+        Err(error) => query_history_error_response(error),
+    }
+}
+
+async fn get_query_thread(
+    State(state): State<Shared>,
+    Path(thread_id): Path<String>,
+) -> impl IntoResponse {
+    let project = state.project.read().unwrap();
+    let Some(project) = project.as_ref() else {
+        return (StatusCode::NOT_FOUND, "no project open").into_response();
+    };
+    let thread = match project.query_threads.get(&thread_id) {
+        Ok(Some(thread)) => thread,
+        Ok(None) => return query_thread_not_found(),
+        Err(error) => return query_history_error_response(error),
+    };
+    match query_thread_response(&project.query_threads, thread) {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => query_history_error_response(error),
+    }
+}
+
+async fn delete_query_thread(
+    State(state): State<Shared>,
+    Path(thread_id): Path<String>,
+) -> impl IntoResponse {
+    let project = state.project.read().unwrap();
+    let Some(project) = project.as_ref() else {
+        return (StatusCode::NOT_FOUND, "no project open").into_response();
+    };
+    match project.query_threads.delete(&thread_id) {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => query_thread_not_found(),
+        Err(error) => query_history_error_response(error),
+    }
+}
+
+async fn fork_query_thread_current(
+    State(state): State<Shared>,
+    Path(thread_id): Path<String>,
+) -> impl IntoResponse {
+    let created_at = current_query_timestamp();
+    let project = state.project.read().unwrap();
+    let Some(project) = project.as_ref() else {
+        return (StatusCode::NOT_FOUND, "no project open").into_response();
+    };
+    let source = match project.query_threads.get(&thread_id) {
+        Ok(Some(thread)) => thread,
+        Ok(None) => return query_thread_not_found(),
+        Err(error) => return query_history_error_response(error),
+    };
+    let thread = match project
+        .query_threads
+        .fork_thread_current(&source, &created_at)
+    {
+        Ok(thread) => thread,
+        Err(error) => return query_history_error_response(error),
+    };
+    match query_thread_response(&project.query_threads, thread) {
+        Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
+        Err(error) => query_history_error_response(error),
+    }
 }
 
 #[derive(Serialize)]
@@ -3891,6 +4109,273 @@ mod tests {
         assert!(projected.is_none());
     }
 
+    #[tokio::test]
+    async fn query_history_routes_cover_restart_order_freshness_fork_delete_and_warnings() {
+        let project = TmpDir::new();
+        std::fs::create_dir_all(project.path().join("src")).unwrap();
+        std::fs::write(project.path().join("src/a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(project.path().join("src/b.rs"), "fn b() {}\n").unwrap();
+
+        let client = reqwest::Client::new();
+        let first_app = start_query_app(make_state(project.path(), "")).await;
+        let created_response = client
+            .post(format!("{}/api/query-threads", first_app.http_base_url))
+            .json(&serde_json::json!({
+                "scope": { "kind": "current", "paths": ["src/a.rs"] },
+                "originalQuestion": "How does a work?"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(created_response.status(), StatusCode::CREATED);
+        let created: serde_json::Value = created_response.json().await.unwrap();
+        let created_id = created["id"].as_str().unwrap().to_string();
+        let created_at = created["createdAt"].as_str().unwrap();
+        assert_eq!(created_at.len(), "2026-08-10T12:34:56.789Z".len());
+        assert!(created_at.ends_with('Z'));
+        assert_eq!(created["updatedAt"], created["createdAt"]);
+        assert_eq!(created["freshness"], "fresh");
+        assert_eq!(created["turns"], serde_json::json!([]));
+        assert!(created.get("staleReason").is_none());
+        drop(first_app);
+
+        // Rebuilding AppState recreates QueryThreadStore from disk, matching a
+        // server restart without relying on the original in-memory store.
+        let restarted = start_query_app(make_state(project.path(), "")).await;
+        let loaded: serde_json::Value = client
+            .get(format!(
+                "{}/api/query-threads/{created_id}",
+                restarted.http_base_url
+            ))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(loaded["id"], created_id);
+        assert_eq!(loaded["freshness"], "fresh");
+
+        let future = restarted
+            .state
+            .project
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .query_threads
+            .create_thread(
+                crate::query_history::QueryScopeSpec::Selected {
+                    paths: vec!["src/a.rs".into(), "src/b.rs".into()],
+                },
+                "How do a and b relate?",
+                "2100-01-01T00:00:00Z",
+            )
+            .unwrap();
+        let list: serde_json::Value = client
+            .get(format!("{}/api/query-threads", restarted.http_base_url))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(list["threads"][0]["id"], future.id);
+        assert_eq!(list["threads"][0]["turnCount"], 0);
+        assert_eq!(list["threads"][0]["freshness"], "fresh");
+        assert_eq!(list["threads"][1]["id"], created_id);
+        assert_eq!(list["warnings"], serde_json::json!([]));
+
+        std::fs::write(project.path().join("src/a.rs"), "fn a() { 1 }\n").unwrap();
+        let stale: serde_json::Value = client
+            .get(format!(
+                "{}/api/query-threads/{created_id}",
+                restarted.http_base_url
+            ))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(stale["freshness"], "stale");
+        assert_eq!(stale["staleReason"], "source-changed");
+
+        let fork_response = client
+            .post(format!(
+                "{}/api/query-threads/{created_id}/fork-current",
+                restarted.http_base_url
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(fork_response.status(), StatusCode::CREATED);
+        let forked: serde_json::Value = fork_response.json().await.unwrap();
+        let forked_id = forked["id"].as_str().unwrap().to_string();
+        assert_ne!(forked_id, created_id);
+        assert_eq!(forked["originalQuestion"], created["originalQuestion"]);
+        assert_eq!(forked["scope"], created["scope"]);
+        assert_eq!(forked["turns"], serde_json::json!([]));
+        assert_eq!(forked["freshness"], "fresh");
+
+        std::fs::remove_file(project.path().join("src/a.rs")).unwrap();
+        let missing: serde_json::Value = client
+            .get(format!(
+                "{}/api/query-threads/{forked_id}",
+                restarted.http_base_url
+            ))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(missing["freshness"], "stale");
+        assert_eq!(missing["staleReason"], "source-missing");
+        let missing_fork = client
+            .post(format!(
+                "{}/api/query-threads/{created_id}/fork-current",
+                restarted.http_base_url
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing_fork.status(), StatusCode::CONFLICT);
+
+        let corrupt_id = "11111111111111111111111111111111";
+        let storage_dir = restarted
+            .state
+            .project
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .query_threads
+            .storage_dir()
+            .to_path_buf();
+        std::fs::write(storage_dir.join(format!("{corrupt_id}.json")), "{ bad json").unwrap();
+        let warned: serde_json::Value = client
+            .get(format!("{}/api/query-threads", restarted.http_base_url))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(warned["warnings"].as_array().unwrap().len(), 1);
+        assert_eq!(warned["warnings"][0]["file"], format!("{corrupt_id}.json"));
+        assert!(warned["threads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|thread| thread["id"] == forked_id));
+
+        let deleted = client
+            .delete(format!(
+                "{}/api/query-threads/{created_id}",
+                restarted.http_base_url
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+        let after_delete = client
+            .get(format!(
+                "{}/api/query-threads/{created_id}",
+                restarted.http_base_url
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(after_delete.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn query_history_routes_follow_no_project_and_open_folder_root_boundaries() {
+        let left = TmpDir::new();
+        let right = TmpDir::new();
+        std::fs::write(left.path().join("a.rs"), "left\n").unwrap();
+        std::fs::write(right.path().join("a.rs"), "right\n").unwrap();
+        let config = LlmConfig {
+            base_url: "https://test/v1".into(),
+            model: "test-model".into(),
+            api_key: String::new(),
+        };
+        let app = start_query_app(AppState::new_no_project(
+            config,
+            left.path().join(".env"),
+            "p1",
+        ))
+        .await;
+        let client = reqwest::Client::new();
+
+        let no_project = client
+            .get(format!("{}/api/query-threads", app.http_base_url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(no_project.status(), StatusCode::NOT_FOUND);
+        assert_eq!(no_project.text().await.unwrap(), "no project open");
+
+        let opened_left = client
+            .post(format!("{}/api/project/open", app.http_base_url))
+            .json(&serde_json::json!({ "path": left.path() }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(opened_left.status(), StatusCode::OK);
+        let created: serde_json::Value = client
+            .post(format!("{}/api/query-threads", app.http_base_url))
+            .json(&serde_json::json!({
+                "scope": { "kind": "current", "paths": ["a.rs"] },
+                "originalQuestion": "Which root owns this?"
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let left_id = created["id"].as_str().unwrap();
+
+        let opened_right = client
+            .post(format!("{}/api/project/open", app.http_base_url))
+            .json(&serde_json::json!({ "path": right.path() }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(opened_right.status(), StatusCode::OK);
+        let hidden_on_right = client
+            .get(format!("{}/api/query-threads/{left_id}", app.http_base_url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(hidden_on_right.status(), StatusCode::NOT_FOUND);
+        let right_list: serde_json::Value = client
+            .get(format!("{}/api/query-threads", app.http_base_url))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(right_list["threads"], serde_json::json!([]));
+
+        let reopened_left = client
+            .post(format!("{}/api/project/open", app.http_base_url))
+            .json(&serde_json::json!({ "path": left.path() }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(reopened_left.status(), StatusCode::OK);
+        let visible_left = client
+            .get(format!("{}/api/query-threads/{left_id}", app.http_base_url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(visible_left.status(), StatusCode::OK);
+    }
+
     #[derive(Clone)]
     struct SelectionMockBackend {
         plan: String,
@@ -6905,6 +7390,8 @@ mod tests {
 
     struct QueryAppServer {
         ws_base_url: String,
+        http_base_url: String,
+        state: Arc<AppState>,
         task: tokio::task::JoinHandle<()>,
     }
 
@@ -7158,12 +7645,15 @@ mod tests {
     async fn start_query_app(state: AppState) -> QueryAppServer {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let app = router(Arc::new(state));
+        let state = Arc::new(state);
+        let app = router(Arc::clone(&state));
         let task = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
         QueryAppServer {
             ws_base_url: format!("ws://{address}"),
+            http_base_url: format!("http://{address}"),
+            state,
             task,
         }
     }

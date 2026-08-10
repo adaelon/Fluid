@@ -81,6 +81,52 @@ pub struct QueryThread {
     pub turns: Vec<PersistedQueryTurn>,
 }
 
+/// Freshness is derived from current project bytes every time a thread is read.
+/// It is never persisted into the durable thread record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum QueryFreshness {
+    Fresh,
+    Stale,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum QueryStaleReason {
+    SourceChanged,
+    SourceMissing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct QueryThreadFreshness {
+    pub freshness: QueryFreshness,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_reason: Option<QueryStaleReason>,
+}
+
+impl QueryThreadFreshness {
+    pub fn fresh() -> Self {
+        Self {
+            freshness: QueryFreshness::Fresh,
+            stale_reason: None,
+        }
+    }
+
+    pub fn stale(reason: QueryStaleReason) -> Self {
+        Self {
+            freshness: QueryFreshness::Stale,
+            stale_reason: Some(reason),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryForkUnavailableReason {
+    Fresh,
+    SourceMissing,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryThreadStoreWarning {
     pub file: String,
@@ -100,6 +146,7 @@ pub enum QueryHistoryError {
     InvalidThread(String),
     SourceMissing(String),
     SourceForbidden(String),
+    ForkUnavailable(QueryForkUnavailableReason),
     StorageEscapesProject(PathBuf),
     InvalidRecord { path: PathBuf, reason: String },
 }
@@ -113,6 +160,12 @@ impl fmt::Display for QueryHistoryError {
             Self::SourceMissing(path) => write!(f, "query source is missing: {path}"),
             Self::SourceForbidden(path) => {
                 write!(f, "query source escapes the project root: {path}")
+            }
+            Self::ForkUnavailable(QueryForkUnavailableReason::Fresh) => {
+                write!(f, "fresh query thread does not need fork-current")
+            }
+            Self::ForkUnavailable(QueryForkUnavailableReason::SourceMissing) => {
+                write!(f, "source-missing query thread cannot be forked")
             }
             Self::StorageEscapesProject(path) => write!(
                 f,
@@ -243,6 +296,76 @@ impl QueryThreadStore {
             hash_length_prefixed(&mut hash, &bytes);
         }
         Ok(hex_lower(&hash.finalize()))
+    }
+
+    /// Compare a persisted source revision with current project bytes. Missing
+    /// or now-forbidden paths are presented as unavailable source rather than a
+    /// fatal list/read error.
+    pub fn freshness(
+        &self,
+        thread: &QueryThread,
+    ) -> Result<QueryThreadFreshness, QueryHistoryError> {
+        match self.source_revision(&thread.scope) {
+            Ok(revision) if revision == thread.source_revision => Ok(QueryThreadFreshness::fresh()),
+            Ok(_) => Ok(QueryThreadFreshness::stale(QueryStaleReason::SourceChanged)),
+            Err(QueryHistoryError::SourceMissing(_) | QueryHistoryError::SourceForbidden(_)) => {
+                Ok(QueryThreadFreshness::stale(QueryStaleReason::SourceMissing))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Create and persist a zero-turn thread for the current project bytes.
+    pub fn create_thread(
+        &self,
+        scope: QueryScopeSpec,
+        original_question: &str,
+        created_at: &str,
+    ) -> Result<QueryThread, QueryHistoryError> {
+        let scope = normalize_query_scope(&scope)?;
+        let source_revision = self.source_revision(&scope)?;
+        let thread = build_zero_turn_thread(
+            self.generate_thread_id(),
+            scope,
+            source_revision,
+            original_question,
+            created_at,
+        )?;
+        self.put(&thread)?;
+        Ok(thread)
+    }
+
+    /// Fork only a source-changed thread. The new record copies the question and
+    /// normalized scope, then binds them to current bytes without copying turns.
+    pub fn fork_thread_current(
+        &self,
+        source: &QueryThread,
+        created_at: &str,
+    ) -> Result<QueryThread, QueryHistoryError> {
+        validate_query_thread(source)?;
+        let source_revision = match self.source_revision(&source.scope) {
+            Ok(revision) if revision == source.source_revision => {
+                return Err(QueryHistoryError::ForkUnavailable(
+                    QueryForkUnavailableReason::Fresh,
+                ))
+            }
+            Ok(revision) => revision,
+            Err(QueryHistoryError::SourceMissing(_) | QueryHistoryError::SourceForbidden(_)) => {
+                return Err(QueryHistoryError::ForkUnavailable(
+                    QueryForkUnavailableReason::SourceMissing,
+                ))
+            }
+            Err(error) => return Err(error),
+        };
+        let thread = build_zero_turn_thread(
+            self.generate_thread_id(),
+            source.scope.clone(),
+            source_revision,
+            &source.original_question,
+            created_at,
+        )?;
+        self.put(&thread)?;
+        Ok(thread)
     }
 
     /// Atomically replace one validated thread record using a same-directory
@@ -453,6 +576,34 @@ impl QueryThreadStore {
         validate_query_thread(&thread).map_err(|error| invalid_record(path, error.to_string()))?;
         Ok(thread)
     }
+}
+
+/// Pure constructor used by create/fork orchestration after the caller has
+/// resolved the project-bound source revision and server-owned identity.
+pub fn build_zero_turn_thread(
+    id: String,
+    scope: QueryScopeSpec,
+    source_revision: String,
+    original_question: &str,
+    created_at: &str,
+) -> Result<QueryThread, QueryHistoryError> {
+    let scope = normalize_query_scope(&scope)?;
+    let title = default_thread_title(original_question).ok_or_else(|| {
+        QueryHistoryError::InvalidThread("originalQuestion must not be blank".into())
+    })?;
+    let thread = QueryThread {
+        schema_version: QUERY_THREAD_SCHEMA_VERSION,
+        id,
+        title,
+        created_at: created_at.to_string(),
+        updated_at: created_at.to_string(),
+        scope,
+        source_revision,
+        original_question: original_question.to_string(),
+        turns: Vec::new(),
+    };
+    validate_query_thread(&thread)?;
+    Ok(thread)
 }
 
 pub fn validate_query_thread(thread: &QueryThread) -> Result<(), QueryHistoryError> {
@@ -1055,6 +1206,84 @@ mod tests {
         validate_thread_id(&first).unwrap();
         validate_thread_id(&second).unwrap();
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn freshness_classifies_matching_changed_and_missing_sources() {
+        let dir = tempdir_guard::TempDir::new("freshness");
+        write_source(dir.path(), "src/a.rs", b"fn a() {}\n");
+        let store = QueryThreadStore::new(dir.path()).unwrap();
+        let revision = store.source_revision(&current("src/a.rs")).unwrap();
+        let thread = sample_thread(current("src/a.rs"), revision);
+
+        assert_eq!(
+            store.freshness(&thread).unwrap(),
+            QueryThreadFreshness::fresh()
+        );
+
+        fs::write(dir.path().join("src/a.rs"), b"fn a() { 1 }\n").unwrap();
+        assert_eq!(
+            store.freshness(&thread).unwrap(),
+            QueryThreadFreshness::stale(QueryStaleReason::SourceChanged)
+        );
+
+        fs::remove_file(dir.path().join("src/a.rs")).unwrap();
+        assert_eq!(
+            store.freshness(&thread).unwrap(),
+            QueryThreadFreshness::stale(QueryStaleReason::SourceMissing)
+        );
+    }
+
+    #[test]
+    fn create_and_fork_current_freeze_only_the_current_source_identity() {
+        const FORKED_AT: &str = "2026-08-10T10:02:00Z";
+
+        let dir = tempdir_guard::TempDir::new("create-fork");
+        write_source(dir.path(), "src/a.rs", b"fn a() {}\n");
+        let store = QueryThreadStore::new(dir.path()).unwrap();
+
+        let created = store
+            .create_thread(
+                current("./src/a.rs"),
+                "\n  How does this work?  \nMore detail",
+                CREATED_AT,
+            )
+            .unwrap();
+        assert_eq!(created.title, "How does this work?");
+        assert_eq!(created.scope, current("src/a.rs"));
+        assert_eq!(created.created_at, CREATED_AT);
+        assert_eq!(created.updated_at, CREATED_AT);
+        assert!(created.turns.is_empty());
+        assert_eq!(store.get(&created.id).unwrap(), Some(created.clone()));
+        assert!(matches!(
+            store.fork_thread_current(&created, FORKED_AT),
+            Err(QueryHistoryError::ForkUnavailable(
+                QueryForkUnavailableReason::Fresh
+            ))
+        ));
+
+        fs::write(dir.path().join("src/a.rs"), b"fn a() { 1 }\n").unwrap();
+        let forked = store.fork_thread_current(&created, FORKED_AT).unwrap();
+        assert_ne!(forked.id, created.id);
+        assert_eq!(forked.original_question, created.original_question);
+        assert_eq!(forked.title, created.title);
+        assert_eq!(forked.scope, created.scope);
+        assert_ne!(forked.source_revision, created.source_revision);
+        assert_eq!(forked.created_at, FORKED_AT);
+        assert_eq!(forked.updated_at, FORKED_AT);
+        assert!(forked.turns.is_empty());
+        assert_eq!(
+            store.freshness(&forked).unwrap(),
+            QueryThreadFreshness::fresh()
+        );
+
+        fs::remove_file(dir.path().join("src/a.rs")).unwrap();
+        assert!(matches!(
+            store.fork_thread_current(&created, FORKED_AT),
+            Err(QueryHistoryError::ForkUnavailable(
+                QueryForkUnavailableReason::SourceMissing
+            ))
+        ));
     }
 
     mod tempdir_guard {
