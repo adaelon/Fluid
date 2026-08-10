@@ -130,11 +130,12 @@ console.log('\n=== dock/focus consume one project-scoped controller ===')
 const appSource = readFileSync(new URL('../src/App.vue', import.meta.url), 'utf8')
 const panelSource = readFileSync(new URL('../src/QueryPanel.vue', import.meta.url), 'utf8')
 const apiSource = readFileSync(new URL('../src/api.ts', import.meta.url), 'utf8')
+const workspaceSource = readFileSync(new URL('../src/queryWorkspace.ts', import.meta.url), 'utf8')
 const queryPanelTags = appSource.match(/<QueryPanel\b[\s\S]*?\/>/g) ?? []
 check('App creates one project-scoped query workspace', appSource.includes('const queryWorkspace = createQueryWorkspace()'))
 check('dock and focus share one unkeyed QueryPanel consumer', queryPanelTags.length === 1 && queryPanelTags[0]?.includes(':workspace="queryWorkspace"') === true && !queryPanelTags[0]?.includes(':key='))
 check('project lifetime, not the view shell, owns final teardown', appSource.includes('queryWorkspace.teardown()') && !panelSource.includes('workspace.teardown()'))
-check('QueryPanel creates or reuses a durable thread before opening a socket', panelSource.includes('createQueryThread') && panelSource.includes('ensureRequestThread'))
+check('QueryPanel delegates durable thread creation/reuse to the controller before opening a socket', panelSource.includes('workspace.ensureRequestThread') && workspaceSource.includes('createQueryThread'))
 check('query socket wire sends threadId and no longer sends the client trace', apiSource.includes('threadId: req.threadId') && !apiSource.includes('trace: req.trace'))
 
 if (failures > 0) {

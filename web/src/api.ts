@@ -3,10 +3,13 @@
 
 import type { FunctionSpan } from './parser/types.ts'
 import type {
+  EvidenceStatus,
   LineAnnotation,
   OrientationFrame,
   QueryFrame,
+  QueryMap,
   SelectionFrame,
+  SourceLink,
 } from './ghostTypes'
 import type { CapsuleSummary } from './queryContext'
 
@@ -22,27 +25,110 @@ export type QueryScopeSpec =
   | { kind: 'current'; paths: [string] }
   | { kind: 'selected'; paths: [string, string, ...string[]] }
 
-export interface QueryThreadHandle {
-  id: string
-  updatedAt: string
+export type QueryThreadFreshness = 'fresh' | 'stale'
+export type QueryThreadStaleReason = 'source-changed' | 'source-missing'
+
+export interface PersistedQueryEvidence {
+  status: EvidenceStatus
+  sources: SourceLink[]
+  warning?: string
 }
 
-/** Create the zero-turn durable record required before either query socket can
- * stream. History listing/selection remains a later UI slice. */
+export interface PersistedQueryTurn {
+  question: string
+  answer: string
+  map: QueryMap
+  evidence: PersistedQueryEvidence | null
+  codeEvidenceIds: string[]
+  completedAt: string
+}
+
+export interface QueryThread {
+  schemaVersion: 1
+  id: string
+  title: string
+  createdAt: string
+  updatedAt: string
+  scope: QueryScopeSpec
+  sourceRevision: string
+  originalQuestion: string
+  turns: PersistedQueryTurn[]
+  freshness: QueryThreadFreshness
+  staleReason?: QueryThreadStaleReason
+}
+
+export interface QueryThreadSummary {
+  id: string
+  title: string
+  updatedAt: string
+  scope: QueryScopeSpec
+  turnCount: number
+  freshness: QueryThreadFreshness
+  staleReason?: QueryThreadStaleReason
+}
+
+export interface QueryThreadWarning {
+  file: string
+  message: string
+}
+
+export interface QueryThreadListResponse {
+  threads: QueryThreadSummary[]
+  warnings: QueryThreadWarning[]
+}
+
+export class QueryHistoryApiError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+  ) {
+    super(message)
+    this.name = 'QueryHistoryApiError'
+  }
+}
+
+async function queryHistoryResponseError(res: Response, endpoint: string): Promise<never> {
+  const detail = (await res.text()).trim()
+  throw new QueryHistoryApiError(res.status, detail || `${endpoint} -> ${res.status}`)
+}
+
+/** Create the zero-turn durable record required before either query socket can stream. */
 export async function createQueryThread(req: {
   scope: QueryScopeSpec
   originalQuestion: string
-}): Promise<QueryThreadHandle> {
+}): Promise<QueryThread> {
   const res = await fetch('/api/query-threads', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(req),
   })
   if (!res.ok) {
-    const detail = (await res.text()).trim()
-    throw new Error(detail || `/api/query-threads -> ${res.status}`)
+    return queryHistoryResponseError(res, '/api/query-threads')
   }
-  return (await res.json()) as QueryThreadHandle
+  return (await res.json()) as QueryThread
+}
+
+/** Load newest-first project summaries plus isolated bad-record warnings. */
+export async function listQueryThreads(): Promise<QueryThreadListResponse> {
+  const endpoint = '/api/query-threads'
+  const res = await fetch(endpoint)
+  if (!res.ok) return queryHistoryResponseError(res, endpoint)
+  return (await res.json()) as QueryThreadListResponse
+}
+
+/** Load one complete persisted thread for reading or a fresh continuation. */
+export async function getQueryThread(threadId: string): Promise<QueryThread> {
+  const endpoint = `/api/query-threads/${encodeURIComponent(threadId)}`
+  const res = await fetch(endpoint)
+  if (!res.ok) return queryHistoryResponseError(res, endpoint)
+  return (await res.json()) as QueryThread
+}
+
+/** Delete exactly one validated thread from the current project. */
+export async function deleteQueryThread(threadId: string): Promise<void> {
+  const endpoint = `/api/query-threads/${encodeURIComponent(threadId)}`
+  const res = await fetch(endpoint, { method: 'DELETE' })
+  if (!res.ok) return queryHistoryResponseError(res, endpoint)
 }
 
 /** GET /api/project/tree -> flat FileNode[] (the frontend nests it, see tree.ts). */

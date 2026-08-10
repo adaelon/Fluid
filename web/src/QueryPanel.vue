@@ -4,10 +4,10 @@
 // notes). Asks the current file or selected file set a free-form question and
 // projects the backend QueryMap before evidence/token deltas from the matching
 // query WebSocket, and turns only known E# citations into source navigation.
-// Switching files or scope vacuums the in-flight Q&A.
+// Switching files or scope cancels an in-flight request but keeps a selected
+// durable thread readable; only a matching fresh scope can continue it.
 import { computed, ref, watch, nextTick, onMounted, onBeforeUnmount } from 'vue'
 import {
-  createQueryThread,
   streamQuery,
   streamQueryFiles,
   type QueryScopeSpec,
@@ -79,6 +79,7 @@ const emit = defineEmits<{
   toggleSelectionMode: []
   clearSelected: []
   openEvidence: [CodeEvidenceRef]
+  restoreScope: [QueryScopeSpec]
   maximize: []
   restore: []
 }>()
@@ -92,6 +93,12 @@ const {
   selectedTurn,
   activeQuestion,
   scope,
+  historySummaries,
+  historyWarnings,
+  historyLoading,
+  historySelectingId,
+  historyError,
+  selectedThread,
 } = workspace
 const renderedEl = ref<HTMLElement | null>(null)
 const codePeekTarget = ref<CodeEvidenceRef | null>(null)
@@ -182,8 +189,26 @@ const selectedScopeHint = computed(() => {
   if (props.selectedCount === 1) return '再选择 1 个文件后可进行文件集追问'
   return `已选择 ${props.selectedCount} 个文件`
 })
+const selectedThreadScopeMatches = computed(() => {
+  const thread = selectedThread.value
+  if (!thread) return true
+  if (thread.scope.kind === 'current') return thread.scope.paths[0] === props.path
+  const expected = Array.from(new Set(thread.scope.paths)).sort()
+  const actual = Array.from(new Set(props.selectedPaths)).sort()
+  return JSON.stringify(expected) === JSON.stringify(actual)
+})
+const selectedThreadCanContinue = computed(() =>
+  workspace.canContinueSelectedThread(scopeIdentity.value),
+)
+const historyNeedsScopeRestore = computed(() =>
+  selectedThread.value?.freshness === 'fresh' && !selectedThreadScopeMatches.value,
+)
+const historyReadOnly = computed(() =>
+  Boolean(selectedThread.value && !selectedThreadCanContinue.value),
+)
 const canAsk = computed(() => {
   if (!question.value.trim() || streaming.value) return false
+  if (selectedThread.value && !selectedThreadCanContinue.value) return false
   if (scope.value === 'current') return Boolean(props.path && currentOrientationId.value)
   return selectedReady.value
 })
@@ -229,6 +254,19 @@ const focusedUnknownEvidenceIds = computed(() => {
   return index === null ? [] : traceUnknownEvidenceIds.value[index] ?? []
 })
 const hasFocusHistory = computed(() => completedTurns.value.length > 0 || hasActiveTurn.value)
+
+function historyScopeLabel(threadScope: QueryScopeSpec): string {
+  return threadScope.kind === 'current'
+    ? threadScope.paths[0]
+    : `${threadScope.paths.length} 个文件`
+}
+
+function historyOptionLabel(index: number): string {
+  const item = historySummaries.value[index]
+  if (!item) return ''
+  const stale = item.freshness === 'stale' ? ' · 只读' : ''
+  return `${item.title} · ${item.turnCount} 轮 · ${historyScopeLabel(item.scope)}${stale}`
+}
 
 function resetTrace(clearQuestion = true) {
   workspace.resetTrace(clearQuestion)
@@ -324,7 +362,10 @@ watch(
     scopeIdentity.value.scopeRevision,
   ] as const,
   (next, previous) => {
-    resetTrace(next[0] !== previous[0])
+    workspace.handleScopeIdentityChange(next[0] !== previous[0])
+    answerRenderGeneration++
+    mathRenderGeneration++
+    closeCodePeek()
   },
 )
 
@@ -446,18 +487,24 @@ function newTrace() {
   resetTrace()
 }
 
-async function ensureRequestThread(
-  request: QueryWorkspaceRequest,
-  threadScope: QueryScopeSpec,
-): Promise<string | null> {
-  if (request.threadId) return request.threadId
-  const created = await createQueryThread({
-    scope: threadScope,
-    originalQuestion: request.question,
-  })
-  return workspace.bindThread(request, created.id, created.updatedAt)
-    ? created.id
-    : null
+async function selectHistoryFromPicker(event: Event): Promise<void> {
+  const nextThreadId = (event.currentTarget as HTMLSelectElement).value
+  if (!nextThreadId) {
+    newTrace()
+    return
+  }
+  closeCodePeek()
+  const result = await workspace.selectHistoryThread(nextThreadId)
+  if (result.kind === 'selected') {
+    await renderTraceAnswers(result.turns, result.snapshots)
+  }
+}
+
+async function deleteSelectedHistory(): Promise<void> {
+  const selectedId = selectedThread.value?.id
+  if (!selectedId) return
+  closeCodePeek()
+  await workspace.deleteHistoryThread(selectedId)
 }
 
 async function ask() {
@@ -480,7 +527,7 @@ async function ask() {
     if (!request) return
     let threadId: string | null
     try {
-      threadId = await ensureRequestThread(request, {
+      threadId = await workspace.ensureRequestThread(request, {
         kind: 'selected',
         paths: filePaths,
       })
@@ -517,7 +564,7 @@ async function ask() {
   if (!request) return
   let threadId: string | null
   try {
-    threadId = await ensureRequestThread(request, {
+    threadId = await workspace.ensureRequestThread(request, {
       kind: 'current',
       paths: [filePath],
     })
@@ -621,6 +668,26 @@ onBeforeUnmount(() => {
             {{ selectedLabel }}
           </button>
         </div>
+        <label class="query-history-picker">
+          <span class="query-history-picker-label">项目历史</span>
+          <select
+            data-testid="query-history-picker"
+            :value="selectedThread?.id ?? ''"
+            :disabled="historyLoading || Boolean(historySelectingId)"
+            @change="selectHistoryFromPicker"
+          >
+            <option value="">
+              {{ historyLoading ? '加载中…' : `项目历史 (${historySummaries.length})` }}
+            </option>
+            <option
+              v-for="(item, index) in historySummaries"
+              :key="item.id"
+              :value="item.id"
+            >
+              {{ historyOptionLabel(index) }}
+            </option>
+          </select>
+        </label>
       </div>
       <div class="query-head-actions">
         <button
@@ -630,6 +697,14 @@ onBeforeUnmount(() => {
           @click="newTrace"
         >
           新追问
+        </button>
+        <button
+          class="query-tool query-history-delete"
+          type="button"
+          :disabled="!selectedThread || Boolean(historySelectingId)"
+          @click="deleteSelectedHistory"
+        >
+          删除
         </button>
         <button
           class="query-tool"
@@ -714,6 +789,37 @@ onBeforeUnmount(() => {
         </button>
       </div>
     </header>
+    <div
+      v-if="historyWarnings.length || historyError"
+      class="query-history-notice"
+      :class="{ error: Boolean(historyError) }"
+      role="status"
+    >
+      <span v-if="historyError">{{ historyError }}</span>
+      <span v-else>
+        {{ historyWarnings.length }} 条历史记录无法读取；其余线程仍可使用。
+      </span>
+    </div>
+    <div v-if="selectedThread" class="query-history-current">
+      <span class="query-history-current-title">{{ selectedThread.title }}</span>
+      <span class="query-history-current-meta">
+        {{ selectedThread.turns.length }} 轮 · {{ historyScopeLabel(selectedThread.scope) }}
+      </span>
+      <span v-if="selectedThread.freshness === 'stale'" class="query-history-stale">
+        历史只读
+      </span>
+      <button
+        v-else-if="historyNeedsScopeRestore"
+        class="query-history-restore"
+        type="button"
+        @click="emit('restoreScope', selectedThread.scope)"
+      >
+        回到追问范围并继续
+      </button>
+      <span v-else-if="historyReadOnly" class="query-history-waiting">
+        等待当前范围就绪后可继续
+      </span>
+    </div>
     <div v-if="!path && scope === 'current'" class="query-vacuum">打开文件以启用追问</div>
     <template v-else>
       <div class="query-content">
@@ -1088,7 +1194,7 @@ onBeforeUnmount(() => {
           v-model="question"
           class="query-input"
           :placeholder="scope === 'selected' ? '追问已选文件…' : '追问当前文件…'"
-          :disabled="streaming"
+          :disabled="streaming || historyReadOnly"
         />
         <button class="query-send" type="submit" :disabled="!canAsk">
           {{ streaming ? '…' : '追问' }}

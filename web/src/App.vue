@@ -1,6 +1,14 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onBeforeUnmount, ref, watch } from 'vue'
-import { fetchFile, fetchTree, openFolder, pickFolder, getLlmSettings, type FileNode } from './api'
+import {
+  fetchFile,
+  fetchTree,
+  openFolder,
+  pickFolder,
+  getLlmSettings,
+  type FileNode,
+  type QueryScopeSpec,
+} from './api'
 import FileTree from './FileTree.vue'
 import Editor from './Editor.vue'
 import MarkdownView from './MarkdownView.vue'
@@ -472,6 +480,7 @@ onMounted(async () => {
   } catch (e) {
     loadError.value = String(e)
   }
+  await queryWorkspace.loadProjectHistory()
   // First-launch nudge: if no LLM backend is configured yet, pop the settings
   // panel so generation/queries don't silently fail later (best-effort probe).
   try {
@@ -504,6 +513,22 @@ async function open(node: FileNode) {
   }
 }
 
+async function restoreQueryScope(threadScope: QueryScopeSpec) {
+  if (threadScope.kind === 'current') {
+    const target = files.value.find((file) => file.path === threadScope.paths[0])
+    if (!target) {
+      loadError.value = `追问范围文件不在当前项目中：${threadScope.paths[0]}`
+      return
+    }
+    queryWorkspace.scope.value = 'current'
+    await open(target)
+    return
+  }
+  selectedFilePaths.value = new Set(threadScope.paths)
+  fileSelectionMode.value = false
+  queryWorkspace.scope.value = 'selected'
+}
+
 async function openCodeEvidence(reference: CodeEvidenceRef) {
   const node = files.value.find((file) => file.path === reference.filePath)
   if (!node) {
@@ -532,8 +557,10 @@ async function doSwitch(path: string) {
   if (!path || switching.value) return
   switching.value = true
   loadError.value = null
+  queryWorkspace.resetForProjectChange()
   try {
     await openFolder(path)
+    await queryWorkspace.loadProjectHistory()
     openFiles.value = []
     activePath.value = null
     evidenceReveal.value = null
@@ -543,6 +570,7 @@ async function doSwitch(path: string) {
     folderInput.value = ''
   } catch (e) {
     loadError.value = String(e)
+    await queryWorkspace.loadProjectHistory()
   } finally {
     switching.value = false
   }
@@ -707,6 +735,7 @@ function closeTab(path: string) {
         @toggle-selection-mode="fileSelectionMode = !fileSelectionMode"
         @clear-selected="clearSelectedFiles"
         @open-evidence="openCodeEvidence"
+        @restore-scope="restoreQueryScope"
       />
     </div>
     <StatusBar

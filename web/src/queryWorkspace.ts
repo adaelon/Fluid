@@ -1,4 +1,16 @@
 import { ref, type Ref } from 'vue'
+import {
+  QueryHistoryApiError,
+  createQueryThread,
+  deleteQueryThread,
+  getQueryThread,
+  listQueryThreads,
+  type QueryScopeSpec,
+  type QueryThread,
+  type QueryThreadListResponse,
+  type QueryThreadSummary,
+  type QueryThreadWarning,
+} from './api'
 import type { QueryFrame, QueryTrace } from './ghostTypes'
 import { queryAnswerEvidenceCitations } from './queryEvidence'
 import {
@@ -15,6 +27,7 @@ import {
   appendCompletedQueryTurn,
   idleQueryState,
   reduceQueryFrame,
+  selectedQueryScope,
   startQueryRequest,
   startQueryTrace,
   type QueryScopeIdentity,
@@ -25,6 +38,78 @@ export type QueryScope = 'current' | 'selected'
 
 export interface QueryWorkspaceStream {
   cancel(): void
+}
+
+export interface QueryHistoryClient {
+  list(): Promise<QueryThreadListResponse>
+  get(threadId: string): Promise<QueryThread>
+  create(req: { scope: QueryScopeSpec; originalQuestion: string }): Promise<QueryThread>
+  delete(threadId: string): Promise<void>
+}
+
+export type QueryHistorySelectionResult =
+  | {
+      kind: 'selected'
+      turns: QueryTrace['turns']
+      snapshots: QueryTurnPresentationSnapshot[]
+    }
+  | { kind: 'missing' | 'ignored' | 'error' }
+
+const DEFAULT_QUERY_HISTORY_CLIENT: QueryHistoryClient = {
+  list: listQueryThreads,
+  get: getQueryThread,
+  create: createQueryThread,
+  delete: deleteQueryThread,
+}
+
+/** Keep server RFC-3339 ordering deterministic even if a proxy/client returns
+ * summaries out of order. Equal timestamps use the opaque id as a stable key. */
+export function sortQueryThreadSummaries(
+  summaries: readonly QueryThreadSummary[],
+): QueryThreadSummary[] {
+  return [...summaries].sort((left, right) =>
+    right.updatedAt.localeCompare(left.updatedAt) || left.id.localeCompare(right.id),
+  )
+}
+
+function summaryForThread(thread: QueryThread): QueryThreadSummary {
+  return {
+    id: thread.id,
+    title: thread.title,
+    updatedAt: thread.updatedAt,
+    scope: thread.scope,
+    turnCount: thread.turns.length,
+    freshness: thread.freshness,
+    ...(thread.staleReason ? { staleReason: thread.staleReason } : {}),
+  }
+}
+
+function scopeKeyForThread(thread: QueryThread): string {
+  if (thread.scope.kind === 'current') return `current:${thread.scope.paths[0]}`
+  return selectedQueryScope(thread.scope.paths).scopeKey
+}
+
+function traceForThread(thread: QueryThread): QueryTrace {
+  return {
+    scopeKey: scopeKeyForThread(thread),
+    scopeRevision: thread.sourceRevision,
+    originalQuestion: thread.originalQuestion,
+    turns: thread.turns.map((turn) => ({
+      question: turn.question,
+      answer: turn.answer,
+      codeEvidenceIds: [...turn.codeEvidenceIds],
+    })),
+  }
+}
+
+function snapshotsForThread(thread: QueryThread): QueryTurnPresentationSnapshot[] {
+  return thread.turns.map((turn) => ({
+    map: turn.map,
+    evidence: turn.evidence
+      ? { ...turn.evidence, sources: turn.evidence.sources.map((source) => ({ ...source })) }
+      : null,
+    answerHtml: '',
+  }))
 }
 
 export interface QueryWorkspaceRequest {
@@ -56,6 +141,23 @@ export interface QueryWorkspaceController {
   scope: Ref<QueryScope>
   threadId: Ref<string | null>
   threadUpdatedAt: Ref<string | null>
+  historySummaries: Ref<QueryThreadSummary[]>
+  historyWarnings: Ref<QueryThreadWarning[]>
+  historyLoading: Ref<boolean>
+  historySelectingId: Ref<string | null>
+  historyError: Ref<string>
+  selectedThread: Ref<QueryThread | null>
+  loadProjectHistory(): Promise<boolean>
+  replaceProject(): Promise<boolean>
+  resetForProjectChange(): void
+  selectHistoryThread(threadId: string): Promise<QueryHistorySelectionResult>
+  deleteHistoryThread(threadId: string): Promise<boolean>
+  ensureRequestThread(
+    request: QueryWorkspaceRequest,
+    scope: QueryScopeSpec,
+  ): Promise<string | null>
+  canContinueSelectedThread(identity: QueryScopeIdentity): boolean
+  handleScopeIdentityChange(clearQuestion?: boolean): void
   beginRequest(identity: QueryScopeIdentity): QueryWorkspaceRequest | null
   bindThread(
     request: QueryWorkspaceRequest,
@@ -80,9 +182,12 @@ export interface QueryWorkspaceController {
 /**
  * Project-scoped owner for the query runtime. Vue views consume these refs, but
  * socket identity, bounded trace and turn presentation survive view-shell moves.
- * Explicit close/scope reset methods keep the pre-S-QSTATE-R0 clearing rules.
+ * Explicit close clears only the active projection; project history survives
+ * panel moves while project replacement invalidates every older async result.
  */
-export function createQueryWorkspace(): QueryWorkspaceController {
+export function createQueryWorkspace(
+  historyClient: QueryHistoryClient = DEFAULT_QUERY_HISTORY_CLIENT,
+): QueryWorkspaceController {
   const question = ref('')
   const viewState = ref(idleQueryState())
   const trace = ref<QueryTrace | null>(null)
@@ -92,10 +197,19 @@ export function createQueryWorkspace(): QueryWorkspaceController {
   const scope = ref<QueryScope>('current')
   const threadId = ref<string | null>(null)
   const threadUpdatedAt = ref<string | null>(null)
+  const historySummaries = ref<QueryThreadSummary[]>([])
+  const historyWarnings = ref<QueryThreadWarning[]>([])
+  const historyLoading = ref(false)
+  const historySelectingId = ref<string | null>(null)
+  const historyError = ref('')
+  const selectedThread = ref<QueryThread | null>(null)
 
   let stream: QueryWorkspaceStream | null = null
   let requestGeneration = 0
   let requestSequence = 0
+  let projectGeneration = 0
+  let historyRequestSequence = 0
+  let historySelectionSequence = 0
 
   function detachStream(cancel: boolean): void {
     const active = stream
@@ -108,7 +222,192 @@ export function createQueryWorkspace(): QueryWorkspaceController {
     detachStream(true)
   }
 
+  function upsertHistorySummary(next: QueryThreadSummary): void {
+    historySummaries.value = sortQueryThreadSummaries([
+      next,
+      ...historySummaries.value.filter((item) => item.id !== next.id),
+    ])
+  }
+
+  function restoreThreadProjection(thread: QueryThread, preserveRendered = false): {
+    turns: QueryTrace['turns']
+    snapshots: QueryTurnPresentationSnapshot[]
+  } {
+    const restoredTrace = traceForThread(thread)
+    const previousSnapshots = preserveRendered ? traceSnapshots.value : []
+    const snapshots = snapshotsForThread(thread).map((snapshot, index) => ({
+      ...snapshot,
+      answerHtml: previousSnapshots[index]?.answerHtml ?? '',
+    }))
+    selectedThread.value = thread
+    threadId.value = thread.id
+    threadUpdatedAt.value = thread.updatedAt
+    trace.value = restoredTrace
+    traceSnapshots.value = snapshots
+    selectedTurn.value = defaultQueryTurnSelection(restoredTrace.turns.length, false)
+    activeQuestion.value = ''
+    viewState.value = idleQueryState()
+    return { turns: restoredTrace.turns, snapshots }
+  }
+
+  async function loadProjectHistory(): Promise<boolean> {
+    const generation = projectGeneration
+    const sequence = ++historyRequestSequence
+    historyLoading.value = true
+    historyError.value = ''
+    try {
+      const response = await historyClient.list()
+      if (generation !== projectGeneration || sequence !== historyRequestSequence) {
+        return false
+      }
+      historySummaries.value = sortQueryThreadSummaries(response.threads)
+      historyWarnings.value = response.warnings.map((warning) => ({ ...warning }))
+      const selectedId = selectedThread.value?.id
+      if (selectedId && !historySummaries.value.some((item) => item.id === selectedId)) {
+        resetTrace(false)
+        historyError.value = '当前追问线程已删除，已返回项目历史列表'
+      }
+      return true
+    } catch (error) {
+      if (generation !== projectGeneration || sequence !== historyRequestSequence) {
+        return false
+      }
+      historyError.value = error instanceof Error ? error.message : '加载项目追问历史失败'
+      return false
+    } finally {
+      if (generation === projectGeneration && sequence === historyRequestSequence) {
+        historyLoading.value = false
+      }
+    }
+  }
+
+  function resetForProjectChange(): void {
+    projectGeneration++
+    historyRequestSequence++
+    historySelectionSequence++
+    historyLoading.value = false
+    historySelectingId.value = null
+    historyError.value = ''
+    historyWarnings.value = []
+    historySummaries.value = []
+    resetTrace()
+    scope.value = 'current'
+  }
+
+  async function replaceProject(): Promise<boolean> {
+    resetForProjectChange()
+    return loadProjectHistory()
+  }
+
+  async function selectHistoryThread(
+    nextThreadId: string,
+  ): Promise<QueryHistorySelectionResult> {
+    if (!nextThreadId) return { kind: 'ignored' }
+    const generation = projectGeneration
+    const sequence = ++historySelectionSequence
+    historySelectingId.value = nextThreadId
+    historyError.value = ''
+    teardown()
+    viewState.value = idleQueryState()
+    activeQuestion.value = ''
+    try {
+      const thread = await historyClient.get(nextThreadId)
+      if (generation !== projectGeneration || sequence !== historySelectionSequence) {
+        return { kind: 'ignored' }
+      }
+      scope.value = thread.scope.kind
+      const restored = restoreThreadProjection(thread)
+      upsertHistorySummary(summaryForThread(thread))
+      question.value = ''
+      return { kind: 'selected', ...restored }
+    } catch (error) {
+      if (generation !== projectGeneration || sequence !== historySelectionSequence) {
+        return { kind: 'ignored' }
+      }
+      if (error instanceof QueryHistoryApiError && error.status === 404) {
+        historySummaries.value = historySummaries.value.filter(
+          (item) => item.id !== nextThreadId,
+        )
+        if (selectedThread.value?.id === nextThreadId) resetTrace(false)
+        historyError.value = '该追问线程已删除，已从项目历史移除'
+        return { kind: 'missing' }
+      }
+      historyError.value = error instanceof Error ? error.message : '读取追问线程失败'
+      return { kind: 'error' }
+    } finally {
+      if (generation === projectGeneration && sequence === historySelectionSequence) {
+        historySelectingId.value = null
+      }
+    }
+  }
+
+  async function deleteHistoryThread(deletedThreadId: string): Promise<boolean> {
+    if (!deletedThreadId) return false
+    const generation = projectGeneration
+    historySelectionSequence++
+    historySelectingId.value = null
+    const deletingSelected = selectedThread.value?.id === deletedThreadId
+    if (deletingSelected) {
+      teardown()
+      const thread = selectedThread.value
+      if (thread) restoreThreadProjection(thread, true)
+    }
+    historyError.value = ''
+    try {
+      await historyClient.delete(deletedThreadId)
+    } catch (error) {
+      if (generation !== projectGeneration) return false
+      if (!(error instanceof QueryHistoryApiError) || error.status !== 404) {
+        historyError.value = error instanceof Error ? error.message : '删除追问线程失败'
+        return false
+      }
+    }
+    if (generation !== projectGeneration) return false
+    historySummaries.value = historySummaries.value.filter(
+      (item) => item.id !== deletedThreadId,
+    )
+    if (deletingSelected) resetTrace(false)
+    return true
+  }
+
+  function canContinueSelectedThread(identity: QueryScopeIdentity): boolean {
+    const thread = selectedThread.value
+    return Boolean(
+      thread
+      && thread.freshness === 'fresh'
+      && identity.scopeRevision
+      && scopeKeyForThread(thread) === identity.scopeKey,
+    )
+  }
+
+  function handleScopeIdentityChange(clearQuestion = true): void {
+    const hadActiveProjection = Boolean(activeQuestion.value)
+      || viewState.value.mode === 'streaming'
+      || viewState.value.mode === 'error'
+    teardown()
+    const thread = selectedThread.value
+    if (thread && hadActiveProjection) restoreThreadProjection(thread, true)
+    else if (thread) {
+      activeQuestion.value = ''
+      viewState.value = idleQueryState()
+      selectedTurn.value = defaultQueryTurnSelection(thread.turns.length, false)
+    }
+    else {
+      trace.value = null
+      const presentation = resetQueryTurnPresentation()
+      selectedTurn.value = presentation.selection
+      traceSnapshots.value = presentation.snapshots
+      activeQuestion.value = ''
+      viewState.value = idleQueryState()
+      threadId.value = null
+      threadUpdatedAt.value = null
+    }
+    if (clearQuestion) question.value = ''
+  }
+
   function resetTrace(clearQuestion = true): void {
+    historySelectionSequence++
+    historySelectingId.value = null
     teardown()
     trace.value = null
     const presentation = resetQueryTurnPresentation()
@@ -118,6 +417,7 @@ export function createQueryWorkspace(): QueryWorkspaceController {
     viewState.value = idleQueryState()
     threadId.value = null
     threadUpdatedAt.value = null
+    selectedThread.value = null
     if (clearQuestion) question.value = ''
   }
 
@@ -129,6 +429,15 @@ export function createQueryWorkspace(): QueryWorkspaceController {
   function beginRequest(identity: QueryScopeIdentity): QueryWorkspaceRequest | null {
     const askedQuestion = question.value.trim()
     if (!askedQuestion) return null
+
+    if (selectedThread.value) {
+      if (!canContinueSelectedThread(identity) || !trace.value) return null
+      trace.value = {
+        ...trace.value,
+        scopeKey: identity.scopeKey,
+        scopeRevision: identity.scopeRevision,
+      }
+    }
 
     selectedTurn.value = activeQueryTurnSelection()
     const requestIdentity = { ...identity }
@@ -170,6 +479,23 @@ export function createQueryWorkspace(): QueryWorkspaceController {
     threadId.value = nextThreadId
     threadUpdatedAt.value = updatedAt
     return true
+  }
+
+  async function ensureRequestThread(
+    request: QueryWorkspaceRequest,
+    threadScope: QueryScopeSpec,
+  ): Promise<string | null> {
+    if (request.threadId) return request.threadId
+    const generation = projectGeneration
+    const created = await historyClient.create({
+      scope: threadScope,
+      originalQuestion: request.question,
+    })
+    if (generation !== projectGeneration) return null
+    if (!bindThread(request, created.id, created.updatedAt)) return null
+    selectedThread.value = created
+    upsertHistorySummary(summaryForThread(created))
+    return created.id
   }
 
   function attachStream(
@@ -235,6 +561,40 @@ export function createQueryWorkspace(): QueryWorkspaceController {
       traceSnapshots.value = snapshots
       activeQuestion.value = ''
       selectedTurn.value = defaultQueryTurnSelection(completed.turns.length, false)
+      const durable = selectedThread.value
+      if (durable?.id === frame.threadId) {
+        const updatedThread: QueryThread = {
+          ...durable,
+          updatedAt: frame.updatedAt,
+          turns: [
+            ...durable.turns,
+            {
+              question: request.question,
+              answer: next.answer,
+              map: next.map,
+              evidence: next.evidence
+                ? {
+                    ...next.evidence,
+                    sources: next.evidence.sources.map((source) => ({ ...source })),
+                  }
+                : null,
+              codeEvidenceIds: [...citations.knownIds],
+              completedAt: frame.updatedAt,
+            },
+          ],
+        }
+        selectedThread.value = updatedThread
+        upsertHistorySummary(summaryForThread(updatedThread))
+      } else {
+        const existing = historySummaries.value.find((item) => item.id === frame.threadId)
+        if (existing) {
+          upsertHistorySummary({
+            ...existing,
+            updatedAt: frame.updatedAt,
+            turnCount: completed.turns.length,
+          })
+        }
+      }
       return { kind: 'completed', turns: completed.turns, snapshots }
     }
 
@@ -272,6 +632,20 @@ export function createQueryWorkspace(): QueryWorkspaceController {
     scope,
     threadId,
     threadUpdatedAt,
+    historySummaries,
+    historyWarnings,
+    historyLoading,
+    historySelectingId,
+    historyError,
+    selectedThread,
+    loadProjectHistory,
+    replaceProject,
+    resetForProjectChange,
+    selectHistoryThread,
+    deleteHistoryThread,
+    ensureRequestThread,
+    canContinueSelectedThread,
+    handleScopeIdentityChange,
     beginRequest,
     bindThread,
     attachStream,
