@@ -27,6 +27,7 @@ import {
   queryDockHeightFromPointer,
   type QueryPresentation,
 } from './queryLayout'
+import { createQueryWorkspace } from './queryWorkspace'
 
 type OpenFile = { path: string; lang: string; source: string }
 
@@ -140,6 +141,7 @@ function toggleGeneration(): void {
 // so follow-ups carry the roster + generated capsule summaries. Editor emits a
 // fresh snapshot on switch/capsule arrival; we still null it out when no file is
 // open (Editor is v-if'd away then and can't emit).
+const queryWorkspace = createQueryWorkspace()
 const queryCtx = ref<QueryContext>(EMPTY_QUERY_CONTEXT)
 
 interface EvidenceReveal extends CodeEvidenceRef {
@@ -306,6 +308,7 @@ function restoreQueryDock(): void {
 }
 
 function closeQueryPanel(): void {
+  queryWorkspace.resetForClose()
   queryPresentation.value = 'dock'
   queryPanelOpen.value = false
 }
@@ -481,6 +484,7 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', onGlobalKey, true)
   window.removeEventListener('resize', resizeQueryDockForViewport)
+  queryWorkspace.teardown()
 })
 
 // Open a file from the tree: if already open just activate its tab; otherwise
@@ -689,6 +693,7 @@ function closeTab(path: string) {
       ></div>
       <QueryPanel
         ref="queryPanelComponent"
+        :workspace="queryWorkspace"
         :path="current.path"
         :ctx="queryCtx"
         :selection-mode="fileSelectionMode"

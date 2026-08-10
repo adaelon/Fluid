@@ -6,7 +6,7 @@
 // query WebSocket, and turns only known E# citations into source navigation.
 // Switching files or scope vacuums the in-flight Q&A.
 import { computed, ref, watch, nextTick, onMounted, onBeforeUnmount } from 'vue'
-import { streamQuery, streamQueryFiles, type QueryStream } from './api'
+import { streamQuery, streamQueryFiles } from './api'
 import type { CodeEvidenceRef, QueryFrame, QueryTrace } from './ghostTypes'
 import { EMPTY_QUERY_CONTEXT, type QueryContext } from './queryContext'
 import CodeEvidencePeek from './CodeEvidencePeek.vue'
@@ -22,30 +22,25 @@ import {
 } from './queryLayout'
 import {
   activeQueryTurnSelection,
-  appendQueryTurnPresentationSnapshot,
   completedQueryTurnSelection,
   defaultQueryTurnSelection,
   normalizeQueryTurnSelection,
   queryTurnEvidenceById,
   queryTurnSelectionFromKey,
   queryTurnSelectionKey,
-  resetQueryTurnPresentation,
-  setQueryTurnAnswerHtml,
   type QueryTurnPresentationSnapshot,
   type QueryTurnSelection,
 } from './queryPresentation'
 import {
-  alignQueryTrace,
-  appendCompletedQueryTurn,
   currentQueryScope,
-  idleQueryState,
-  reduceQueryFrame,
   selectedQueryScope,
-  startQueryRequest,
-  startQueryTrace,
   type QueryEvidenceState,
   type QueryScopeIdentity,
 } from './queryState'
+import type {
+  QueryWorkspaceController,
+  QueryWorkspaceRequest,
+} from './queryWorkspace'
 // S11-lazy: markdown-it / DOMPurify / KaTeX (+ its CSS) are heavy and only needed
 // once an answer finishes streaming, so they are dynamically import()ed inside
 // renderAnswer() rather than at module top — Rollup splits them into async chunks
@@ -53,6 +48,7 @@ import {
 
 const props = withDefaults(
   defineProps<{
+    workspace: QueryWorkspaceController
     path: string | null
     ctx?: QueryContext
     selectionMode?: boolean
@@ -82,16 +78,17 @@ const emit = defineEmits<{
   restore: []
 }>()
 
-type QueryScope = 'current' | 'selected'
-
-const question = ref('')
-const viewState = ref(idleQueryState())
-const trace = ref<QueryTrace | null>(null)
-const traceSnapshots = ref<QueryTurnPresentationSnapshot[]>([])
-const selectedTurn = ref<QueryTurnSelection>(null)
-const activeQuestion = ref('')
+const workspace = props.workspace
+const {
+  question,
+  viewState,
+  trace,
+  traceSnapshots,
+  selectedTurn,
+  activeQuestion,
+  scope,
+} = workspace
 const renderedEl = ref<HTMLElement | null>(null)
-const scope = ref<QueryScope>('current')
 const codePeekTarget = ref<CodeEvidenceRef | null>(null)
 const codePeekViewportWidth = ref(window.innerWidth)
 let codePeekPreferredWidth = loadCodePeekWidth(
@@ -101,9 +98,6 @@ let codePeekPreferredWidth = loadCodePeekWidth(
 const codePeekWidth = ref(codePeekPreferredWidth)
 const codePeekBounds = computed(() => codePeekWidthBounds(codePeekViewportWidth.value))
 const codePeekDragging = ref(false)
-let stream: QueryStream | null = null
-let requestGeneration = 0
-let requestSequence = 0
 let answerRenderGeneration = 0
 let mathRenderGeneration = 0
 
@@ -232,17 +226,10 @@ const focusedUnknownEvidenceIds = computed(() => {
 const hasFocusHistory = computed(() => completedTurns.value.length > 0 || hasActiveTurn.value)
 
 function resetTrace(clearQuestion = true) {
-  teardown()
+  workspace.resetTrace(clearQuestion)
   answerRenderGeneration++
   mathRenderGeneration++
-  trace.value = null
-  const presentation = resetQueryTurnPresentation()
-  selectedTurn.value = presentation.selection
-  traceSnapshots.value = presentation.snapshots
-  activeQuestion.value = ''
   closeCodePeek()
-  viewState.value = idleQueryState()
-  if (clearQuestion) question.value = ''
 }
 
 function closeCodePeek(): void {
@@ -323,12 +310,6 @@ function resizeCodePeekForViewport(): void {
   )
 }
 
-function teardown() {
-  requestGeneration++
-  stream?.cancel()
-  stream = null
-}
-
 // File, scope, selected-set or source-revision changes all end the current trace.
 watch(
   () => [
@@ -383,48 +364,14 @@ async function renderTraceAnswers(
     ),
   )
   if (generation !== answerRenderGeneration) return
-  traceSnapshots.value = setQueryTurnAnswerHtml(snapshots, htmlByTurn)
+  if (!workspace.applyRenderedAnswers(snapshots, htmlByTurn)) return
   await renderVisibleMath()
 }
 
-function acceptFrame(
-  generation: number,
-  identity: QueryScopeIdentity,
-  askedQuestion: string,
-  frame: QueryFrame,
-) {
-  if (generation !== requestGeneration) return
-  const previous = viewState.value
-  const next = reduceQueryFrame(previous, frame)
-  if (next === previous && frame.reqId !== previous.requestId) return
-  viewState.value = next
-  if (previous.mode !== 'error' && next.mode === 'error' && frame.kind !== 'error') {
-    stream?.cancel()
-    stream = null
-    return
-  }
-  if (frame.kind === 'done' && next.mode === 'done' && next.map) {
-    stream = null
-    const citations = queryAnswerEvidenceCitations(next.answer, next.map.evidence)
-    const completed = appendCompletedQueryTurn(
-      trace.value,
-      identity,
-      askedQuestion,
-      next.answer,
-      citations.knownIds,
-    )
-    trace.value = completed
-    const snapshots = appendQueryTurnPresentationSnapshot(
-      traceSnapshots.value,
-      next.map,
-      next.evidence,
-    )
-    traceSnapshots.value = snapshots
-    activeQuestion.value = ''
-    selectedTurn.value = defaultQueryTurnSelection(completed.turns.length, false)
-    void renderTraceAnswers(completed.turns, snapshots)
-  } else if (frame.kind === 'error') {
-    stream = null
+function acceptFrame(request: QueryWorkspaceRequest, frame: QueryFrame) {
+  const result = workspace.acceptFrame(request, frame)
+  if (result.kind === 'completed') {
+    void renderTraceAnswers(result.turns, result.snapshots)
   }
 }
 
@@ -499,65 +446,48 @@ function ask() {
   if (!q || streaming.value) return
   if (scope.value === 'selected') {
     if (!selectedReady.value) {
-      viewState.value = {
-        ...idleQueryState(),
-        mode: 'error',
-        errorMessage: selectedScopeHint.value,
-      }
+      workspace.showValidationError(selectedScopeHint.value)
       return
     }
-    selectedTurn.value = activeQueryTurnSelection()
     closeCodePeek()
-    const identity = { ...scopeIdentity.value }
-    const requestTrace =
-      alignQueryTrace(trace.value, identity) ?? startQueryTrace(identity, q)
-    trace.value = requestTrace
-    const reqId = `qf-${++requestSequence}`
-    const generation = ++requestGeneration
-    viewState.value = startQueryRequest(reqId)
-    activeQuestion.value = q
-    question.value = ''
-    stream = streamQueryFiles(
+    const request = workspace.beginRequest(scopeIdentity.value)
+    if (!request) return
+    const nextStream = streamQueryFiles(
       {
-        reqId,
+        reqId: request.requestId,
         filePaths: props.selectedPaths,
-        question: q,
-        trace: requestTrace,
+        question: request.question,
+        trace: request.trace,
         allowWeb: props.allowWeb,
       },
       {
-        onFrame: (frame) => acceptFrame(generation, identity, q, frame),
+        onFrame: (frame) => acceptFrame(request, frame),
       },
     )
+    workspace.attachStream(request.generation, nextStream)
     return
   }
   if (!props.path || !currentOrientationId.value) return
-  selectedTurn.value = activeQueryTurnSelection()
   closeCodePeek()
-  const identity = { ...scopeIdentity.value }
-  const requestTrace = alignQueryTrace(trace.value, identity) ?? startQueryTrace(identity, q)
-  trace.value = requestTrace
-  const reqId = `q-${++requestSequence}`
-  const generation = ++requestGeneration
-  viewState.value = startQueryRequest(reqId)
-  activeQuestion.value = q
-  question.value = ''
-  stream = streamQuery(
+  const request = workspace.beginRequest(scopeIdentity.value)
+  if (!request) return
+  const nextStream = streamQuery(
     {
-      reqId,
+      reqId: request.requestId,
       filePath: props.path,
       orientationId: currentOrientationId.value,
-      question: q,
-      trace: requestTrace,
+      question: request.question,
+      trace: request.trace,
       roster: props.ctx.roster,
       rosterSpans: props.ctx.rosterSpans,
       capsules: props.ctx.capsules,
       allowWeb: props.allowWeb,
     },
     {
-      onFrame: (frame) => acceptFrame(generation, identity, q, frame),
+      onFrame: (frame) => acceptFrame(request, frame),
     },
   )
+  workspace.attachStream(request.generation, nextStream)
 }
 
 watch(
@@ -589,7 +519,6 @@ onBeforeUnmount(() => {
   window.removeEventListener('resize', resizeCodePeekForViewport)
   answerRenderGeneration++
   mathRenderGeneration++
-  teardown()
 })
 </script>
 
