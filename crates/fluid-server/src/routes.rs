@@ -40,17 +40,18 @@ use crate::context_assembler::{
     build_full_orientation_role_batch_specs, build_gen_prompt,
     build_orientation_role_batch_correction_prompt, build_orientation_role_batch_prompt,
     build_orientation_skeleton_correction_prompt, build_orientation_skeleton_prompt,
-    build_orientation_source_planning_prompt, build_query_prompt, build_query_prompt_with_map,
-    build_query_source_planning_prompt, build_selection_explanation_prompt,
-    build_selection_private_context, build_untrusted_web_evidence_block,
-    cross_file_query_source_targets, cross_file_targets, extract_selection_site,
-    file_set_query_source_targets, focus_query_source_target, inline_query_source_target,
-    is_dependency_manifest_path, known_query_code_evidence_ids, local_query_source_targets,
-    orientation_core_source_targets, orientation_requires_source_planning,
-    rebase_query_source_targets, sample_dependency_manifests, select_query_source_targets,
-    slice_orientation_sources, slice_span, CrossFileTarget, EvidenceCatalog, FileSetContext,
-    FunctionSpan, GenContext, QueryFocus, QueryMap, QuerySourceTarget, QueryTrace, SharedContext,
-    ORIENTATION_FETCH_BUDGET_CHARS, QUERY_FETCH_BUDGET_CHARS,
+    build_orientation_source_planning_prompt, build_query_answer_correction_prompt,
+    build_query_prompt, build_query_prompt_with_map, build_query_source_planning_prompt,
+    build_selection_explanation_prompt, build_selection_private_context,
+    build_untrusted_web_evidence_block, cross_file_query_source_targets, cross_file_targets,
+    extract_selection_site, file_set_query_source_targets, focus_query_source_target,
+    inline_query_source_target, is_dependency_manifest_path, known_query_code_evidence_ids,
+    local_query_source_targets, orientation_core_source_targets,
+    orientation_requires_source_planning, query_answer_contract, rebase_query_source_targets,
+    sample_dependency_manifests, select_query_source_targets, slice_orientation_sources,
+    slice_span, validate_query_answer, CrossFileTarget, EvidenceCatalog, FileSetContext,
+    FunctionSpan, GenContext, QueryAnswerViolation, QueryFocus, QueryMap, QuerySourceTarget,
+    QueryTrace, SharedContext, ORIENTATION_FETCH_BUDGET_CHARS, QUERY_FETCH_BUDGET_CHARS,
 };
 use crate::graph_loader::{GraphCatalog, GraphNode, KnowledgeGraph};
 #[cfg(test)]
@@ -3622,9 +3623,9 @@ fn persist_query_completion(
     question: &str,
     completion: QueryCompletion,
 ) -> Result<(String, String), String> {
-    if completion.answer.trim().is_empty() {
-        return Err("LLM returned an empty answer; query turn was not saved".into());
-    }
+    validate_query_answer(&completion.answer, &completion.map).map_err(|error| {
+        format!("query answer contract violation: {error}; query turn was not saved")
+    })?;
     let mut guard = state.project.write().unwrap();
     let project = guard
         .as_mut()
@@ -3697,13 +3698,69 @@ where
     (user, evidence)
 }
 
-async fn stream_query_answer<F>(
+const QUERY_ANSWER_PREAMBLE_MAX_CHARS: usize = 256;
+
+#[derive(Debug)]
+enum QueryAnswerAttemptError {
+    Provider(String),
+    Preamble {
+        invalid_prefix: String,
+        validation_error: String,
+    },
+}
+
+fn first_complete_non_empty_line(text: &str) -> Option<(&str, usize)> {
+    let mut prefix_chars = 0;
+    for line in text.split_inclusive('\n') {
+        prefix_chars += line.chars().count();
+        if !line.ends_with('\n') {
+            continue;
+        }
+        let line = line.trim_end_matches('\n').trim_end_matches('\r').trim();
+        if !line.is_empty() {
+            return Some((line, prefix_chars));
+        }
+    }
+    None
+}
+
+fn first_non_empty_line_at_eof(text: &str) -> Option<(&str, usize)> {
+    let mut prefix_chars = 0;
+    for line in text.split_inclusive('\n') {
+        prefix_chars += line.chars().count();
+        let line = line.trim_end_matches('\n').trim_end_matches('\r').trim();
+        if !line.is_empty() {
+            return Some((line, prefix_chars));
+        }
+    }
+    None
+}
+
+fn bounded_query_answer_prefix(text: &str) -> String {
+    text.chars().take(QUERY_ANSWER_PREAMBLE_MAX_CHARS).collect()
+}
+
+fn query_answer_preamble_error(map: &QueryMap) -> String {
+    QueryAnswerViolation::PreambleMismatch {
+        expected: query_answer_contract(map).expected_preamble,
+    }
+    .to_string()
+}
+
+fn query_answer_preamble_limit_error() -> String {
+    format!(
+        "first non-empty line exceeded the {QUERY_ANSWER_PREAMBLE_MAX_CHARS}-character protocol limit"
+    )
+}
+
+async fn stream_query_answer_attempt<F>(
     llm: &LlmProxy,
     system: &str,
     user: &str,
+    map: &QueryMap,
     log_scope: &str,
     emit: &mut F,
-) -> Result<String, String>
+) -> Result<String, QueryAnswerAttemptError>
 where
     F: FnMut(QueryFrame) + Send,
 {
@@ -3711,27 +3768,131 @@ where
         Ok(response) => response,
         Err(error) => {
             eprintln!("[{log_scope}] LLM error: {error}");
-            return Err(format!("LLM error: {error}"));
+            return Err(QueryAnswerAttemptError::Provider(format!(
+                "LLM error: {error}"
+            )));
         }
     };
 
     let mut stream = resp.bytes_stream();
     let mut decoder = SseDecoder::new();
     let mut answer = String::new();
+    let mut pending_deltas = Vec::new();
+    let expected_preamble = query_answer_contract(map).expected_preamble;
+    let mut preamble_accepted = false;
     while let Some(chunk) = stream.next().await {
         let bytes = match chunk {
             Ok(bytes) => bytes,
             Err(error) => {
                 eprintln!("[{log_scope}] stream error: {error}");
-                return Err(format!("LLM stream error: {error}"));
+                return Err(QueryAnswerAttemptError::Provider(format!(
+                    "LLM stream error: {error}"
+                )));
             }
         };
         for delta in decoder.push(&String::from_utf8_lossy(&bytes)) {
             answer.push_str(&delta);
-            emit(QueryFrame::Delta { text: delta });
+            if preamble_accepted {
+                emit(QueryFrame::Delta { text: delta });
+                continue;
+            }
+
+            pending_deltas.push(delta);
+            if let Some((line, prefix_chars)) = first_complete_non_empty_line(&answer) {
+                if prefix_chars > QUERY_ANSWER_PREAMBLE_MAX_CHARS {
+                    return Err(QueryAnswerAttemptError::Preamble {
+                        invalid_prefix: bounded_query_answer_prefix(&answer),
+                        validation_error: query_answer_preamble_limit_error(),
+                    });
+                }
+                if line != expected_preamble {
+                    return Err(QueryAnswerAttemptError::Preamble {
+                        invalid_prefix: bounded_query_answer_prefix(&answer),
+                        validation_error: query_answer_preamble_error(map),
+                    });
+                }
+                preamble_accepted = true;
+                for text in pending_deltas.drain(..) {
+                    emit(QueryFrame::Delta { text });
+                }
+            } else if answer.chars().count() > QUERY_ANSWER_PREAMBLE_MAX_CHARS {
+                return Err(QueryAnswerAttemptError::Preamble {
+                    invalid_prefix: bounded_query_answer_prefix(&answer),
+                    validation_error: query_answer_preamble_limit_error(),
+                });
+            }
+        }
+    }
+
+    if !preamble_accepted {
+        match first_non_empty_line_at_eof(&answer) {
+            Some((_, prefix_chars)) if prefix_chars > QUERY_ANSWER_PREAMBLE_MAX_CHARS => {
+                return Err(QueryAnswerAttemptError::Preamble {
+                    invalid_prefix: bounded_query_answer_prefix(&answer),
+                    validation_error: query_answer_preamble_limit_error(),
+                });
+            }
+            Some((line, _)) if line == expected_preamble => {
+                for text in pending_deltas.drain(..) {
+                    emit(QueryFrame::Delta { text });
+                }
+            }
+            _ => {
+                return Err(QueryAnswerAttemptError::Preamble {
+                    invalid_prefix: bounded_query_answer_prefix(&answer),
+                    validation_error: query_answer_preamble_error(map),
+                });
+            }
         }
     }
     Ok(answer)
+}
+
+async fn stream_query_answer<F>(
+    llm: &LlmProxy,
+    system: &str,
+    user: &str,
+    map: &QueryMap,
+    log_scope: &str,
+    emit: &mut F,
+) -> Result<String, String>
+where
+    F: FnMut(QueryFrame) + Send,
+{
+    match stream_query_answer_attempt(llm, system, user, map, log_scope, emit).await {
+        Ok(answer) => Ok(answer),
+        Err(QueryAnswerAttemptError::Provider(message)) => Err(message),
+        Err(QueryAnswerAttemptError::Preamble {
+            invalid_prefix,
+            validation_error,
+        }) => {
+            eprintln!("[{log_scope}] correcting query answer preamble: {validation_error}");
+            let (correction_system, correction_user) = build_query_answer_correction_prompt(
+                system,
+                user,
+                &invalid_prefix,
+                &validation_error,
+            );
+            match stream_query_answer_attempt(
+                llm,
+                &correction_system,
+                &correction_user,
+                map,
+                log_scope,
+                emit,
+            )
+            .await
+            {
+                Ok(answer) => Ok(answer),
+                Err(QueryAnswerAttemptError::Provider(message)) => Err(message),
+                Err(QueryAnswerAttemptError::Preamble {
+                    validation_error, ..
+                }) => Err(format!(
+                    "query answer contract violation after one correction: {validation_error}"
+                )),
+            }
+        }
+    }
 }
 
 fn current_query_evidence_after_plan(
@@ -3955,7 +4116,7 @@ where
     emit(QueryFrame::Map { map: map.clone() });
     emit(query_evidence(&evidence));
     eprintln!("[query] {} — streaming ({})", req.file_path, llm.model);
-    let answer = stream_query_answer(llm, &system, &user, "query", &mut emit).await?;
+    let answer = stream_query_answer(llm, &system, &user, &map, "query", &mut emit).await?;
     Ok(QueryCompletion {
         map,
         evidence,
@@ -4056,7 +4217,7 @@ where
         req.file_paths.len(),
         llm.model
     );
-    let answer = stream_query_answer(llm, &system, &user, "query-files", &mut emit).await?;
+    let answer = stream_query_answer(llm, &system, &user, &map, "query-files", &mut emit).await?;
     Ok(QueryCompletion {
         map,
         evidence,
@@ -7645,14 +7806,56 @@ mod tests {
         web_body: String,
         web_delay: Duration,
         answer_status: StatusCode,
-        answer_body: String,
+        queued_answers: Arc<Mutex<VecDeque<QueryMockAnswer>>>,
         requests: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+    }
+
+    enum QueryMockAnswer {
+        Body(StatusCode, String),
+        StreamErrorAfter(String),
     }
 
     struct QueryMockServer {
         base_url: String,
+        queued_answers: Arc<Mutex<VecDeque<QueryMockAnswer>>>,
         requests: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
         task: tokio::task::JoinHandle<()>,
+    }
+
+    impl QueryMockServer {
+        fn queue_answer(&self, answer: &str) {
+            self.queued_answers
+                .lock()
+                .unwrap()
+                .push_back(QueryMockAnswer::Body(
+                    StatusCode::OK,
+                    query_sse_answer(answer),
+                ));
+        }
+
+        fn queue_answer_deltas(&self, deltas: &[&str]) {
+            self.queued_answers
+                .lock()
+                .unwrap()
+                .push_back(QueryMockAnswer::Body(
+                    StatusCode::OK,
+                    query_sse_deltas(deltas),
+                ));
+        }
+
+        fn queue_answer_failure(&self, status: StatusCode, body: &str) {
+            self.queued_answers
+                .lock()
+                .unwrap()
+                .push_back(QueryMockAnswer::Body(status, body.to_string()));
+        }
+
+        fn queue_stream_error_after(&self, delta: &str) {
+            self.queued_answers
+                .lock()
+                .unwrap()
+                .push_back(QueryMockAnswer::StreamErrorAfter(delta.to_string()));
+        }
     }
 
     impl Drop for QueryMockServer {
@@ -7683,17 +7886,47 @@ mod tests {
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
         if request.get("stream").and_then(serde_json::Value::as_bool) == Some(true) {
+            let response = state
+                .queued_answers
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| {
+                    let body = if state.answer_status.is_success() {
+                        query_sse_answer(&query_fixture_answer(&request))
+                    } else {
+                        "fixture answer failure".to_string()
+                    };
+                    QueryMockAnswer::Body(state.answer_status, body)
+                });
             state
                 .requests
                 .lock()
                 .unwrap()
                 .push(("answer".to_string(), request));
-            return (
-                state.answer_status,
-                [("content-type", "text/event-stream")],
-                state.answer_body,
-            )
-                .into_response();
+            return match response {
+                QueryMockAnswer::Body(status, body) => {
+                    (status, [("content-type", "text/event-stream")], body).into_response()
+                }
+                QueryMockAnswer::StreamErrorAfter(delta) => {
+                    let first = query_sse_delta(&delta);
+                    let chunks = stream::once(async move {
+                        Ok::<_, std::io::Error>(axum::body::Bytes::from(first))
+                    })
+                    .chain(stream::once(async {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                        Err::<axum::body::Bytes, _>(std::io::Error::other(
+                            "injected query answer stream failure",
+                        ))
+                    }));
+                    let body = axum::body::Body::from_stream(chunks);
+                    axum::response::Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "text/event-stream")
+                        .body(body)
+                        .unwrap()
+                }
+            };
         }
 
         let (kind, content) = if system.contains("离线检索意图规划器") {
@@ -7731,10 +7964,43 @@ mod tests {
     }
 
     fn query_sse_answer(text: &str) -> String {
+        query_sse_deltas(&[text])
+    }
+
+    fn query_sse_delta(text: &str) -> String {
         format!(
-            "data: {}\n\ndata: [DONE]\n\n",
+            "data: {}\n\n",
             serde_json::json!({ "choices": [{ "delta": { "content": text } }] })
         )
+    }
+
+    fn query_sse_deltas(deltas: &[&str]) -> String {
+        let mut body = String::new();
+        for delta in deltas {
+            body.push_str(&query_sse_delta(delta));
+        }
+        body.push_str("data: [DONE]\n\n");
+        body
+    }
+
+    fn query_fixture_answer(request: &serde_json::Value) -> String {
+        let system = request
+            .pointer("/messages/0/content")
+            .and_then(serde_json::Value::as_str)
+            .expect("query fixture system prompt");
+        let expected = system
+            .split_once("首个非空行必须逐字写为「")
+            .and_then(|(_, suffix)| suffix.split_once('」'))
+            .map(|(preamble, _)| preamble)
+            .expect("query fixture prompt carries the backend-owned preamble");
+        let direction_evidence = system
+            .split_once("完整回答必须在代码围栏与行内代码之外至少引用一个方向证据：")
+            .and_then(|(_, suffix)| suffix.split(['、', '。']).next())
+            .filter(|value| !value.is_empty());
+        match direction_evidence {
+            Some(evidence) => format!("{expected}\nfixture answer {evidence}"),
+            None => format!("{expected}\nfixture answer"),
+        }
     }
 
     async fn start_query_mock(
@@ -7747,13 +8013,14 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
+        let queued_answers = Arc::new(Mutex::new(VecDeque::new()));
         let state = QueryMockBackend {
             web_plan: web_plan.to_string(),
             web_status,
             web_body: web_body.to_string(),
             web_delay,
             answer_status,
-            answer_body: query_sse_answer("fixture answer"),
+            queued_answers: Arc::clone(&queued_answers),
             requests: Arc::clone(&requests),
         };
         let app = Router::new()
@@ -7765,6 +8032,7 @@ mod tests {
         });
         QueryMockServer {
             base_url: format!("http://{address}"),
+            queued_answers,
             requests,
             task,
         }
@@ -8092,7 +8360,12 @@ mod tests {
         );
         assert_eq!(kinds.iter().filter(|kind| **kind == "map").count(), 1);
         assert!(!kinds.contains(&"error"));
-        assert_eq!(frames[delta]["text"], "fixture answer");
+        let answer = frames[evidence_index + 1..done]
+            .iter()
+            .filter_map(|frame| frame["text"].as_str())
+            .collect::<String>();
+        assert!(answer.starts_with("方向图状态："));
+        assert!(answer.contains("fixture answer"));
         assert_eq!(
             frames[done]["threadId"].as_str().map(str::len),
             Some(32),
@@ -8828,6 +9101,568 @@ mod tests {
             assert!(!frames.iter().any(|frame| frame["kind"] == "delta"));
             assert!(!frames.iter().any(|frame| frame["kind"] == "done"));
         }
+        assert_eq!(
+            mock.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(kind, _)| kind == "answer")
+                .count(),
+            2,
+            "provider failures must not trigger correction attempts"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_current_corrects_a_wrong_direction_preamble_before_any_answer_delta() {
+        let tmp = TmpDir::new();
+        write_query_fixture_project(tmp.path());
+        let mock = start_query_mock(
+            r#"{"action":"search","query":"serde_json public docs"}"#,
+            StatusCode::OK,
+            include_str!("../tests/fixtures/web_search/openai_cited.json"),
+            Duration::ZERO,
+            StatusCode::OK,
+        )
+        .await;
+        let invalid = "方向图状态：没有可核验的跨组件方向。\n错误首答";
+        let corrected = "方向图状态：已核验 1 条跨组件方向。\n纠正后的回答 [E1]";
+        mock.queue_answer(invalid);
+        mock.queue_answer(corrected);
+        let (state, orientation_id) = query_state(tmp.path(), &mock, Duration::from_secs(1));
+        let app = start_query_app(state).await;
+        let thread = create_query_test_thread(
+            &app,
+            QueryScopeSpec::Current {
+                paths: vec!["a.py".into()],
+            },
+            "这个函数做什么？",
+        );
+        let mut request = query_current_json(true, &orientation_id);
+        request["threadId"] = thread.id.clone().into();
+
+        let frames = query_ws_frames(&app, "/api/query", request).await;
+
+        assert_eq!(frames.last().unwrap()["kind"], "done");
+        assert_eq!(
+            frames.iter().filter(|frame| frame["kind"] == "map").count(),
+            1
+        );
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| frame["kind"] == "evidence")
+                .count(),
+            1
+        );
+        let visible_answer = frames
+            .iter()
+            .filter(|frame| frame["kind"] == "delta")
+            .filter_map(|frame| frame["text"].as_str())
+            .collect::<String>();
+        assert_eq!(visible_answer, corrected);
+        assert!(!visible_answer.contains("错误首答"));
+
+        let saved = app
+            .state
+            .project
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .query_threads
+            .get(&thread.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.turns.len(), 1);
+        assert_eq!(saved.turns[0].answer, corrected);
+
+        let requests = mock.requests.lock().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|(kind, _)| kind == "source-plan")
+                .count(),
+            1
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|(kind, _)| kind == "web-plan")
+                .count(),
+            1
+        );
+        assert_eq!(requests.iter().filter(|(kind, _)| kind == "web").count(), 1);
+        let answers = requests
+            .iter()
+            .filter(|(kind, _)| kind == "answer")
+            .map(|(_, body)| body)
+            .collect::<Vec<_>>();
+        assert_eq!(answers.len(), 2);
+        assert_eq!(answers[0]["model"], answers[1]["model"]);
+        assert_eq!(answers[0]["temperature"], answers[1]["temperature"]);
+        assert_eq!(answers[0]["messages"][0], answers[1]["messages"][0]);
+        let original_user = answers[0]["messages"][1]["content"].as_str().unwrap();
+        let correction_user = answers[1]["messages"][1]["content"].as_str().unwrap();
+        assert!(correction_user.starts_with(original_user));
+        assert!(correction_user.contains(invalid));
+        assert!(correction_user.contains("first non-empty line must be exactly"));
+    }
+
+    #[tokio::test]
+    async fn query_current_releases_a_split_valid_preamble_in_original_delta_order() {
+        let tmp = TmpDir::new();
+        write_query_fixture_project(tmp.path());
+        let mock = start_query_mock(
+            r#"{"action":"local"}"#,
+            StatusCode::OK,
+            include_str!("../tests/fixtures/web_search/openai_cited.json"),
+            Duration::ZERO,
+            StatusCode::OK,
+        )
+        .await;
+        let deltas = [
+            "\r\n",
+            "方向图状态：已核验 ",
+            "1 条跨组件方向。\r",
+            "\n",
+            "正文 ",
+            "[E1]",
+        ];
+        mock.queue_answer_deltas(&deltas);
+        let (state, orientation_id) = query_state(tmp.path(), &mock, Duration::from_secs(1));
+        let app = start_query_app(state).await;
+        let thread = create_query_test_thread(
+            &app,
+            QueryScopeSpec::Current {
+                paths: vec!["a.py".into()],
+            },
+            "这个函数做什么？",
+        );
+        let mut request = query_current_json(false, &orientation_id);
+        request["threadId"] = thread.id.clone().into();
+
+        let frames = query_ws_frames(&app, "/api/query", request).await;
+
+        assert_eq!(frames.last().unwrap()["kind"], "done");
+        let visible_deltas = frames
+            .iter()
+            .filter(|frame| frame["kind"] == "delta")
+            .map(|frame| frame["text"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(visible_deltas, deltas);
+        assert_eq!(
+            mock.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(kind, _)| kind == "answer")
+                .count(),
+            1
+        );
+        let saved = app
+            .state
+            .project
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .query_threads
+            .get(&thread.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.turns.len(), 1);
+        assert_eq!(saved.turns[0].answer, deltas.concat());
+    }
+
+    #[tokio::test]
+    async fn query_files_bounds_the_unterminated_first_line_before_correction() {
+        let tmp = TmpDir::new();
+        write_query_fixture_project(tmp.path());
+        let mock = start_query_mock(
+            r#"{"action":"local"}"#,
+            StatusCode::OK,
+            include_str!("../tests/fixtures/web_search/openai_cited.json"),
+            Duration::ZERO,
+            StatusCode::OK,
+        )
+        .await;
+        let overlong = "x".repeat(QUERY_ANSWER_PREAMBLE_MAX_CHARS + 1);
+        let corrected = "方向图状态：没有可核验的跨组件方向。\n纠正后的文件集回答";
+        mock.queue_answer(&overlong);
+        mock.queue_answer(corrected);
+        let (state, _) = query_state(tmp.path(), &mock, Duration::from_secs(1));
+        let app = start_query_app(state).await;
+        let thread = create_query_test_thread(
+            &app,
+            QueryScopeSpec::Selected {
+                paths: vec!["a.py".into(), "b.py".into()],
+            },
+            "这些文件怎么协作？",
+        );
+        let mut request = query_files_json(false);
+        request["threadId"] = thread.id.clone().into();
+
+        let frames = query_ws_frames(&app, "/api/query-files", request).await;
+
+        assert_eq!(frames.last().unwrap()["kind"], "done");
+        let visible_answer = frames
+            .iter()
+            .filter(|frame| frame["kind"] == "delta")
+            .filter_map(|frame| frame["text"].as_str())
+            .collect::<String>();
+        assert_eq!(visible_answer, corrected);
+        assert!(!visible_answer.contains('x'));
+        let requests = mock.requests.lock().unwrap();
+        let answers = requests
+            .iter()
+            .filter(|(kind, _)| kind == "answer")
+            .map(|(_, body)| body)
+            .collect::<Vec<_>>();
+        assert_eq!(answers.len(), 2);
+        let correction_user = answers[1]["messages"][1]["content"].as_str().unwrap();
+        assert!(correction_user.contains("256-character protocol limit"));
+        assert!(correction_user.contains(&"x".repeat(QUERY_ANSWER_PREAMBLE_MAX_CHARS)));
+        assert!(!correction_user.contains(&"x".repeat(QUERY_ANSWER_PREAMBLE_MAX_CHARS + 1)));
+    }
+
+    #[tokio::test]
+    async fn query_current_stream_failure_after_a_valid_preamble_is_not_corrected_or_persisted() {
+        let tmp = TmpDir::new();
+        write_query_fixture_project(tmp.path());
+        let mock = start_query_mock(
+            r#"{"action":"local"}"#,
+            StatusCode::OK,
+            include_str!("../tests/fixtures/web_search/openai_cited.json"),
+            Duration::ZERO,
+            StatusCode::OK,
+        )
+        .await;
+        let partial = "方向图状态：已核验 1 条跨组件方向。\n流中断前的正文 [E1]";
+        mock.queue_stream_error_after(partial);
+        let (state, orientation_id) = query_state(tmp.path(), &mock, Duration::from_secs(1));
+        let app = start_query_app(state).await;
+        let thread = create_query_test_thread(
+            &app,
+            QueryScopeSpec::Current {
+                paths: vec!["a.py".into()],
+            },
+            "这个函数做什么？",
+        );
+        let mut request = query_current_json(false, &orientation_id);
+        request["threadId"] = thread.id.clone().into();
+
+        let frames = query_ws_frames(&app, "/api/query", request).await;
+
+        assert_eq!(frames.last().unwrap()["kind"], "error");
+        assert!(frames.last().unwrap()["message"]
+            .as_str()
+            .unwrap()
+            .contains("LLM stream error"));
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| frame["kind"] == "delta")
+                .filter_map(|frame| frame["text"].as_str())
+                .collect::<String>(),
+            partial
+        );
+        assert!(!frames.iter().any(|frame| frame["kind"] == "done"));
+        assert!(app
+            .state
+            .project
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .query_threads
+            .get(&thread.id)
+            .unwrap()
+            .unwrap()
+            .turns
+            .is_empty());
+        assert_eq!(
+            mock.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(kind, _)| kind == "answer")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn query_files_correction_provider_failure_remains_zero_delta_and_zero_turn() {
+        let tmp = TmpDir::new();
+        write_query_fixture_project(tmp.path());
+        let mock = start_query_mock(
+            r#"{"action":"local"}"#,
+            StatusCode::OK,
+            include_str!("../tests/fixtures/web_search/openai_cited.json"),
+            Duration::ZERO,
+            StatusCode::OK,
+        )
+        .await;
+        mock.queue_answer("方向图状态：已核验 1 条跨组件方向。\n错误首答 [E1]");
+        mock.queue_answer_failure(StatusCode::BAD_GATEWAY, "correction unavailable");
+        let (state, _) = query_state(tmp.path(), &mock, Duration::from_secs(1));
+        let app = start_query_app(state).await;
+        let thread = create_query_test_thread(
+            &app,
+            QueryScopeSpec::Selected {
+                paths: vec!["a.py".into(), "b.py".into()],
+            },
+            "这些文件怎么协作？",
+        );
+        let mut request = query_files_json(false);
+        request["threadId"] = thread.id.clone().into();
+
+        let frames = query_ws_frames(&app, "/api/query-files", request).await;
+
+        assert_eq!(frames.last().unwrap()["kind"], "error");
+        assert!(frames.last().unwrap()["message"]
+            .as_str()
+            .unwrap()
+            .contains("LLM HTTP 502"));
+        assert!(!frames.iter().any(|frame| frame["kind"] == "delta"));
+        assert!(!frames.iter().any(|frame| frame["kind"] == "done"));
+        assert!(app
+            .state
+            .project
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .query_threads
+            .get(&thread.id)
+            .unwrap()
+            .unwrap()
+            .turns
+            .is_empty());
+        assert_eq!(
+            mock.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(kind, _)| kind == "answer")
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn query_files_rejects_two_wrong_direction_preambles_without_delta_or_turn() {
+        let tmp = TmpDir::new();
+        write_query_fixture_project(tmp.path());
+        let mock = start_query_mock(
+            r#"{"action":"local"}"#,
+            StatusCode::OK,
+            include_str!("../tests/fixtures/web_search/openai_cited.json"),
+            Duration::ZERO,
+            StatusCode::OK,
+        )
+        .await;
+        let invalid = "方向图状态：已核验 1 条跨组件方向。\n错误的文件集回答 [E1]";
+        mock.queue_answer(invalid);
+        mock.queue_answer(invalid);
+        let (state, _) = query_state(tmp.path(), &mock, Duration::from_secs(1));
+        let app = start_query_app(state).await;
+        let thread = create_query_test_thread(
+            &app,
+            QueryScopeSpec::Selected {
+                paths: vec!["a.py".into(), "b.py".into()],
+            },
+            "这些文件怎么协作？",
+        );
+        let mut request = query_files_json(false);
+        request["threadId"] = thread.id.clone().into();
+
+        let frames = query_ws_frames(&app, "/api/query-files", request).await;
+
+        assert_eq!(frames.last().unwrap()["kind"], "error");
+        assert!(frames.last().unwrap()["message"]
+            .as_str()
+            .unwrap()
+            .contains("first non-empty line must be exactly"));
+        assert!(!frames.iter().any(|frame| frame["kind"] == "delta"));
+        assert!(!frames.iter().any(|frame| frame["kind"] == "done"));
+        assert_eq!(
+            frames.iter().filter(|frame| frame["kind"] == "map").count(),
+            1
+        );
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| frame["kind"] == "evidence")
+                .count(),
+            1
+        );
+        assert!(app
+            .state
+            .project
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .query_threads
+            .get(&thread.id)
+            .unwrap()
+            .unwrap()
+            .turns
+            .is_empty());
+
+        let requests = mock.requests.lock().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|(kind, _)| kind == "source-plan")
+                .count(),
+            1
+        );
+        let answers = requests
+            .iter()
+            .filter(|(kind, _)| kind == "answer")
+            .map(|(_, body)| body)
+            .collect::<Vec<_>>();
+        assert_eq!(answers.len(), 2);
+        assert_eq!(answers[0]["messages"][0], answers[1]["messages"][0]);
+        let original_user = answers[0]["messages"][1]["content"].as_str().unwrap();
+        let correction_user = answers[1]["messages"][1]["content"].as_str().unwrap();
+        assert!(correction_user.starts_with(original_user));
+        assert!(correction_user.contains(invalid));
+    }
+
+    #[tokio::test]
+    async fn query_terminal_validation_rejects_missing_direction_evidence_without_persisting() {
+        let tmp = TmpDir::new();
+        write_query_fixture_project(tmp.path());
+        let mock = start_query_mock(
+            r#"{"action":"local"}"#,
+            StatusCode::OK,
+            include_str!("../tests/fixtures/web_search/openai_cited.json"),
+            Duration::ZERO,
+            StatusCode::OK,
+        )
+        .await;
+        let invalid = "方向图状态：已核验 1 条跨组件方向。\n正文没有方向证据";
+        mock.queue_answer(invalid);
+        let (state, orientation_id) = query_state(tmp.path(), &mock, Duration::from_secs(1));
+        let app = start_query_app(state).await;
+        let thread = create_query_test_thread(
+            &app,
+            QueryScopeSpec::Current {
+                paths: vec!["a.py".into()],
+            },
+            "这个函数做什么？",
+        );
+        let mut request = query_current_json(false, &orientation_id);
+        request["threadId"] = thread.id.clone().into();
+
+        let frames = query_ws_frames(&app, "/api/query", request).await;
+
+        assert_eq!(frames.last().unwrap()["kind"], "error");
+        assert!(frames.last().unwrap()["message"]
+            .as_str()
+            .unwrap()
+            .contains("at least one direction evidence ID"));
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| frame["kind"] == "delta")
+                .filter_map(|frame| frame["text"].as_str())
+                .collect::<String>(),
+            invalid
+        );
+        assert!(!frames.iter().any(|frame| frame["kind"] == "done"));
+        assert!(app
+            .state
+            .project
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .query_threads
+            .get(&thread.id)
+            .unwrap()
+            .unwrap()
+            .turns
+            .is_empty());
+        assert_eq!(
+            mock.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(kind, _)| kind == "answer")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn query_files_terminal_validation_rejects_an_empty_body_without_correction() {
+        let tmp = TmpDir::new();
+        write_query_fixture_project(tmp.path());
+        let mock = start_query_mock(
+            r#"{"action":"local"}"#,
+            StatusCode::OK,
+            include_str!("../tests/fixtures/web_search/openai_cited.json"),
+            Duration::ZERO,
+            StatusCode::OK,
+        )
+        .await;
+        let preamble = "方向图状态：没有可核验的跨组件方向。";
+        mock.queue_answer(preamble);
+        let (state, _) = query_state(tmp.path(), &mock, Duration::from_secs(1));
+        let app = start_query_app(state).await;
+        let thread = create_query_test_thread(
+            &app,
+            QueryScopeSpec::Selected {
+                paths: vec!["a.py".into(), "b.py".into()],
+            },
+            "这些文件怎么协作？",
+        );
+        let mut request = query_files_json(false);
+        request["threadId"] = thread.id.clone().into();
+
+        let frames = query_ws_frames(&app, "/api/query-files", request).await;
+
+        assert_eq!(frames.last().unwrap()["kind"], "error");
+        assert!(frames.last().unwrap()["message"]
+            .as_str()
+            .unwrap()
+            .contains("answer body must not be empty"));
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| frame["kind"] == "delta")
+                .filter_map(|frame| frame["text"].as_str())
+                .collect::<String>(),
+            preamble
+        );
+        assert!(!frames.iter().any(|frame| frame["kind"] == "done"));
+        assert!(app
+            .state
+            .project
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .query_threads
+            .get(&thread.id)
+            .unwrap()
+            .unwrap()
+            .turns
+            .is_empty());
+        assert_eq!(
+            mock.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(kind, _)| kind == "answer")
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -8881,7 +9716,10 @@ mod tests {
             .unwrap();
         assert_eq!(first_saved["turns"].as_array().unwrap().len(), 1);
         assert_eq!(first_saved["turns"][0]["question"], "这个函数做什么？");
-        assert_eq!(first_saved["turns"][0]["answer"], "fixture answer");
+        assert_eq!(
+            first_saved["turns"][0]["answer"],
+            "方向图状态：已核验 1 条跨组件方向。\nfixture answer [E1]"
+        );
         assert_eq!(first_done["updatedAt"], first_saved["updatedAt"]);
 
         let mut second = query_current_json(false, &orientation_id);
@@ -8915,7 +9753,8 @@ mod tests {
             .expect("follow-up answer prompt");
         assert!(follow_up_prompt.contains("【追问轨迹·原始问题】\n这个函数做什么？"));
         assert!(follow_up_prompt.contains("【Turn 1】"));
-        assert!(follow_up_prompt.contains("答：fixture answer"));
+        assert!(follow_up_prompt
+            .contains("答：方向图状态：已核验 1 条跨组件方向。\nfixture answer [E1]"));
     }
 
     #[tokio::test]
@@ -9189,15 +10028,19 @@ mod tests {
             &saved.turns[0].map,
         )
         .is_empty());
+        let map = saved.turns[0].map.clone();
         let completion = QueryCompletion {
-            map: saved.turns[0].map.clone(),
+            answer: format!(
+                "{}\n第二轮只保存一次 [E1]",
+                query_answer_contract(&map).expected_preamble
+            ),
+            map,
             evidence: EvidenceOutcome {
                 status: persisted_evidence.status,
                 text: None,
                 sources: persisted_evidence.sources,
                 warning: persisted_evidence.warning,
             },
-            answer: "第二轮只保存一次 [E1]".into(),
         };
         persist_query_completion(&app.state, &binding, "后续问题", completion.clone()).unwrap();
         let duplicate =
