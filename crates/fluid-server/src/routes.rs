@@ -45,12 +45,12 @@ use crate::context_assembler::{
     build_selection_private_context, build_untrusted_web_evidence_block,
     cross_file_query_source_targets, cross_file_targets, extract_selection_site,
     file_set_query_source_targets, focus_query_source_target, inline_query_source_target,
-    is_dependency_manifest_path, local_query_source_targets, orientation_core_source_targets,
-    orientation_requires_source_planning, rebase_query_source_targets, sample_dependency_manifests,
-    select_query_source_targets, slice_orientation_sources, slice_span, CrossFileTarget,
-    EvidenceCatalog, FileSetContext, FunctionSpan, GenContext, QueryFocus, QueryMap,
-    QuerySourceTarget, QueryTrace, SharedContext, ORIENTATION_FETCH_BUDGET_CHARS,
-    QUERY_FETCH_BUDGET_CHARS,
+    is_dependency_manifest_path, known_query_code_evidence_ids, local_query_source_targets,
+    orientation_core_source_targets, orientation_requires_source_planning,
+    rebase_query_source_targets, sample_dependency_manifests, select_query_source_targets,
+    slice_orientation_sources, slice_span, CrossFileTarget, EvidenceCatalog, FileSetContext,
+    FunctionSpan, GenContext, QueryFocus, QueryMap, QuerySourceTarget, QueryTrace, SharedContext,
+    ORIENTATION_FETCH_BUDGET_CHARS, QUERY_FETCH_BUDGET_CHARS,
 };
 use crate::graph_loader::{GraphCatalog, GraphNode, KnowledgeGraph};
 #[cfg(test)]
@@ -3614,111 +3614,6 @@ struct QueryCompletion {
     map: QueryMap,
     evidence: EvidenceOutcome,
     answer: String,
-}
-
-fn query_answer_prose(answer: &str) -> String {
-    let mut without_fences = String::with_capacity(answer.len());
-    let mut pending_fence = String::new();
-    let mut fence: Option<&str> = None;
-    for segment in answer.split_inclusive('\n') {
-        let line = segment.strip_suffix('\n').unwrap_or(segment);
-        let line = line.strip_suffix('\r').unwrap_or(line);
-        match fence {
-            Some(marker) => {
-                pending_fence.push_str(segment);
-                if line == marker {
-                    without_fences.push('\n');
-                    pending_fence.clear();
-                    fence = None;
-                }
-            }
-            None if line.starts_with("```") => {
-                fence = Some("```");
-                pending_fence.push_str(segment);
-            }
-            None if line.starts_with("~~~") => {
-                fence = Some("~~~");
-                pending_fence.push_str(segment);
-            }
-            None => without_fences.push_str(segment),
-        }
-    }
-    if fence.is_some() {
-        without_fences.push_str(&pending_fence);
-    }
-
-    let mut prose = String::with_capacity(without_fences.len());
-    for line in without_fences.split_inclusive('\n') {
-        let bytes = line.as_bytes();
-        let mut copied_until = 0;
-        let mut cursor = 0;
-        while cursor < bytes.len() {
-            if bytes[cursor] != b'`' {
-                cursor += 1;
-                continue;
-            }
-            let opening = cursor;
-            while cursor < bytes.len() && bytes[cursor] == b'`' {
-                cursor += 1;
-            }
-            let mut closing = cursor;
-            while closing < bytes.len() && bytes[closing] != b'`' && bytes[closing] != b'\n' {
-                closing += 1;
-            }
-            if closing >= bytes.len() || bytes[closing] == b'\n' {
-                break;
-            }
-            prose.push_str(&line[copied_until..opening]);
-            while closing < bytes.len() && bytes[closing] == b'`' {
-                closing += 1;
-            }
-            copied_until = closing;
-            cursor = closing;
-        }
-        prose.push_str(&line[copied_until..]);
-    }
-    prose
-}
-
-fn known_query_code_evidence_ids(answer: &str, map: &QueryMap) -> Vec<String> {
-    let known: BTreeSet<&str> = map
-        .evidence
-        .iter()
-        .map(|reference| reference.id.as_str())
-        .collect();
-    let mut seen = BTreeSet::new();
-    let mut ordered = Vec::new();
-    let prose = query_answer_prose(answer);
-    let bytes = prose.as_bytes();
-    let mut index = 0;
-    while index + 4 <= bytes.len() {
-        if bytes[index] != b'[' || bytes[index + 1] != b'E' {
-            index += 1;
-            continue;
-        }
-        let mut end = index + 2;
-        if !bytes
-            .get(end)
-            .is_some_and(|byte| (b'1'..=b'9').contains(byte))
-        {
-            index += 1;
-            continue;
-        }
-        while bytes.get(end).is_some_and(|byte| byte.is_ascii_digit()) {
-            end += 1;
-        }
-        if bytes.get(end) != Some(&b']') {
-            index += 1;
-            continue;
-        }
-        if let Some(id) = prose.get(index + 1..end) {
-            if known.contains(id) && seen.insert(id.to_string()) {
-                ordered.push(id.to_string());
-            }
-        }
-        index = end + 1;
-    }
-    ordered
 }
 
 fn persist_query_completion(
