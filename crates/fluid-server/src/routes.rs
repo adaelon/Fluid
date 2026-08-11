@@ -4406,6 +4406,9 @@ mod tests {
 
     use crate::cache_store::SelectionKind;
     use crate::graph_loader::GraphCatalog;
+    use crate::orientation::{
+        ActorBoundary, CodeEvidenceRef, OrientationActor, OrientationWalkthrough, WalkthroughStep,
+    };
     use futures_util::SinkExt;
     use tokio_tungstenite::tungstenite::Message as ClientMessage;
 
@@ -4511,6 +4514,35 @@ mod tests {
             .to_string(),
         )
         .unwrap();
+    }
+
+    fn persisted_history_map(path: &str) -> QueryMap {
+        QueryMap {
+            actors: vec![OrientationActor {
+                id: "file".into(),
+                name: path.into(),
+                role: "source file".into(),
+                boundary: ActorBoundary::Project,
+            }],
+            direction: Vec::new(),
+            core_function_ids: vec!["f#1".into()],
+            supporting_function_ids: Vec::new(),
+            walkthrough: OrientationWalkthrough {
+                title: "Call path".into(),
+                input: "request".into(),
+                steps: vec![WalkthroughStep {
+                    text: "Read the source".into(),
+                    evidence_ids: vec!["E1".into()],
+                }],
+            },
+            evidence: vec![CodeEvidenceRef {
+                id: "E1".into(),
+                file_path: path.into(),
+                start_line: 1,
+                end_line: 1,
+                symbol: Some("f".into()),
+            }],
+        }
     }
 
     #[tokio::test]
@@ -4722,6 +4754,81 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(after_delete.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn query_history_get_normalizes_legacy_sources_without_rewriting_the_record() {
+        let project = TmpDir::new();
+        std::fs::create_dir_all(project.path().join("src")).unwrap();
+        std::fs::write(project.path().join("src/a.rs"), "fn f() {}\n").unwrap();
+        let app = start_query_app(make_state(project.path(), "")).await;
+
+        let (thread_id, record_path) = {
+            let guard = app.state.project.read().unwrap();
+            let project = guard.as_ref().unwrap();
+            let mut thread = project
+                .query_threads
+                .create_thread(
+                    QueryScopeSpec::Current {
+                        paths: vec!["src/a.rs".into()],
+                    },
+                    "How does f work?",
+                    "2026-08-11T10:00:00.000Z",
+                )
+                .unwrap();
+            thread.turns.push(PersistedQueryTurn {
+                question: "How does f work?".into(),
+                answer: "方向图状态：没有可核验的跨组件方向。\nIt reads the source. [E1]".into(),
+                map: persisted_history_map("src/a.rs"),
+                evidence: Some(QueryEvidenceState {
+                    status: EvidenceStatus::Unverified,
+                    sources: Vec::new(),
+                    warning: None,
+                }),
+                code_evidence_ids: vec!["E1".into()],
+                completed_at: "2026-08-11T10:01:00.000Z".into(),
+            });
+            thread.updated_at = "2026-08-11T10:01:00.000Z".into();
+            project.query_threads.put(&thread).unwrap();
+            let path = project
+                .query_threads
+                .storage_dir()
+                .join(format!("{}.json", thread.id));
+            (thread.id, path)
+        };
+
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+        legacy["turns"][0]["evidence"]
+            .as_object_mut()
+            .unwrap()
+            .remove("sources");
+        std::fs::write(&record_path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+        let bytes_before = std::fs::read(&record_path).unwrap();
+        let modified_before = std::fs::metadata(&record_path).unwrap().modified().unwrap();
+
+        let response = reqwest::Client::new()
+            .get(format!(
+                "{}/api/query-threads/{thread_id}",
+                app.http_base_url
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let loaded: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(
+            loaded["turns"][0]["evidence"],
+            serde_json::json!({
+                "status": "unverified",
+                "sources": []
+            })
+        );
+        assert_eq!(std::fs::read(&record_path).unwrap(), bytes_before);
+        assert_eq!(
+            std::fs::metadata(&record_path).unwrap().modified().unwrap(),
+            modified_before
+        );
     }
 
     #[tokio::test]

@@ -77,6 +77,18 @@ export interface QueryThreadListResponse {
   warnings: QueryThreadWarning[]
 }
 
+type PersistedQueryEvidenceWire = Omit<PersistedQueryEvidence, 'sources'> & {
+  sources?: unknown
+}
+
+type PersistedQueryTurnWire = Omit<PersistedQueryTurn, 'evidence'> & {
+  evidence: PersistedQueryEvidenceWire | null
+}
+
+type QueryThreadWire = Omit<QueryThread, 'turns'> & {
+  turns: PersistedQueryTurnWire[]
+}
+
 export class QueryHistoryApiError extends Error {
   constructor(
     readonly status: number,
@@ -87,9 +99,54 @@ export class QueryHistoryApiError extends Error {
   }
 }
 
+export class QueryHistoryContractError extends Error {
+  constructor(
+    readonly endpoint: string,
+    detail: string,
+  ) {
+    super(`${endpoint} returned an invalid query thread: ${detail}`)
+    this.name = 'QueryHistoryContractError'
+  }
+}
+
 async function queryHistoryResponseError(res: Response, endpoint: string): Promise<never> {
   const detail = (await res.text()).trim()
   throw new QueryHistoryApiError(res.status, detail || `${endpoint} -> ${res.status}`)
+}
+
+function normalizePersistedQueryEvidence(
+  wire: PersistedQueryEvidenceWire,
+  endpoint: string,
+  turnIndex: number,
+): PersistedQueryEvidence {
+  const { sources, ...metadata } = wire
+  if (sources !== undefined && !Array.isArray(sources)) {
+    throw new QueryHistoryContractError(
+      endpoint,
+      `turns[${turnIndex}].evidence.sources must be an array when present`,
+    )
+  }
+  return {
+    ...metadata,
+    sources: sources ?? [],
+  }
+}
+
+function normalizeQueryThread(wire: QueryThreadWire, endpoint: string): QueryThread {
+  return {
+    ...wire,
+    turns: wire.turns.map((turn, turnIndex) => ({
+      ...turn,
+      evidence: turn.evidence
+        ? normalizePersistedQueryEvidence(turn.evidence, endpoint, turnIndex)
+        : null,
+    })),
+  }
+}
+
+async function queryThreadDetailResponse(res: Response, endpoint: string): Promise<QueryThread> {
+  if (!res.ok) return queryHistoryResponseError(res, endpoint)
+  return normalizeQueryThread((await res.json()) as QueryThreadWire, endpoint)
 }
 
 /** Create the zero-turn durable record required before either query socket can stream. */
@@ -97,15 +154,13 @@ export async function createQueryThread(req: {
   scope: QueryScopeSpec
   originalQuestion: string
 }): Promise<QueryThread> {
-  const res = await fetch('/api/query-threads', {
+  const endpoint = '/api/query-threads'
+  const res = await fetch(endpoint, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(req),
   })
-  if (!res.ok) {
-    return queryHistoryResponseError(res, '/api/query-threads')
-  }
-  return (await res.json()) as QueryThread
+  return queryThreadDetailResponse(res, endpoint)
 }
 
 /** Load newest-first project summaries plus isolated bad-record warnings. */
@@ -120,8 +175,7 @@ export async function listQueryThreads(): Promise<QueryThreadListResponse> {
 export async function getQueryThread(threadId: string): Promise<QueryThread> {
   const endpoint = `/api/query-threads/${encodeURIComponent(threadId)}`
   const res = await fetch(endpoint)
-  if (!res.ok) return queryHistoryResponseError(res, endpoint)
-  return (await res.json()) as QueryThread
+  return queryThreadDetailResponse(res, endpoint)
 }
 
 /** Delete exactly one validated thread from the current project. */
@@ -136,8 +190,7 @@ export async function deleteQueryThread(threadId: string): Promise<void> {
 export async function forkQueryThreadCurrent(threadId: string): Promise<QueryThread> {
   const endpoint = `/api/query-threads/${encodeURIComponent(threadId)}/fork-current`
   const res = await fetch(endpoint, { method: 'POST' })
-  if (!res.ok) return queryHistoryResponseError(res, endpoint)
-  return (await res.json()) as QueryThread
+  return queryThreadDetailResponse(res, endpoint)
 }
 
 /** GET /api/project/tree -> flat FileNode[] (the frontend nests it, see tree.ts). */

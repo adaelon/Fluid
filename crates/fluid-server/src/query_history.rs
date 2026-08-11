@@ -48,7 +48,7 @@ impl QueryScopeSpec {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct QueryEvidenceState {
     pub status: EvidenceStatus,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub sources: Vec<SourceLink>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
@@ -1003,6 +1003,23 @@ mod tests {
         let destination = root.join(Path::new(path));
         fs::create_dir_all(destination.parent().unwrap()).unwrap();
         fs::write(destination, bytes).unwrap();
+    }
+
+    #[test]
+    fn legacy_evidence_defaults_missing_sources_and_serializes_an_explicit_array() {
+        let evidence: QueryEvidenceState = serde_json::from_value(serde_json::json!({
+            "status": "unverified"
+        }))
+        .unwrap();
+
+        assert!(evidence.sources.is_empty());
+        assert_eq!(
+            serde_json::to_value(evidence).unwrap(),
+            serde_json::json!({
+                "status": "unverified",
+                "sources": []
+            })
+        );
     }
 
     #[test]

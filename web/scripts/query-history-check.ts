@@ -5,7 +5,9 @@
 import { readFileSync } from 'node:fs'
 import {
   QueryHistoryApiError,
+  createQueryThread,
   deleteQueryThread,
+  forkQueryThreadCurrent,
   getQueryThread,
   listQueryThreads,
   type QueryThread,
@@ -14,6 +16,7 @@ import {
 } from '../src/api.ts'
 import type { QueryMap } from '../src/ghostTypes.ts'
 import { currentQueryScope, selectedQueryScope } from '../src/queryState.ts'
+import { renderQueryMarkdown } from '../src/render/markdown.ts'
 import {
   createQueryWorkspace,
   sortQueryThreadSummaries,
@@ -135,6 +138,35 @@ const newer = thread('thread-newer', '2026-08-10T11:00:00.000Z', {
   title: '新线程标题',
 })
 
+const restoredMarkdown = [
+  '## 恢复标题',
+  '### 恢复细节',
+  '**历史强调**',
+  '',
+  '---',
+  '',
+  '| 输入 | 输出 |',
+  '| --- | --- |',
+  '| 旧记录 | 规范数组 |',
+].join('\n')
+
+function legacyWireThread(value: QueryThread, id = value.id): unknown {
+  return {
+    ...value,
+    id,
+    turns: value.turns.map((turn) => ({
+      ...turn,
+      answer: restoredMarkdown,
+      evidence: turn.evidence
+        ? {
+            status: turn.evidence.status,
+            ...(turn.evidence.warning ? { warning: turn.evidence.warning } : {}),
+          }
+        : null,
+    })),
+  }
+}
+
 console.log('=== history REST clients ===')
 const originalFetch = globalThis.fetch
 const apiCalls: Array<{ url: string; method: string }> = []
@@ -143,15 +175,43 @@ globalThis.fetch = async (input, init) => {
   const method = init?.method ?? 'GET'
   apiCalls.push({ url, method })
   if (method === 'DELETE') return new Response(null, { status: 204 })
-  if (url === '/api/query-threads') {
+  if (url === '/api/query-threads' && method === 'GET') {
     return Response.json({ threads: [summary(newer)], warnings: [] })
   }
-  return Response.json(older)
+  if (url === '/api/query-threads' && method === 'POST') {
+    return Response.json(legacyWireThread(older, 'thread-created'))
+  }
+  if (url.endsWith('/fork-current')) {
+    return Response.json(legacyWireThread(older, 'thread-forked'))
+  }
+  return Response.json(legacyWireThread(older))
 }
 const apiList = await listQueryThreads()
+const apiCreated = await createQueryThread({
+  scope: { kind: 'current', paths: ['src/a.ts'] },
+  originalQuestion: older.originalQuestion,
+})
 const apiDetail = await getQueryThread('thread/older')
+const apiForked = await forkQueryThreadCurrent('thread/older')
 await deleteQueryThread('thread/older')
-check('list/get/delete use the project history REST endpoints and encoded ids', apiList.threads[0]?.id === newer.id && apiDetail.id === older.id && apiCalls.map((call) => `${call.method} ${call.url}`).join(',') === 'GET /api/query-threads,GET /api/query-threads/thread%2Folder,DELETE /api/query-threads/thread%2Folder')
+check('list/create/get/fork/delete use the project history REST endpoints and encoded ids', apiList.threads[0]?.id === newer.id && apiCreated.id === 'thread-created' && apiDetail.id === older.id && apiForked.id === 'thread-forked' && apiCalls.map((call) => `${call.method} ${call.url}`).join(',') === 'GET /api/query-threads,POST /api/query-threads,GET /api/query-threads/thread%2Folder,POST /api/query-threads/thread%2Folder/fork-current,DELETE /api/query-threads/thread%2Folder')
+check('all three detail clients normalize legacy omitted sources to arrays', [apiCreated, apiDetail, apiForked].every((value) => Array.isArray(value.turns[0]?.evidence?.sources) && value.turns[0]?.evidence?.sources.length === 0))
+
+globalThis.fetch = async () => Response.json({
+  ...older,
+  turns: older.turns.map((turn) => ({
+    ...turn,
+    evidence: { status: 'unverified', sources: 'not-an-array' },
+  })),
+})
+let contractError: unknown
+try {
+  await getQueryThread('bad-sources')
+} catch (error) {
+  contractError = error
+}
+check('a present non-array sources value raises an explicit API contract error', contractError instanceof Error && contractError.name === 'QueryHistoryContractError' && contractError.message.includes('sources'))
+
 globalThis.fetch = async () => new Response('query thread not found', { status: 404 })
 let apiError: unknown
 try {
@@ -161,6 +221,25 @@ try {
 }
 check('history REST failures preserve status for deleted-thread recovery', apiError instanceof QueryHistoryApiError && apiError.status === 404)
 globalThis.fetch = originalFetch
+
+console.log('\n=== legacy REST detail restoration and Markdown ===')
+const legacyHistory = createQueryWorkspace(client({
+  get: async () => apiDetail,
+}))
+let legacyRestoreError: unknown
+let legacyHtml = ''
+try {
+  await legacyHistory.selectHistoryThread(apiDetail.id)
+  const restored = legacyHistory.traceSnapshots.value[0]
+  legacyHtml = renderQueryMarkdown(
+    legacyHistory.trace.value?.turns[0]?.answer ?? '',
+    restored?.map.evidence ?? [],
+  )
+} catch (error) {
+  legacyRestoreError = error
+}
+check('legacy omitted sources passes restoreThreadProjection as an empty array', legacyRestoreError === undefined && legacyHistory.traceSnapshots.value[0]?.evidence?.sources.length === 0)
+check('restored original Markdown keeps h2/h3/strong/hr/table structure', ['<h2>', '<h3>', '<strong>', '<hr>', '<table>'].every((tag) => legacyHtml.includes(tag)))
 
 console.log('=== project history summaries and warnings ===')
 const ordered = sortQueryThreadSummaries([summary(older), summary(newer)])
