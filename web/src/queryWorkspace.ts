@@ -1,4 +1,4 @@
-import { ref, type Ref } from 'vue'
+import { ref, toRaw, type Ref } from 'vue'
 import {
   QueryHistoryApiError,
   createQueryThread,
@@ -689,7 +689,9 @@ export function createQueryWorkspace(
     expectedSnapshots: QueryTurnPresentationSnapshot[],
     htmlByTurn: readonly string[],
   ): boolean {
-    if (traceSnapshots.value !== expectedSnapshots) return false
+    // Vue deep-wraps arrays assigned to a ref. Compare their raw identities so
+    // the generation guard accepts the exact array returned by the controller.
+    if (toRaw(traceSnapshots.value) !== toRaw(expectedSnapshots)) return false
     traceSnapshots.value = setQueryTurnAnswerHtml(expectedSnapshots, htmlByTurn)
     return true
   }

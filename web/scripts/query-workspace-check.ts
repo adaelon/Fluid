@@ -73,8 +73,8 @@ check('done records only known code-evidence citations', workspace.trace.value?.
 check('done appends an index-aligned presentation snapshot', workspace.traceSnapshots.value.length === 1 && workspace.traceSnapshots.value[0]?.map.evidence[0]?.filePath === 'src/a.ts')
 check('done selects the latest completed turn and clears the active question', workspace.selectedTurn.value?.kind === 'completed' && workspace.selectedTurn.value.index === 0 && workspace.activeQuestion.value === '')
 check('normal completion detaches without cancelling the completed stream', firstStream.cancelCount === 0)
-const completedSnapshots = workspace.traceSnapshots.value
-check('rendered answer HTML updates only the matching snapshot generation', workspace.applyRenderedAnswers(completedSnapshots, ['<p>为了限制并发。</p>']) && workspace.traceSnapshots.value[0]?.answerHtml.includes('为了限制并发') === true)
+const completedSnapshots = completed.kind === 'completed' ? completed.snapshots : []
+check('the completed frame snapshot identity accepts its rendered HTML', workspace.applyRenderedAnswers(completedSnapshots, ['<p>为了限制并发。</p>']) && workspace.traceSnapshots.value[0]?.answerHtml.includes('为了限制并发') === true)
 
 const mismatched = createQueryWorkspace()
 mismatched.question.value = '线程身份会串吗？'

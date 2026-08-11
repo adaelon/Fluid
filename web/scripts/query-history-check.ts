@@ -228,18 +228,26 @@ const legacyHistory = createQueryWorkspace(client({
 }))
 let legacyRestoreError: unknown
 let legacyHtml = ''
+let legacyRenderApplied = false
 try {
-  await legacyHistory.selectHistoryThread(apiDetail.id)
+  const legacySelection = await legacyHistory.selectHistoryThread(apiDetail.id)
   const restored = legacyHistory.traceSnapshots.value[0]
   legacyHtml = renderQueryMarkdown(
     legacyHistory.trace.value?.turns[0]?.answer ?? '',
     restored?.map.evidence ?? [],
   )
+  if (legacySelection.kind === 'selected') {
+    legacyRenderApplied = legacyHistory.applyRenderedAnswers(
+      legacySelection.snapshots,
+      [legacyHtml],
+    )
+  }
 } catch (error) {
   legacyRestoreError = error
 }
 check('legacy omitted sources passes restoreThreadProjection as an empty array', legacyRestoreError === undefined && legacyHistory.traceSnapshots.value[0]?.evidence?.sources.length === 0)
 check('restored original Markdown keeps h2/h3/strong/hr/table structure', ['<h2>', '<h3>', '<strong>', '<hr>', '<table>'].every((tag) => legacyHtml.includes(tag)))
+check('the selected history snapshot identity accepts its rendered HTML', legacyRenderApplied && legacyHistory.traceSnapshots.value[0]?.answerHtml.includes('<h2>恢复标题</h2>') === true)
 
 console.log('=== project history summaries and warnings ===')
 const ordered = sortQueryThreadSummaries([summary(older), summary(newer)])
