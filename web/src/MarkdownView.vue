@@ -45,7 +45,9 @@ const props = defineProps<{
 }>()
 const emit = defineEmits<{
   'find-state': [InFileFindSnapshot]
-  'reading-anchor': [MarkdownReadingAnchor]
+  'reading-anchor': [path: string, anchor: MarkdownReadingAnchor]
+  'reading-interaction': [path: string]
+  'reading-restore-settled': [path: string]
 }>()
 
 const html = ref('')
@@ -112,6 +114,7 @@ let renderedAnchorBlocks: IndexedMarkdownBlock[] = []
 let readingAnchorRestoreSequence = 0
 let restoredReadingAnchor: MarkdownReadingAnchor | null = null
 let lastEmittedReadingAnchor: MarkdownReadingAnchor | null = null
+let settledReadingAnchorRestoreSequence = -1
 let readingAnchorCorrectionFrame = 0
 let readingAnchorEmitFrame = 0
 
@@ -203,6 +206,7 @@ function sameReadingAnchor(
 }
 
 function scheduleReadingAnchorEmit(): void {
+  if (restoredReadingAnchor) return
   const fileToken = token
   const request = renderRequest
   const filePath = props.path
@@ -213,7 +217,7 @@ function scheduleReadingAnchorEmit(): void {
     const anchor = captureReadingAnchor()
     if (!anchor || sameReadingAnchor(lastEmittedReadingAnchor, anchor)) return
     lastEmittedReadingAnchor = anchor
-    emit('reading-anchor', anchor)
+    emit('reading-anchor', filePath, anchor)
   })
 }
 
@@ -222,6 +226,21 @@ function cancelReadingAnchorRestore(): void {
   restoredReadingAnchor = null
   window.cancelAnimationFrame(readingAnchorCorrectionFrame)
   readingAnchorCorrectionFrame = 0
+}
+
+function settleReadingAnchorRestore(sequence: number, filePath: string): void {
+  if (
+    sequence !== readingAnchorRestoreSequence
+    || settledReadingAnchorRestoreSequence === sequence
+    || filePath !== props.path
+  ) return
+  settledReadingAnchorRestoreSequence = sequence
+  emit('reading-restore-settled', filePath)
+}
+
+function onReadingAnchorUserScroll(): void {
+  cancelReadingAnchorRestore()
+  emit('reading-interaction', props.path)
 }
 
 function scheduleReadingAnchorCorrection(): void {
@@ -264,7 +283,7 @@ function scheduleReadingAnchorCorrection(): void {
     if (Math.abs(scroller.scrollTop - nextScrollTop) >= READING_ANCHOR_SCROLL_EPSILON_PX) {
       scroller.scrollTop = nextScrollTop
     }
-    scheduleReadingAnchorEmit()
+    settleReadingAnchorRestore(sequence, filePath)
   })
 }
 
@@ -277,6 +296,7 @@ function restoreReadingAnchor(anchor: MarkdownReadingAnchor): boolean {
 
   readingAnchorRestoreSequence++
   restoredReadingAnchor = normalized
+  settledReadingAnchorRestoreSequence = -1
   scheduleReadingAnchorCorrection()
   return true
 }
@@ -284,11 +304,11 @@ function restoreReadingAnchor(anchor: MarkdownReadingAnchor): boolean {
 function onReadingAnchorPointerDown(event: PointerEvent): void {
   const scroller = scroll.value
   if (!scroller || (event.button !== 1 && event.target !== scroller)) return
-  cancelReadingAnchorRestore()
+  onReadingAnchorUserScroll()
 }
 
 function onReadingAnchorKeyDown(event: KeyboardEvent): void {
-  if (READING_ANCHOR_NAVIGATION_KEYS.has(event.key)) cancelReadingAnchorRestore()
+  if (READING_ANCHOR_NAVIGATION_KEYS.has(event.key)) onReadingAnchorUserScroll()
 }
 
 function sameRange(left: FindRange, right: FindRange): boolean {
@@ -555,8 +575,8 @@ onMounted(() => {
     findResizeObserver.observe(article.value)
   }
   scroll.value?.addEventListener('scroll', scheduleReadingAnchorEmit, { passive: true })
-  scroll.value?.addEventListener('wheel', cancelReadingAnchorRestore, { passive: true })
-  scroll.value?.addEventListener('touchstart', cancelReadingAnchorRestore, { passive: true })
+  scroll.value?.addEventListener('wheel', onReadingAnchorUserScroll, { passive: true })
+  scroll.value?.addEventListener('touchstart', onReadingAnchorUserScroll, { passive: true })
   scroll.value?.addEventListener('pointerdown', onReadingAnchorPointerDown)
   scroll.value?.addEventListener('keydown', onReadingAnchorKeyDown)
   void renderActive(false)
@@ -576,8 +596,8 @@ onBeforeUnmount(() => {
   window.cancelAnimationFrame(findResizeFrame)
   window.cancelAnimationFrame(readingAnchorEmitFrame)
   scroll.value?.removeEventListener('scroll', scheduleReadingAnchorEmit)
-  scroll.value?.removeEventListener('wheel', cancelReadingAnchorRestore)
-  scroll.value?.removeEventListener('touchstart', cancelReadingAnchorRestore)
+  scroll.value?.removeEventListener('wheel', onReadingAnchorUserScroll)
+  scroll.value?.removeEventListener('touchstart', onReadingAnchorUserScroll)
   scroll.value?.removeEventListener('pointerdown', onReadingAnchorPointerDown)
   scroll.value?.removeEventListener('keydown', onReadingAnchorKeyDown)
   cancelReadingAnchorRestore()

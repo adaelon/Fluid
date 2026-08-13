@@ -6,10 +6,14 @@ import {
   fetchTree,
   openFolder,
   pickFolder,
+  saveCurrentWorkspace,
   getLlmSettings,
   type FileNode,
+  type OpenProjectResponse,
   type ProjectReadingSnapshot,
   type QueryScopeSpec,
+  type ReadingAnchor,
+  type ReadingStateWarning,
 } from './api'
 import FileTree from './FileTree.vue'
 import Editor from './Editor.vue'
@@ -58,16 +62,46 @@ import {
   markWorkspaceTabReady,
   openWorkspaceTab,
   resetWorkspaceSourceLoads,
+  restoreWorkspaceReadingPositions,
   restoreWorkspaceTabs,
   type WorkspaceOpenFile,
   type WorkspaceTabsState,
 } from './workspaceState'
+import {
+  createWorkspaceController,
+  type WorkspaceNotice,
+  type WorkspacePhase,
+  type WorkspaceSnapshotChange,
+} from './workspaceController'
 
 const files = ref<FileNode[]>([])
 const expandedDirectories = ref<ReadonlySet<string>>(new Set())
 // Multi-tab model (U2): an ordered list of open files + the active one.
 const openFiles = ref<WorkspaceOpenFile[]>([])
 const activePath = ref<string | null>(null)
+const readingPositions = ref<Record<string, ReadingAnchor>>({})
+const workspacePhase = ref<WorkspacePhase>('booting')
+const workspaceNotice = ref<(WorkspaceNotice & { id: number }) | null>(null)
+let workspaceNoticeSequence = 0
+let workspaceNoticeTimer: number | null = null
+
+function showWorkspaceNotice(notice: WorkspaceNotice): void {
+  if (workspaceNoticeTimer !== null) window.clearTimeout(workspaceNoticeTimer)
+  const id = ++workspaceNoticeSequence
+  workspaceNotice.value = { ...notice, id }
+  workspaceNoticeTimer = window.setTimeout(() => {
+    if (workspaceNotice.value?.id === id) workspaceNotice.value = null
+    workspaceNoticeTimer = null
+  }, 6_000)
+}
+
+const workspaceController = createWorkspaceController({
+  save: saveCurrentWorkspace,
+  notify: showWorkspaceNotice,
+  onPhaseChange: (phase) => {
+    workspacePhase.value = phase
+  },
+})
 const current = computed<WorkspaceOpenFile | null>(
   () => openFiles.value.find((f) => f.path === activePath.value) ?? null,
 )
@@ -92,6 +126,21 @@ function applyWorkspaceTabs(state: WorkspaceTabsState): void {
   activePath.value = state.activePath
 }
 
+function currentWorkspaceSnapshot(): ProjectReadingSnapshot {
+  return {
+    expandedDirectories: Array.from(expandedDirectories.value),
+    openFiles: openFiles.value.map((file) => file.path),
+    activeFile: activePath.value,
+    readingPositions: Object.fromEntries(
+      Object.entries(readingPositions.value).map(([path, anchor]) => [path, { ...anchor }]),
+    ),
+  }
+}
+
+function syncWorkspaceSnapshot(change: WorkspaceSnapshotChange): void {
+  workspaceController.updateSnapshot(currentWorkspaceSnapshot(), change)
+}
+
 async function loadOpenFile(path: string): Promise<void> {
   const tab = openFiles.value.find((candidate) => candidate.path === path)
   if (!tab || tab.loadState === 'ready' || tab.loadState === 'loading') return
@@ -108,31 +157,83 @@ async function loadOpenFile(path: string): Promise<void> {
   } catch (error) {
     if (!acceptWorkspaceSourceLoad(sourceLoads, begun.request)) return
     applyWorkspaceTabs(markWorkspaceTabError(workspaceTabsState(), path))
-    if (activePath.value === path) loadError.value = String(error)
+    if (activePath.value === path) {
+      loadError.value = String(error)
+      workspaceController.completeRestore()
+    }
   }
 }
 
 function installWorkspaceTabs(
   treeFiles: readonly FileNode[],
   snapshot: ProjectReadingSnapshot | null,
-): void {
+): ReturnType<typeof restoreWorkspaceTabs> {
   const restored = restoreWorkspaceTabs(treeFiles, snapshot)
   applyWorkspaceTabs(restored)
   if (restored.activePath) void loadOpenFile(restored.activePath)
+  return restored
 }
 
 function installWorkspaceTree(
   treeFiles: FileNode[],
   snapshot: ProjectReadingSnapshot | null,
-): void {
+): ReturnType<typeof restoreExpandedDirectories> {
   const tree = buildTree(treeFiles)
   const restored = restoreExpandedDirectories(tree, snapshot?.expandedDirectories ?? [])
   files.value = treeFiles
   expandedDirectories.value = restored.expandedDirectories
+  return restored
+}
+
+function installWorkspaceReadingPositions(
+  treeFiles: readonly FileNode[],
+  snapshot: ProjectReadingSnapshot | null,
+): ReturnType<typeof restoreWorkspaceReadingPositions> {
+  const restored = restoreWorkspaceReadingPositions(
+    treeFiles,
+    snapshot?.readingPositions ?? {},
+  )
+  readingPositions.value = restored.readingPositions
+  return restored
+}
+
+function emptyWorkspaceSnapshot(): ProjectReadingSnapshot {
+  return {
+    expandedDirectories: [],
+    openFiles: [],
+    activeFile: null,
+    readingPositions: {},
+  }
+}
+
+function beginWorkspaceRestore(
+  root: string | null,
+  treeFiles: FileNode[],
+  snapshot: ProjectReadingSnapshot | null,
+  warnings: readonly ReadingStateWarning[],
+): void {
+  sourceLoads = resetWorkspaceSourceLoads(sourceLoads)
+  workspaceController.beginRestore(root, snapshot ?? emptyWorkspaceSnapshot())
+  const restoredTree = installWorkspaceTree(treeFiles, snapshot)
+  const restoredAnchors = installWorkspaceReadingPositions(treeFiles, snapshot)
+  const restoredTabs = installWorkspaceTabs(treeFiles, snapshot)
+  syncWorkspaceSnapshot('structure')
+  workspaceController.reportRestoreIssues({
+    backendWarnings: warnings.length,
+    skippedDirectories: restoredTree.skippedDirectories.length,
+    skippedOpenFiles: restoredTabs.skippedOpenFiles.length,
+    skippedReadingPositions: restoredAnchors.skippedReadingPositions.length,
+  })
+  if (!restoredTabs.activePath) workspaceController.completeRestore()
 }
 
 function setDirectoryExpanded(change: DirectoryExpansionChange): void {
-  expandedDirectories.value = reduceDirectoryExpansion(expandedDirectories.value, change)
+  if (workspacePhase.value === 'switching') return
+  const next = reduceDirectoryExpansion(expandedDirectories.value, change)
+  if (next === expandedDirectories.value) return
+  expandedDirectories.value = next
+  workspaceController.completeRestore()
+  syncWorkspaceSnapshot('structure')
 }
 
 const DEFAULT_FIND_QUERY: InFileFindQuery = {
@@ -148,8 +249,77 @@ interface InFileFindBarHandle {
 const editorStage = ref<HTMLElement | null>(null)
 interface ActiveContentSurfaceHandle extends InFileFindSurfaceHandle {
   toggleGeneration?: () => void
+  captureReadingAnchor?: () => ReadingAnchor | null
+  restoreReadingAnchor?: (anchor: ReadingAnchor) => boolean
+  cancelReadingAnchorRestore?: () => void
 }
 const activeFindSurface = ref<ActiveContentSurfaceHandle | null>(null)
+let activeReadingRestoreSequence = 0
+
+function readingAnchorMatchesFile(file: FileNode | WorkspaceOpenFile, anchor: ReadingAnchor): boolean {
+  return file.lang === 'md' ? anchor.kind === 'markdown' : anchor.kind === 'code'
+}
+
+function storeReadingAnchor(path: string, anchor: ReadingAnchor): boolean {
+  const file = readyCurrent.value
+  if (!file || file.path !== path || !readingAnchorMatchesFile(file, anchor)) return false
+  readingPositions.value = {
+    ...readingPositions.value,
+    [path]: { ...anchor },
+  }
+  return true
+}
+
+function captureActiveReadingAnchor(): boolean {
+  const file = readyCurrent.value
+  const anchor = activeFindSurface.value?.captureReadingAnchor?.()
+  return Boolean(file && anchor && storeReadingAnchor(file.path, anchor))
+}
+
+function cancelActiveReadingRestore(): void {
+  activeReadingRestoreSequence++
+  activeFindSurface.value?.cancelReadingAnchorRestore?.()
+}
+
+async function restoreActiveReadingAnchor(file: WorkspaceOpenFile): Promise<void> {
+  const sequence = ++activeReadingRestoreSequence
+  await nextTick()
+  if (
+    sequence !== activeReadingRestoreSequence
+    || readyCurrent.value?.path !== file.path
+  ) return
+
+  const anchor = readingPositions.value[file.path]
+  const surface = activeFindSurface.value
+  const registered = Boolean(
+    anchor
+    && readingAnchorMatchesFile(file, anchor)
+    && surface?.restoreReadingAnchor?.(anchor),
+  )
+  if (
+    !registered
+    && sequence === activeReadingRestoreSequence
+    && readyCurrent.value?.path === file.path
+  ) workspaceController.completeRestore()
+}
+
+function recordReadingAnchor(path: string, anchor: ReadingAnchor): void {
+  if (workspacePhase.value === 'switching') return
+  if (!storeReadingAnchor(path, anchor)) return
+  syncWorkspaceSnapshot('scroll')
+}
+
+function beginReadingInteraction(path: string): void {
+  if (readyCurrent.value?.path === path) workspaceController.completeRestore()
+}
+
+function finishReadingRestore(path: string): void {
+  if (readyCurrent.value?.path === path) workspaceController.completeRestore()
+}
+
+watch(readyCurrent, (file) => {
+  if (file) void restoreActiveReadingAnchor(file)
+})
 const findBarComponent = ref<InFileFindBarHandle | null>(null)
 const findOpen = ref(false)
 const findQuery = ref<InFileFindQuery>({ ...DEFAULT_FIND_QUERY })
@@ -397,6 +567,12 @@ function resizeQueryDockForViewport(): void {
   )
 }
 
+function flushWorkspaceBestEffort(): void {
+  captureActiveReadingAnchor()
+  syncWorkspaceSnapshot('structure')
+  void workspaceController.flush()
+}
+
 function maximizeQueryPanel(): void {
   if (!queryPanelOpen.value || !current.value) return
   transitionQueryLayout('focus')
@@ -578,15 +754,22 @@ function endResize(e: PointerEvent): void {
 onMounted(async () => {
   window.addEventListener('keydown', onGlobalKey, true)
   window.addEventListener('resize', resizeQueryDockForViewport)
+  window.addEventListener('pagehide', flushWorkspaceBestEffort)
   try {
     const [workspace, treeFiles] = await Promise.all([
       fetchCurrentWorkspace(),
       fetchTree(),
     ])
-    installWorkspaceTree(treeFiles, workspace.snapshot)
-    installWorkspaceTabs(treeFiles, workspace.snapshot)
+    beginWorkspaceRestore(
+      workspace.projectRoot,
+      treeFiles,
+      workspace.snapshot,
+      workspace.warnings,
+    )
   } catch (e) {
     loadError.value = String(e)
+    workspaceController.beginRestore(null, emptyWorkspaceSnapshot())
+    workspaceController.completeRestore()
   }
   await queryWorkspace.loadProjectHistory()
   // First-launch nudge: if no LLM backend is configured yet, pop the settings
@@ -601,14 +784,23 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', onGlobalKey, true)
   window.removeEventListener('resize', resizeQueryDockForViewport)
+  window.removeEventListener('pagehide', flushWorkspaceBestEffort)
+  cancelActiveReadingRestore()
+  flushWorkspaceBestEffort()
+  if (workspaceNoticeTimer !== null) window.clearTimeout(workspaceNoticeTimer)
   queryWorkspace.teardown()
 })
 
 // Open a file from the tree: tab identity is installed synchronously, while its
 // source is fetched only for the active tab. Existing ready tabs remain cached.
 async function open(node: FileNode) {
+  if (workspacePhase.value === 'switching') return
+  captureActiveReadingAnchor()
+  cancelActiveReadingRestore()
   evidenceReveal.value = null
   applyWorkspaceTabs(openWorkspaceTab(workspaceTabsState(), node))
+  workspaceController.completeRestore()
+  syncWorkspaceSnapshot('structure')
   await loadOpenFile(node.path)
 }
 
@@ -643,8 +835,13 @@ async function openCodeEvidence(reference: CodeEvidenceRef) {
 }
 
 function activate(path: string) {
+  if (workspacePhase.value === 'switching') return
+  captureActiveReadingAnchor()
+  cancelActiveReadingRestore()
   evidenceReveal.value = null
   applyWorkspaceTabs(activateWorkspaceTab(workspaceTabsState(), path))
+  workspaceController.completeRestore()
+  syncWorkspaceSnapshot('structure')
   void loadOpenFile(path)
 }
 
@@ -657,21 +854,42 @@ async function doSwitch(path: string) {
   if (!path || switching.value) return
   switching.value = true
   loadError.value = null
-  queryWorkspace.resetForProjectChange()
+  captureActiveReadingAnchor()
+  cancelActiveReadingRestore()
+  syncWorkspaceSnapshot('structure')
+  workspaceController.beginSwitch()
+  let opened: OpenProjectResponse | null = null
   try {
-    const opened = await openFolder(path)
+    await workspaceController.flush()
+    opened = await openFolder(path)
+    // The backend root is now committed. Cancel every old-root query/source
+    // owner before the follow-up tree read can resolve or fail.
+    queryWorkspace.resetForProjectChange()
     sourceLoads = resetWorkspaceSourceLoads(sourceLoads)
-    const treeFiles = await fetchTree()
-    installWorkspaceTree(treeFiles, opened.snapshot)
-    installWorkspaceTabs(treeFiles, opened.snapshot)
+    files.value = []
+    expandedDirectories.value = new Set()
+    openFiles.value = []
+    activePath.value = null
+    readingPositions.value = {}
     evidenceReveal.value = null
     fileSelectionMode.value = false
     clearSelectedFiles()
     folderInput.value = ''
+    const treeFiles = await fetchTree()
+    beginWorkspaceRestore(opened.root, treeFiles, opened.snapshot, opened.warnings)
     await queryWorkspace.loadProjectHistory()
   } catch (e) {
-    loadError.value = String(e)
-    await queryWorkspace.loadProjectHistory()
+    if (opened) {
+      // `/api/project/open` cannot be rolled back after a later tree failure.
+      // Drop old-root UI rather than let it issue reads against the new root.
+      beginWorkspaceRestore(opened.root, [], null, opened.warnings)
+      workspaceController.completeRestore()
+      loadError.value = `项目已切换，但文件树读取失败：${String(e)}`
+      await queryWorkspace.loadProjectHistory()
+    } else {
+      workspaceController.cancelSwitch()
+      loadError.value = String(e)
+    }
   } finally {
     switching.value = false
   }
@@ -697,18 +915,23 @@ function switchFolder() {
 // Close a tab; if it was active, fall to the right neighbor, else the left,
 // else vacuum (U2).
 function closeTab(path: string) {
+  if (workspacePhase.value === 'switching') return
+  captureActiveReadingAnchor()
+  cancelActiveReadingRestore()
   const closed = closeWorkspaceTab(workspaceTabsState(), path)
   applyWorkspaceTabs(closed)
+  workspaceController.completeRestore()
+  syncWorkspaceSnapshot('structure')
   if (closed.activePath) void loadOpenFile(closed.activePath)
 }
 </script>
 
 <template>
-  <div class="ide-shell">
+  <div class="ide-shell" :data-workspace-phase="workspacePhase">
     <div
       class="ide-body"
       :aria-hidden="queryFocusActive ? 'true' : undefined"
-      :inert="queryFocusActive"
+      :inert="queryFocusActive || workspacePhase === 'switching'"
     >
       <ActivityBar
         :sidebar-view="sidebarView"
@@ -781,6 +1004,9 @@ function closeTab(path: string) {
             :path="readyCurrent.path"
             :find-query="activeFindQuery"
             @find-state="updateFindSnapshot"
+            @reading-anchor="recordReadingAnchor"
+            @reading-interaction="beginReadingInteraction"
+            @reading-restore-settled="finishReadingRestore"
           />
           <Editor
             v-else-if="readyCurrent"
@@ -794,6 +1020,9 @@ function closeTab(path: string) {
             @progress="genProgress = $event"
             @context="queryCtx = $event"
             @find-state="updateFindSnapshot"
+            @reading-anchor="recordReadingAnchor"
+            @reading-interaction="beginReadingInteraction"
+            @reading-restore-settled="finishReadingRestore"
           />
           <div v-else-if="current && current.loadState === 'error'" class="empty">
             文件读取失败；重新选择此标签可重试
@@ -813,8 +1042,18 @@ function closeTab(path: string) {
       </main>
     </div>
     <div
+      v-if="workspaceNotice"
+      class="workspace-notice"
+      :class="workspaceNotice.kind"
+      role="status"
+      aria-live="polite"
+    >
+      {{ workspaceNotice.message }}
+    </div>
+    <div
       v-show="queryPanelOpen && current"
       class="query-surface"
+      :inert="workspacePhase === 'switching'"
       :class="{
         'query-sidebar': queryPresentation === 'sidebar',
         'query-dock': queryPresentation === 'dock',
@@ -871,7 +1110,7 @@ function closeTab(path: string) {
       :progress="genProgress"
       :query-open="queryPanelOpen"
       :aria-hidden="queryFocusActive ? 'true' : undefined"
-      :inert="queryFocusActive"
+      :inert="queryFocusActive || workspacePhase === 'switching'"
       @toggle-query="toggleQueryPanel"
       @toggle-generation="toggleGeneration"
     />

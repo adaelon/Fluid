@@ -106,6 +106,28 @@ body {
   display: flex;
 }
 
+.workspace-notice {
+  position: absolute;
+  z-index: 45;
+  top: 12px;
+  right: 12px;
+  max-width: min(440px, calc(100vw - 24px));
+  padding: 9px 12px;
+  color: var(--text);
+  background: color-mix(in srgb, var(--panel) 92%, #c9a45d 8%);
+  border: 1px solid color-mix(in srgb, #c9a45d 55%, var(--border));
+  border-radius: 6px;
+  box-shadow: 0 8px 24px var(--shadow-chrome);
+  font-size: 12px;
+  line-height: 1.45;
+  pointer-events: none;
+}
+
+.workspace-notice.error {
+  background: color-mix(in srgb, var(--panel) 92%, var(--c-error) 8%);
+  border-color: color-mix(in srgb, var(--c-error) 55%, var(--border));
+}
+
 /* — Activity bar: left vertical icon strip — */
 .activity-bar {
   position: relative;

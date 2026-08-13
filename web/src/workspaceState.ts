@@ -1,4 +1,13 @@
-import type { FileNode, Lang, ProjectReadingSnapshot } from './api.ts'
+import type {
+  FileNode,
+  Lang,
+  ProjectReadingSnapshot,
+  ReadingAnchor,
+} from './api.ts'
+import {
+  normalizeCodeReadingAnchor,
+  normalizeMarkdownReadingAnchor,
+} from './readingAnchor.ts'
 
 export type WorkspaceFileLoadState = 'unloaded' | 'loading' | 'ready' | 'error'
 
@@ -21,6 +30,11 @@ export interface WorkspaceTabsState {
 
 export interface RestoredWorkspaceTabs extends WorkspaceTabsState {
   skippedOpenFiles: string[]
+}
+
+export interface RestoredWorkspaceReadingPositions {
+  readingPositions: Record<string, ReadingAnchor>
+  skippedReadingPositions: string[]
 }
 
 function unloadedTab(node: FileNode): WorkspaceOpenFile {
@@ -93,6 +107,34 @@ export function restoreWorkspaceTabs(
     ),
     skippedOpenFiles,
   }
+}
+
+/** Project persisted reader anchors onto the current file tree. The backend
+ * validates the wire shape, while this final frontend gate also rejects paths
+ * that disappeared and anchors meant for the other reader kind. */
+export function restoreWorkspaceReadingPositions(
+  files: readonly FileNode[],
+  persistedPositions: Readonly<Record<string, ReadingAnchor>>,
+): RestoredWorkspaceReadingPositions {
+  const nodesByPath = new Map(files.map((node) => [node.path, node]))
+  const readingPositions: Record<string, ReadingAnchor> = {}
+  const skippedReadingPositions: string[] = []
+
+  for (const [path, anchor] of Object.entries(persistedPositions)) {
+    const node = nodesByPath.get(path)
+    const normalized = node?.lang === 'md'
+      ? normalizeMarkdownReadingAnchor(anchor)
+      : node
+        ? normalizeCodeReadingAnchor(anchor)
+        : null
+    if (!node || !normalized) {
+      skippedReadingPositions.push(path)
+      continue
+    }
+    readingPositions[path] = normalized
+  }
+
+  return { readingPositions, skippedReadingPositions }
 }
 
 /** Add a new unloaded tab or synchronously activate its existing identity. */

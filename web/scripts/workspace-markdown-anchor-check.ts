@@ -188,7 +188,8 @@ const renderBlock = viewSource.slice(
 )
 check(
   'MarkdownView publishes anchors and exposes capture, restore and cancellation',
-  viewSource.includes("'reading-anchor': [MarkdownReadingAnchor]")
+  viewSource.includes("'reading-anchor': [path: string, anchor: MarkdownReadingAnchor]")
+    && viewSource.includes("emit('reading-anchor', filePath, anchor)")
     && viewSource.includes('captureReadingAnchor,')
     && viewSource.includes('restoreReadingAnchor,')
     && viewSource.includes('cancelReadingAnchorRestore,'),
@@ -217,11 +218,19 @@ check(
     && correctionBlock.includes('filePath !== props.path'),
 )
 check(
+  'async restoration emits no save anchor before its real render correction settles',
+  viewSource.includes('if (restoredReadingAnchor) return')
+    && viewSource.includes("emit('reading-restore-settled', filePath)")
+    && correctionBlock.includes('settleReadingAnchorRestore(sequence, filePath)'),
+)
+check(
   'scroll and post-layout resize emit/correct anchors without replaying after user input',
   viewSource.includes("addEventListener('scroll', scheduleReadingAnchorEmit")
     && viewSource.includes('scheduleReadingAnchorCorrection()')
-    && viewSource.includes("addEventListener('wheel', cancelReadingAnchorRestore")
-    && viewSource.includes("addEventListener('touchstart', cancelReadingAnchorRestore")
+    && viewSource.includes("'reading-interaction': [path: string]")
+    && viewSource.includes("emit('reading-interaction', props.path)")
+    && viewSource.includes("addEventListener('wheel', onReadingAnchorUserScroll")
+    && viewSource.includes("addEventListener('touchstart', onReadingAnchorUserScroll")
     && viewSource.includes("addEventListener('pointerdown', onReadingAnchorPointerDown")
     && viewSource.includes("addEventListener('keydown', onReadingAnchorKeyDown"),
 )

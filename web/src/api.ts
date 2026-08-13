@@ -289,10 +289,16 @@ export async function saveCurrentWorkspace(req: {
   snapshot: ProjectReadingSnapshot
 }): Promise<{ saved: true }> {
   const endpoint = '/api/workspace/current'
+  const body = JSON.stringify(req)
+  // A small complete snapshot may outlive `pagehide`; oversized records stay a
+  // normal fetch because browsers reject keepalive bodies around the 64 KiB
+  // quota. Event-driven autosave remains the primary durability path either way.
+  const keepalive = new TextEncoder().encode(body).byteLength <= 60 * 1024
   const res = await fetch(endpoint, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(req),
+    body,
+    keepalive,
   })
   if (!res.ok) return workspaceResponseError(res, endpoint)
   return (await res.json()) as { saved: true }

@@ -364,8 +364,15 @@ check('QueryPanel consumes controller history actions instead of calling history
 check('dock/focus expose one shared project history selector and bad-record warning', panelSource.includes('data-testid="query-history-picker"') && panelSource.includes('historyWarnings'))
 const projectResetIndex = appSource.indexOf('queryWorkspace.resetForProjectChange()')
 const projectOpenIndex = appSource.indexOf('await openFolder(path)')
+const projectTreeIndex = appSource.indexOf('await fetchTree()', projectOpenIndex)
 const projectLoadIndex = appSource.indexOf('await queryWorkspace.loadProjectHistory()', projectOpenIndex)
-check('a project-root switch cancels old work before changing roots, then reloads history', projectResetIndex >= 0 && projectResetIndex < projectOpenIndex && projectLoadIndex > projectOpenIndex)
+check(
+  'a failed root switch preserves old query work while a committed switch resets before new-tree install',
+  projectOpenIndex >= 0
+    && projectResetIndex > projectOpenIndex
+    && projectResetIndex < projectTreeIndex
+    && projectLoadIndex > projectTreeIndex,
+)
 
 if (failures > 0) {
   console.error(`\n${failures} FAILED`)

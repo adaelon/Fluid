@@ -178,7 +178,8 @@ const capsuleStartBlock = editorSource.slice(
 )
 check(
   'Editor publishes code anchors and exposes capture, restore and cancellation',
-  editorSource.includes("'reading-anchor': [CodeReadingAnchor]")
+  editorSource.includes("'reading-anchor': [path: string, anchor: CodeReadingAnchor]")
+    && editorSource.includes("emit('reading-anchor', filePath, anchor)")
     && editorSource.includes('captureReadingAnchor,')
     && editorSource.includes('restoreReadingAnchor,')
     && editorSource.includes('cancelReadingAnchorRestore,'),
@@ -209,6 +210,13 @@ check(
     && editorSource.includes('if (u.geometryChanged) scheduleReadingAnchorCorrection()'),
 )
 check(
+  'programmatic restoration stays silent until the measured correction settles',
+  editorSource.includes('if (!editor || !currentPath || restoredReadingAnchor) return')
+    && editorSource.includes("emit('reading-restore-settled', filePath)")
+    && editorSource.indexOf('settleReadingAnchorRestore(sequence, filePath)')
+      > editorSource.indexOf('measuredView.scrollDOM.scrollTop = nextScrollTop'),
+)
+check(
   'capsule scheduling gives a pending restored anchor first correction priority',
   capsuleStartBlock.indexOf('scheduleReadingAnchorCorrection()') >= 0
     && capsuleStartBlock.indexOf('scheduleReadingAnchorCorrection()')
@@ -221,9 +229,11 @@ check(
     && editorSource.includes('cancelReadingAnchorRestore()\n      editor.dispatch({'),
 )
 check(
-  'user wheel, touch, scrollbar and keyboard navigation cancel correction',
-  editorSource.includes("addEventListener('wheel', cancelReadingAnchorRestore")
-    && editorSource.includes("addEventListener('touchstart', cancelReadingAnchorRestore")
+  'user wheel, touch, scrollbar and keyboard navigation cancel correction and surface intent',
+  editorSource.includes("'reading-interaction': [path: string]")
+    && editorSource.includes("emit('reading-interaction', currentPath)")
+    && editorSource.includes("addEventListener('wheel', onReadingAnchorUserScroll")
+    && editorSource.includes("addEventListener('touchstart', onReadingAnchorUserScroll")
     && editorSource.includes("addEventListener('pointerdown', onReadingAnchorPointerDown")
     && editorSource.includes("addEventListener('keydown', onReadingAnchorKeyDown"),
 )

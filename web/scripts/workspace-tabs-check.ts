@@ -152,7 +152,7 @@ check('App restores tab identities then requests only the chosen active source',
 check('Editor and Markdown activation are gated by a ready non-null source', appSource.includes('const readyCurrent = computed') && appSource.includes('v-if="readyCurrent && readyCurrent.lang === \'md\'"') && appSource.includes('v-else-if="readyCurrent"'))
 check('the source loader never assigns activePath from a response callback', appSource.includes('acceptWorkspaceSourceLoad') && !/await fetchFile\([\s\S]{0,300}activePath\.value\s*=/.test(appSource))
 const switchCallIndex = appSource.indexOf('await openFolder(path)')
-const switchInstallIndex = appSource.indexOf('installWorkspaceTabs(', switchCallIndex)
+const switchInstallIndex = appSource.indexOf('beginWorkspaceRestore(', switchCallIndex)
 check('a rejected project-open request cannot clear the existing tab UI', switchCallIndex >= 0 && switchInstallIndex > switchCallIndex)
 
 if (failures > 0) {
