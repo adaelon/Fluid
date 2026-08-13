@@ -12,6 +12,10 @@ mod llm_proxy;
 #[allow(dead_code)]
 mod orientation;
 mod project_reader;
+// S-WSTATE-1 lands the user-level reading-state persistence boundary before
+// startup/routes consume it in S-WSTART-1.
+#[allow(dead_code)]
+mod reading_state;
 // S-QTHREAD-1 lands the project-scoped persistence boundary before S-QAPI-1
 // adds the first route consumer. Keep the staged allowance local to the module.
 #[allow(dead_code)]

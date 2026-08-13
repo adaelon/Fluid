@@ -38,6 +38,12 @@ mime_guess = "2"
 # Best-effort: open the default browser at the served URL on startup.
 open = "5"
 
+[target.'cfg(windows)'.dependencies]
+# `std::fs::rename` cannot replace an existing destination on Windows. Reading
+# state uses MoveFileExW(REPLACE_EXISTING|WRITE_THROUGH) for same-directory
+# whole-record replacement while preserving the previous bytes on failure.
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 # Real WebSocket fixture for route/protocol coverage; all supplier calls remain
 # local axum fixtures and never require external network.
