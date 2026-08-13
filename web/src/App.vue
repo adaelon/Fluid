@@ -1,12 +1,14 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onBeforeUnmount, ref, watch } from 'vue'
 import {
+  fetchCurrentWorkspace,
   fetchFile,
   fetchTree,
   openFolder,
   pickFolder,
   getLlmSettings,
   type FileNode,
+  type ProjectReadingSnapshot,
   type QueryScopeSpec,
 } from './api'
 import FileTree from './FileTree.vue'
@@ -38,19 +40,79 @@ import {
   type QueryLayoutAction,
 } from './queryLayout'
 import { createQueryWorkspace } from './queryWorkspace'
-
-type OpenFile = { path: string; lang: string; source: string }
+import {
+  acceptWorkspaceSourceLoad,
+  activateWorkspaceTab,
+  activeReadyWorkspaceFile,
+  beginWorkspaceSourceLoad,
+  closeWorkspaceTab,
+  createWorkspaceSourceLoadState,
+  markWorkspaceTabError,
+  markWorkspaceTabLoading,
+  markWorkspaceTabReady,
+  openWorkspaceTab,
+  resetWorkspaceSourceLoads,
+  restoreWorkspaceTabs,
+  type WorkspaceOpenFile,
+  type WorkspaceTabsState,
+} from './workspaceState'
 
 const files = ref<FileNode[]>([])
 // Multi-tab model (U2): an ordered list of open files + the active one.
-const openFiles = ref<OpenFile[]>([])
+const openFiles = ref<WorkspaceOpenFile[]>([])
 const activePath = ref<string | null>(null)
-const current = computed<OpenFile | null>(
+const current = computed<WorkspaceOpenFile | null>(
   () => openFiles.value.find((f) => f.path === activePath.value) ?? null,
 )
+const readyCurrent = computed(() => activeReadyWorkspaceFile({
+  openFiles: openFiles.value,
+  activePath: activePath.value,
+}))
 // Breadcrumb segments of the active file path (U2).
 const crumbs = computed<string[]>(() => current.value?.path.split('/') ?? [])
 const loadError = ref<string | null>(null)
+let sourceLoads = createWorkspaceSourceLoadState()
+
+function workspaceTabsState(): WorkspaceTabsState {
+  return {
+    openFiles: openFiles.value,
+    activePath: activePath.value,
+  }
+}
+
+function applyWorkspaceTabs(state: WorkspaceTabsState): void {
+  openFiles.value = state.openFiles
+  activePath.value = state.activePath
+}
+
+async function loadOpenFile(path: string): Promise<void> {
+  const tab = openFiles.value.find((candidate) => candidate.path === path)
+  if (!tab || tab.loadState === 'ready' || tab.loadState === 'loading') return
+
+  const begun = beginWorkspaceSourceLoad(sourceLoads, path)
+  sourceLoads = begun.state
+  applyWorkspaceTabs(markWorkspaceTabLoading(workspaceTabsState(), path))
+  if (activePath.value === path) loadError.value = null
+
+  try {
+    const source = await fetchFile(path)
+    if (!acceptWorkspaceSourceLoad(sourceLoads, begun.request)) return
+    applyWorkspaceTabs(markWorkspaceTabReady(workspaceTabsState(), path, source))
+  } catch (error) {
+    if (!acceptWorkspaceSourceLoad(sourceLoads, begun.request)) return
+    applyWorkspaceTabs(markWorkspaceTabError(workspaceTabsState(), path))
+    if (activePath.value === path) loadError.value = String(error)
+  }
+}
+
+function installWorkspaceTabs(
+  treeFiles: readonly FileNode[],
+  snapshot: ProjectReadingSnapshot | null,
+): void {
+  const restored = restoreWorkspaceTabs(treeFiles, snapshot)
+  applyWorkspaceTabs(restored)
+  if (restored.activePath) void loadOpenFile(restored.activePath)
+}
 
 const DEFAULT_FIND_QUERY: InFileFindQuery = {
   text: '',
@@ -83,7 +145,7 @@ function focusFindInput(): void {
 }
 
 function openFind(): void {
-  if (!current.value) return
+  if (!readyCurrent.value) return
   if (!findOpen.value) {
     findQuery.value = { ...lastFindQuery.value }
     findSnapshot.value = emptyFindSnapshot()
@@ -122,7 +184,7 @@ function moveFind(direction: InFileFindDirection): void {
 
 function isFindKeyboardContext(event: KeyboardEvent): boolean {
   const stage = editorStage.value
-  if (!stage || !current.value) return false
+  if (!stage || !readyCurrent.value) return false
   const target = event.target instanceof Node ? event.target : document.activeElement
   return target instanceof Node && stage.contains(target)
 }
@@ -192,7 +254,7 @@ watch(
     if (!c || c.lang === 'md' || queryCtx.value.filePath !== c.path) {
       queryCtx.value = EMPTY_QUERY_CONTEXT
     }
-    if (!c || c.lang === 'md') {
+    if (!c || c.loadState !== 'ready' || c.lang === 'md') {
       genProgress.value = { phase: 'idle', completed: 0, total: 0 }
     }
   },
@@ -496,7 +558,12 @@ onMounted(async () => {
   window.addEventListener('keydown', onGlobalKey, true)
   window.addEventListener('resize', resizeQueryDockForViewport)
   try {
-    files.value = await fetchTree()
+    const [workspace, treeFiles] = await Promise.all([
+      fetchCurrentWorkspace(),
+      fetchTree(),
+    ])
+    files.value = treeFiles
+    installWorkspaceTabs(treeFiles, workspace.snapshot)
   } catch (e) {
     loadError.value = String(e)
   }
@@ -516,21 +583,12 @@ onBeforeUnmount(() => {
   queryWorkspace.teardown()
 })
 
-// Open a file from the tree: if already open just activate its tab; otherwise
-// fetch the source once, append a tab, and activate it (U2).
+// Open a file from the tree: tab identity is installed synchronously, while its
+// source is fetched only for the active tab. Existing ready tabs remain cached.
 async function open(node: FileNode) {
   evidenceReveal.value = null
-  if (openFiles.value.some((f) => f.path === node.path)) {
-    activePath.value = node.path
-    return
-  }
-  try {
-    const source = await fetchFile(node.path)
-    openFiles.value.push({ path: node.path, lang: node.lang, source })
-    activePath.value = node.path
-  } catch (e) {
-    loadError.value = String(e)
-  }
+  applyWorkspaceTabs(openWorkspaceTab(workspaceTabsState(), node))
+  await loadOpenFile(node.path)
 }
 
 async function restoreQueryScope(threadScope: QueryScopeSpec) {
@@ -565,7 +623,8 @@ async function openCodeEvidence(reference: CodeEvidenceRef) {
 
 function activate(path: string) {
   evidenceReveal.value = null
-  activePath.value = path
+  applyWorkspaceTabs(activateWorkspaceTab(workspaceTabsState(), path))
+  void loadOpenFile(path)
 }
 
 // Open Folder (U3): switch the backend project root, then reload the tree and
@@ -579,15 +638,16 @@ async function doSwitch(path: string) {
   loadError.value = null
   queryWorkspace.resetForProjectChange()
   try {
-    await openFolder(path)
-    await queryWorkspace.loadProjectHistory()
-    openFiles.value = []
-    activePath.value = null
+    const opened = await openFolder(path)
+    sourceLoads = resetWorkspaceSourceLoads(sourceLoads)
+    const treeFiles = await fetchTree()
+    files.value = treeFiles
+    installWorkspaceTabs(treeFiles, opened.snapshot)
     evidenceReveal.value = null
     fileSelectionMode.value = false
     clearSelectedFiles()
-    files.value = await fetchTree()
     folderInput.value = ''
+    await queryWorkspace.loadProjectHistory()
   } catch (e) {
     loadError.value = String(e)
     await queryWorkspace.loadProjectHistory()
@@ -616,12 +676,9 @@ function switchFolder() {
 // Close a tab; if it was active, fall to the right neighbor, else the left,
 // else vacuum (U2).
 function closeTab(path: string) {
-  const i = openFiles.value.findIndex((f) => f.path === path)
-  if (i < 0) return
-  openFiles.value.splice(i, 1)
-  if (activePath.value !== path) return
-  const next = openFiles.value[i] ?? openFiles.value[i - 1] ?? null
-  activePath.value = next?.path ?? null
+  const closed = closeWorkspaceTab(workspaceTabsState(), path)
+  applyWorkspaceTabs(closed)
+  if (closed.activePath) void loadOpenFile(closed.activePath)
 }
 </script>
 
@@ -695,19 +752,19 @@ function closeTab(path: string) {
         </div>
         <div ref="editorStage" class="editor-stage">
           <MarkdownView
-            v-if="current && current.lang === 'md'"
+            v-if="readyCurrent && readyCurrent.lang === 'md'"
             ref="activeFindSurface"
-            :source="current.source"
-            :path="current.path"
+            :source="readyCurrent.source"
+            :path="readyCurrent.path"
             :find-query="activeFindQuery"
             @find-state="updateFindSnapshot"
           />
           <Editor
-            v-else-if="current"
+            v-else-if="readyCurrent"
             ref="activeFindSurface"
-            :source="current.source"
-            :lang="current.lang"
-            :path="current.path"
+            :source="readyCurrent.source"
+            :lang="readyCurrent.lang"
+            :path="readyCurrent.path"
             :allow-web="allowWeb"
             :reveal-evidence="activeEvidenceReveal"
             :find-query="activeFindQuery"
@@ -715,6 +772,10 @@ function closeTab(path: string) {
             @context="queryCtx = $event"
             @find-state="updateFindSnapshot"
           />
+          <div v-else-if="current && current.loadState === 'error'" class="empty">
+            文件读取失败；重新选择此标签可重试
+          </div>
+          <div v-else-if="current" class="empty">正在读取 {{ current.path }}…</div>
           <div v-else class="empty">从左侧选择一个文件以只读查看源码</div>
           <InFileFindBar
             v-if="findOpen && current"
