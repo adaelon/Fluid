@@ -41,6 +41,12 @@ import {
 } from './queryLayout'
 import { createQueryWorkspace } from './queryWorkspace'
 import {
+  buildTree,
+  restoreExpandedDirectories,
+  setDirectoryExpanded as reduceDirectoryExpansion,
+  type DirectoryExpansionChange,
+} from './tree'
+import {
   acceptWorkspaceSourceLoad,
   activateWorkspaceTab,
   activeReadyWorkspaceFile,
@@ -58,6 +64,7 @@ import {
 } from './workspaceState'
 
 const files = ref<FileNode[]>([])
+const expandedDirectories = ref<ReadonlySet<string>>(new Set())
 // Multi-tab model (U2): an ordered list of open files + the active one.
 const openFiles = ref<WorkspaceOpenFile[]>([])
 const activePath = ref<string | null>(null)
@@ -112,6 +119,20 @@ function installWorkspaceTabs(
   const restored = restoreWorkspaceTabs(treeFiles, snapshot)
   applyWorkspaceTabs(restored)
   if (restored.activePath) void loadOpenFile(restored.activePath)
+}
+
+function installWorkspaceTree(
+  treeFiles: FileNode[],
+  snapshot: ProjectReadingSnapshot | null,
+): void {
+  const tree = buildTree(treeFiles)
+  const restored = restoreExpandedDirectories(tree, snapshot?.expandedDirectories ?? [])
+  files.value = treeFiles
+  expandedDirectories.value = restored.expandedDirectories
+}
+
+function setDirectoryExpanded(change: DirectoryExpansionChange): void {
+  expandedDirectories.value = reduceDirectoryExpansion(expandedDirectories.value, change)
 }
 
 const DEFAULT_FIND_QUERY: InFileFindQuery = {
@@ -562,7 +583,7 @@ onMounted(async () => {
       fetchCurrentWorkspace(),
       fetchTree(),
     ])
-    files.value = treeFiles
+    installWorkspaceTree(treeFiles, workspace.snapshot)
     installWorkspaceTabs(treeFiles, workspace.snapshot)
   } catch (e) {
     loadError.value = String(e)
@@ -641,7 +662,7 @@ async function doSwitch(path: string) {
     const opened = await openFolder(path)
     sourceLoads = resetWorkspaceSourceLoads(sourceLoads)
     const treeFiles = await fetchTree()
-    files.value = treeFiles
+    installWorkspaceTree(treeFiles, opened.snapshot)
     installWorkspaceTabs(treeFiles, opened.snapshot)
     evidenceReveal.value = null
     fileSelectionMode.value = false
@@ -722,10 +743,12 @@ function closeTab(path: string) {
         <FileTree
           :files="files"
           :active="current?.path ?? null"
+          :expanded-directories="expandedDirectories"
           :selection-mode="fileSelectionMode"
           :selected-paths="selectedFilePathList"
           @select="open"
           @toggle-selected="toggleSelectedFile"
+          @set-directory-expanded="setDirectoryExpanded"
         />
         </template>
       </aside>
