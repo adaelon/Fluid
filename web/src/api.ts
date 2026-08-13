@@ -21,6 +21,71 @@ export interface FileNode {
   lang: Lang
 }
 
+export type ReadingAnchor =
+  | {
+      kind: 'code'
+      topLine: number
+      offsetPx: number
+      totalLines: number
+    }
+  | {
+      kind: 'markdown'
+      blockDigest: string
+      occurrence: number
+      offsetPx: number
+      scrollRatio: number
+    }
+
+export interface ProjectReadingSnapshot {
+  expandedDirectories: string[]
+  openFiles: string[]
+  activeFile: string | null
+  readingPositions: Record<string, ReadingAnchor>
+}
+
+export type ReadingStateWarningKind =
+  | 'corrupt-json'
+  | 'unsupported-schema'
+  | 'project-root-mismatch'
+  | 'invalid-path'
+  | 'invalid-value'
+  | 'record-too-large'
+  | 'invalid-record'
+  | 'io'
+
+export interface ReadingStateWarning {
+  kind: ReadingStateWarningKind
+  file: string
+  message: string
+}
+
+export interface CurrentWorkspaceResponse {
+  projectRoot: string | null
+  snapshot: ProjectReadingSnapshot | null
+  warnings: ReadingStateWarning[]
+}
+
+export interface OpenProjectResponse {
+  root: string
+  snapshot: ProjectReadingSnapshot | null
+  warnings: ReadingStateWarning[]
+}
+
+export class WorkspaceApiError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+  ) {
+    super(message)
+    this.name = 'WorkspaceApiError'
+  }
+}
+
+async function workspaceResponseError(res: Response, endpoint: string): Promise<never> {
+  const detail = (await res.text()).trim()
+  throw new WorkspaceApiError(res.status, detail || `${endpoint} -> ${res.status}`)
+}
+
 export type QueryScopeSpec =
   | { kind: 'current'; paths: [string] }
   | { kind: 'selected'; paths: [string, string, ...string[]] }
@@ -209,16 +274,41 @@ export async function fetchFile(path: string): Promise<string> {
   return data.source
 }
 
-/** POST /api/project/open { path } -> new canonical root (U3 single-root swap). */
-export async function openFolder(path: string): Promise<string> {
-  const res = await fetch('/api/project/open', {
+/** GET the canonical current root and its independently persisted reading state. */
+export async function fetchCurrentWorkspace(): Promise<CurrentWorkspaceResponse> {
+  const endpoint = '/api/workspace/current'
+  const res = await fetch(endpoint)
+  if (!res.ok) return workspaceResponseError(res, endpoint)
+  return (await res.json()) as CurrentWorkspaceResponse
+}
+
+/** Save one complete snapshot only when its root is still the backend's current
+ * root. A delayed old-root request is preserved as WorkspaceApiError(409). */
+export async function saveCurrentWorkspace(req: {
+  projectRoot: string
+  snapshot: ProjectReadingSnapshot
+}): Promise<{ saved: true }> {
+  const endpoint = '/api/workspace/current'
+  const res = await fetch(endpoint, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(req),
+  })
+  if (!res.ok) return workspaceResponseError(res, endpoint)
+  return (await res.json()) as { saved: true }
+}
+
+/** Switch to one canonical project root and receive that target's persisted
+ * snapshot in the same response, avoiding a second current-root guess. */
+export async function openFolder(path: string): Promise<OpenProjectResponse> {
+  const endpoint = '/api/project/open'
+  const res = await fetch(endpoint, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ path }),
   })
-  if (!res.ok) throw new Error((await res.text()) || `/api/project/open -> ${res.status}`)
-  const data = (await res.json()) as { root: string }
-  return data.root
+  if (!res.ok) return workspaceResponseError(res, endpoint)
+  return (await res.json()) as OpenProjectResponse
 }
 
 /** POST /api/project/pick -> chosen absolute path, or null if the user cancelled

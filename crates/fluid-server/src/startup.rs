@@ -5,11 +5,14 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
+
+use crate::project_reader::ProjectReader;
+use crate::reading_state::ReadingStateStore;
 
 pub const DEFAULT_PORT: u16 = 7878;
 pub const IDENTITY_PATH: &str = "/api/identity";
@@ -47,6 +50,102 @@ pub struct BoundServer {
 pub enum StartupSelection {
     Serve(BoundServer),
     Reuse { url: String },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StartupProjectSource {
+    Explicit,
+    Recent,
+    None,
+}
+
+pub struct StartupProjectDecision {
+    pub project: Option<ProjectReader>,
+    pub source: StartupProjectSource,
+    /// Non-fatal persistence/history failures that the caller should log. They
+    /// never turn an automatic no-argument launch into a startup failure.
+    pub diagnostics: Vec<String>,
+}
+
+impl StartupProjectDecision {
+    fn empty(diagnostics: Vec<String>) -> Self {
+        Self {
+            project: None,
+            source: StartupProjectSource::None,
+            diagnostics,
+        }
+    }
+}
+
+/// Choose the project for a newly served process. Explicit user intent is
+/// strict and wins without consulting history. Automatic history is best-effort:
+/// an unreadable index or unavailable recent root is diagnosed and degrades to
+/// the vacuum state without deleting the persisted record.
+pub fn select_startup_project(
+    explicit_project: Option<PathBuf>,
+    reading_state: Option<&ReadingStateStore>,
+) -> io::Result<StartupProjectDecision> {
+    if let Some(path) = explicit_project {
+        return ProjectReader::new(path).map(|project| StartupProjectDecision {
+            project: Some(project),
+            source: StartupProjectSource::Explicit,
+            diagnostics: Vec::new(),
+        });
+    }
+
+    let Some(reading_state) = reading_state else {
+        return Ok(StartupProjectDecision::empty(Vec::new()));
+    };
+    let loaded = match reading_state.load_index() {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            return Ok(StartupProjectDecision::empty(vec![format!(
+                "cannot read recent-project index: {error}"
+            )]))
+        }
+    };
+    let diagnostics = loaded
+        .warnings
+        .iter()
+        .map(|warning| {
+            format!(
+                "ignored recent-project index {}: {}",
+                warning.file, warning.message
+            )
+        })
+        .collect::<Vec<_>>();
+    let Some(recent_root) = loaded.value.and_then(|index| index.recent_project_root) else {
+        return Ok(StartupProjectDecision::empty(diagnostics));
+    };
+    match ProjectReader::new(PathBuf::from(&recent_root)) {
+        Ok(project) => Ok(StartupProjectDecision {
+            project: Some(project),
+            source: StartupProjectSource::Recent,
+            diagnostics,
+        }),
+        Err(error) => {
+            let mut diagnostics = diagnostics;
+            diagnostics.push(format!(
+                "ignored unavailable recent project {recent_root:?}: {error}"
+            ));
+            Ok(StartupProjectDecision::empty(diagnostics))
+        }
+    }
+}
+
+/// Persist the root selected for a newly served process without making index IO
+/// part of startup success. `Some` is a diagnostic for the caller to log.
+pub fn record_startup_project(
+    reading_state: Option<&ReadingStateStore>,
+    project: Option<&ProjectReader>,
+) -> Option<String> {
+    let (Some(reading_state), Some(project)) = (reading_state, project) else {
+        return None;
+    };
+    reading_state
+        .save_recent_project(project.root())
+        .err()
+        .map(|error| format!("project opened but recent-project index was not updated: {error}"))
 }
 
 /// Select the listener for one invocation. An explicit port is strict. With no
@@ -167,16 +266,65 @@ pub async fn handoff_project(base_url: &str, project: &Path) -> anyhow::Result<(
     Ok(())
 }
 
+/// Reuse keeps the current root when this invocation has no positional project.
+/// Returning whether a handoff occurred makes the zero-request branch directly
+/// testable without changing the existing listener/reuse policy.
+pub async fn handoff_project_if_present(
+    base_url: &str,
+    project: Option<&Path>,
+) -> anyhow::Result<bool> {
+    let Some(project) = project else {
+        return Ok(false);
+    };
+    handoff_project(base_url, project).await?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
+    use crate::reading_state::ReadingStateStore;
     use axum::{
         extract::State,
         routing::{get, post},
         Json, Router,
     };
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "fluid-startup-{label}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+
+        fn make_dir(&self, name: &str) -> PathBuf {
+            let path = self.path().join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     async fn fixture_server(app: Router) -> (u16, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -277,6 +425,137 @@ mod tests {
             .err()
             .expect("explicit conflict must fail");
         assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        task.abort();
+    }
+
+    #[test]
+    fn explicit_project_wins_over_a_valid_recent_project() {
+        let temp = TempDir::new("explicit-wins");
+        let explicit = temp.make_dir("explicit");
+        let recent = temp.make_dir("recent");
+        let store = ReadingStateStore::new(temp.path().join("user-data"));
+        store.save_recent_project(&recent).unwrap();
+
+        let selected = select_startup_project(Some(explicit.clone()), Some(&store)).unwrap();
+
+        assert_eq!(selected.source, StartupProjectSource::Explicit);
+        assert_eq!(
+            selected.project.unwrap().root(),
+            explicit.canonicalize().unwrap()
+        );
+        assert!(selected.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn invalid_explicit_project_remains_a_strict_startup_error() {
+        let temp = TempDir::new("invalid-explicit");
+        let store = ReadingStateStore::new(temp.path().join("user-data"));
+
+        assert!(
+            select_startup_project(Some(temp.path().join("missing-explicit")), Some(&store))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn valid_recent_project_is_selected_for_a_new_no_argument_server() {
+        let temp = TempDir::new("recent-valid");
+        let recent = temp.make_dir("recent");
+        let store = ReadingStateStore::new(temp.path().join("user-data"));
+        store.save_recent_project(&recent).unwrap();
+
+        let selected = select_startup_project(None, Some(&store)).unwrap();
+
+        assert_eq!(selected.source, StartupProjectSource::Recent);
+        assert_eq!(
+            selected.project.unwrap().root(),
+            recent.canonicalize().unwrap()
+        );
+        assert!(selected.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn unavailable_recent_project_silently_degrades_without_deleting_the_index() {
+        let temp = TempDir::new("recent-missing");
+        let recent = temp.make_dir("recent");
+        let store = ReadingStateStore::new(temp.path().join("user-data"));
+        store.save_recent_project(&recent).unwrap();
+        let index_before = std::fs::read(store.index_path()).unwrap();
+        std::fs::remove_dir_all(&recent).unwrap();
+
+        let selected = select_startup_project(None, Some(&store)).unwrap();
+
+        assert_eq!(selected.source, StartupProjectSource::None);
+        assert!(selected.project.is_none());
+        assert_eq!(selected.diagnostics.len(), 1);
+        assert_eq!(std::fs::read(store.index_path()).unwrap(), index_before);
+    }
+
+    #[test]
+    fn missing_recent_index_starts_in_the_vacuum_state() {
+        let temp = TempDir::new("no-index");
+        let store = ReadingStateStore::new(temp.path().join("user-data"));
+
+        let selected = select_startup_project(None, Some(&store)).unwrap();
+
+        assert_eq!(selected.source, StartupProjectSource::None);
+        assert!(selected.project.is_none());
+        assert!(selected.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn successful_served_project_updates_the_recent_index_best_effort() {
+        let temp = TempDir::new("record-startup");
+        let previous = temp.make_dir("previous");
+        let selected_root = temp.make_dir("selected");
+        let store = ReadingStateStore::new(temp.path().join("user-data"));
+        store.save_recent_project(&previous).unwrap();
+        let selected = select_startup_project(Some(selected_root.clone()), Some(&store)).unwrap();
+
+        assert!(record_startup_project(Some(&store), selected.project.as_ref()).is_none());
+        assert_eq!(
+            store
+                .load_index()
+                .unwrap()
+                .value
+                .unwrap()
+                .recent_project_root,
+            Some(selected_root.canonicalize().unwrap().display().to_string())
+        );
+
+        let failed_root = temp.make_dir("failed-update");
+        let failed_project = ProjectReader::new(failed_root).unwrap();
+        store.fail_next_atomic_replace_for_test();
+        assert!(record_startup_project(Some(&store), Some(&failed_project)).is_some());
+        assert_eq!(
+            store
+                .load_index()
+                .unwrap()
+                .value
+                .unwrap()
+                .recent_project_root,
+            Some(selected_root.canonicalize().unwrap().display().to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn reuse_without_an_explicit_project_sends_no_handoff_request() {
+        async fn count_handoff(State(count): State<Arc<AtomicUsize>>) {
+            count.fetch_add(1, Ordering::SeqCst);
+        }
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/api/project/open", post(count_handoff))
+            .with_state(Arc::clone(&count));
+        let (port, task) = fixture_server(app).await;
+
+        let handed_off = handoff_project_if_present(&loopback_url(port), None)
+            .await
+            .unwrap();
+
+        assert!(!handed_off);
+        assert_eq!(count.load(Ordering::SeqCst), 0);
         task.abort();
     }
 

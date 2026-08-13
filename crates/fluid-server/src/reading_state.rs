@@ -173,6 +173,9 @@ impl From<io::Error> for ReadingStateError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// The parameterized variants are all exercised in tests on every host; a
+// production binary naturally constructs only its compile-target platform.
+#[cfg_attr(not(test), allow(dead_code))]
 pub enum UserDataPlatform {
     Windows,
     MacOs,
@@ -372,6 +375,9 @@ impl ReadingStateStore {
         })
     }
 
+    // Retained as the explicit index-reset operation and covered by store tests;
+    // S-WSTART-1 deliberately preserves an unavailable recent root instead.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn clear_recent_project(&self) -> Result<(), ReadingStateError> {
         self.save_index(&ReadingStateIndex::default())
     }

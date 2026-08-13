@@ -1,6 +1,8 @@
 //! HTTP / WS routes.
 //!
 //! - `GET /api/project/tree`        -> { files: FileNode[] }
+//! - `GET|PUT /api/workspace/current` -> current root reading-state load/save
+//! - `POST /api/project/open`       -> root + target reading state + warnings
 //! - `GET /api/file?path=<rel>`     -> { source: string }
 //! - `GET /api/project/graph`       -> KnowledgeGraph | null   (S2, optional)
 //! - `GET /api/identity`            -> stable local-instance identity
@@ -11,7 +13,7 @@
 //! All handlers share an `Arc<AppState>` as axum state.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -73,6 +75,10 @@ use crate::query_history::{
     normalize_query_scope, PersistedQueryTurn, QueryEvidenceState, QueryFreshness,
     QueryHistoryError, QueryScopeSpec, QueryThread, QueryThreadFreshness, QueryThreadStore,
 };
+use crate::reading_state::{
+    ProjectReadingSnapshot, ReadingStateError, ReadingStateStore, ReadingStateWarning,
+    ReadingStateWarningKind,
+};
 use crate::settings::{mask_key, persist_env, LlmConfig};
 use crate::startup::{FluidIdentity, IDENTITY_PATH};
 use crate::translate::{build_translate_prompt, protect_code, restore_code, split_chunks};
@@ -103,6 +109,10 @@ pub struct AppState {
     /// it via `/api/project/open`. Until then tree is empty and file/gen/query report
     /// "no project open".
     project: RwLock<Option<ProjectCtx>>,
+    /// User-level reading-state persistence. Absence is a supported degraded
+    /// mode: projects still open, while workspace reads expose one warning and
+    /// saves return 503 so the frontend can retain its dirty snapshot.
+    reading_state: Option<ReadingStateStore>,
     /// Runtime-editable LLM backend (U5a, ADR-0018): config (source of truth,
     /// holds the secret key in memory) + the derived proxy (`None` when no key).
     /// Behind a lock so the settings panel can hot-swap it; the proxy is `Arc`'d
@@ -168,6 +178,7 @@ impl AppState {
         let proxy = LlmProxy::from_config(&llm_config).map(Arc::new);
         Self {
             project: RwLock::new(project),
+            reading_state: None,
             llm: RwLock::new(LlmState {
                 config: llm_config,
                 proxy,
@@ -175,6 +186,11 @@ impl AppState {
             env_path,
             prompt_version,
         }
+    }
+
+    pub fn with_reading_state(mut self, reading_state: Option<ReadingStateStore>) -> Self {
+        self.reading_state = reading_state;
+        self
     }
 
     /// Snapshot the current proxy (cheap `Arc` clone), releasing the lock at once
@@ -203,6 +219,10 @@ pub fn router(state: Shared) -> Router {
     Router::new()
         .route(IDENTITY_PATH, get(identity))
         .route("/api/project/tree", get(tree))
+        .route(
+            "/api/workspace/current",
+            get(current_workspace).put(save_current_workspace),
+        )
         .route("/api/file", get(file))
         .route("/api/project/graph", get(graph))
         .route("/api/project/open", post(open_folder))
@@ -254,6 +274,136 @@ async fn tree(State(state): State<Shared>) -> Json<TreeResponse> {
     Json(TreeResponse { files })
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CurrentWorkspaceResponse {
+    project_root: Option<String>,
+    snapshot: Option<ProjectReadingSnapshot>,
+    warnings: Vec<ReadingStateWarning>,
+}
+
+fn project_root_string(root: &FsPath) -> String {
+    root.display().to_string()
+}
+
+fn persistence_unavailable_warning() -> ReadingStateWarning {
+    ReadingStateWarning {
+        kind: ReadingStateWarningKind::Io,
+        file: "user-data/Fluid".into(),
+        message: "user-level reading-state persistence is unavailable".into(),
+    }
+}
+
+fn reading_state_error_warning(
+    store: &ReadingStateStore,
+    error: ReadingStateError,
+) -> ReadingStateWarning {
+    let kind = match &error {
+        ReadingStateError::Io(_) => ReadingStateWarningKind::Io,
+        ReadingStateError::InvalidProjectRoot(_) => ReadingStateWarningKind::InvalidPath,
+        ReadingStateError::InvalidIndex(_) | ReadingStateError::InvalidSnapshot(_) => {
+            ReadingStateWarningKind::InvalidValue
+        }
+    };
+    ReadingStateWarning {
+        kind,
+        file: store.root().display().to_string(),
+        message: error.to_string(),
+    }
+}
+
+fn load_workspace_snapshot(
+    store: Option<&ReadingStateStore>,
+    project_root: &FsPath,
+) -> (Option<ProjectReadingSnapshot>, Vec<ReadingStateWarning>) {
+    let Some(store) = store else {
+        return (None, vec![persistence_unavailable_warning()]);
+    };
+    match store.load_project(project_root) {
+        Ok(loaded) => (loaded.value.map(|record| record.snapshot), loaded.warnings),
+        Err(error) => (None, vec![reading_state_error_warning(store, error)]),
+    }
+}
+
+async fn current_workspace(State(state): State<Shared>) -> Json<CurrentWorkspaceResponse> {
+    let project = state.project.read().unwrap();
+    let Some(project) = project.as_ref() else {
+        return Json(CurrentWorkspaceResponse {
+            project_root: None,
+            snapshot: None,
+            warnings: state
+                .reading_state
+                .is_none()
+                .then(persistence_unavailable_warning)
+                .into_iter()
+                .collect(),
+        });
+    };
+    let project_root = project_root_string(project.reader.root());
+    let (snapshot, warnings) =
+        load_workspace_snapshot(state.reading_state.as_ref(), project.reader.root());
+    Json(CurrentWorkspaceResponse {
+        project_root: Some(project_root),
+        snapshot,
+        warnings,
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SaveCurrentWorkspaceRequest {
+    project_root: String,
+    snapshot: ProjectReadingSnapshot,
+}
+
+#[derive(Serialize)]
+struct SaveCurrentWorkspaceResponse {
+    saved: bool,
+}
+
+async fn save_current_workspace(
+    State(state): State<Shared>,
+    Json(request): Json<SaveCurrentWorkspaceRequest>,
+) -> impl IntoResponse {
+    let Some(store) = state.reading_state.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "user-level reading-state persistence is unavailable",
+        )
+            .into_response();
+    };
+    // Keep the root read lock through the atomic save. An Open Folder write
+    // therefore either happens fully before this comparison (409) or fully after
+    // the old-root snapshot has committed; it cannot redirect bytes mid-save.
+    let project = state.project.read().unwrap();
+    let Some(project) = project.as_ref() else {
+        return (StatusCode::CONFLICT, "no current project root").into_response();
+    };
+    let current_root = project_root_string(project.reader.root());
+    if request.project_root != current_root {
+        return (
+            StatusCode::CONFLICT,
+            "workspace projectRoot no longer matches the current project",
+        )
+            .into_response();
+    }
+    match store.save_project(
+        project.reader.root(),
+        &request.snapshot,
+        &current_query_timestamp(),
+    ) {
+        Ok(()) => Json(SaveCurrentWorkspaceResponse { saved: true }).into_response(),
+        Err(error @ ReadingStateError::InvalidProjectRoot(_))
+        | Err(error @ ReadingStateError::InvalidIndex(_))
+        | Err(error @ ReadingStateError::InvalidSnapshot(_)) => {
+            (StatusCode::BAD_REQUEST, error.to_string()).into_response()
+        }
+        Err(error @ ReadingStateError::Io(_)) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct FileQuery {
     path: String,
@@ -298,6 +448,8 @@ struct OpenRequest {
 #[derive(Serialize)]
 struct OpenResponse {
     root: String,
+    snapshot: Option<ProjectReadingSnapshot>,
+    warnings: Vec<ReadingStateWarning>,
 }
 
 /// `POST /api/project/open { path }` — switch the served project root (U3, single
@@ -330,15 +482,36 @@ async fn open_folder(
                 .into_response()
         }
     };
-    let root = reader.root().display().to_string();
-    *state.project.write().unwrap() = Some(ProjectCtx {
-        reader,
-        graphs,
-        cache,
-        query_threads,
-    });
+    let root_path = reader.root().to_path_buf();
+    let root = project_root_string(&root_path);
+    let (snapshot, mut warnings) =
+        load_workspace_snapshot(state.reading_state.as_ref(), &root_path);
+    {
+        // Serialize root swaps with the recent-project write. A failed index
+        // commit is reported but never restores the old ProjectCtx.
+        let mut project = state.project.write().unwrap();
+        *project = Some(ProjectCtx {
+            reader,
+            graphs,
+            cache,
+            query_threads,
+        });
+        if let Some(store) = state.reading_state.as_ref() {
+            if let Err(error) = store.save_recent_project(&root_path) {
+                warnings.push(reading_state_error_warning(store, error));
+            }
+        }
+    }
     eprintln!("[open] switched project root to {root}");
-    (StatusCode::OK, Json(OpenResponse { root })).into_response()
+    (
+        StatusCode::OK,
+        Json(OpenResponse {
+            root,
+            snapshot,
+            warnings,
+        }),
+    )
+        .into_response()
 }
 
 #[derive(Deserialize)]
@@ -4409,6 +4582,7 @@ mod tests {
     use crate::orientation::{
         ActorBoundary, CodeEvidenceRef, OrientationActor, OrientationWalkthrough, WalkthroughStep,
     };
+    use crate::reading_state::{canonical_project_root, ProjectReadingSnapshot, ReadingStateStore};
     use futures_util::SinkExt;
     use tokio_tungstenite::tungstenite::Message as ClientMessage;
 
@@ -4496,6 +4670,15 @@ mod tests {
         )
     }
 
+    fn sample_workspace_snapshot(active_file: &str) -> ProjectReadingSnapshot {
+        ProjectReadingSnapshot {
+            expanded_directories: vec!["src".into()],
+            open_files: vec![active_file.into()],
+            active_file: Some(active_file.into()),
+            reading_positions: BTreeMap::new(),
+        }
+    }
+
     fn write_file_graph(scope: &Path, directory: &str, file_path: &str, summary: &str) {
         let graph_dir = scope.join(directory);
         std::fs::create_dir_all(&graph_dir).unwrap();
@@ -4573,6 +4756,236 @@ mod tests {
         let state = Arc::new(make_state(nested_only.path(), ""));
         let Json(projected) = super::graph(State(state)).await;
         assert!(projected.is_none());
+    }
+
+    #[tokio::test]
+    async fn workspace_routes_open_load_save_and_reject_a_stale_project_root() {
+        let temp = TmpDir::new();
+        let left = temp.path().join("left");
+        let right = temp.path().join("right");
+        std::fs::create_dir_all(left.join("src")).unwrap();
+        std::fs::create_dir_all(right.join("src")).unwrap();
+        std::fs::write(left.join("src/left.rs"), "fn left() {}\n").unwrap();
+        std::fs::write(right.join("src/right.rs"), "fn right() {}\n").unwrap();
+        let store = ReadingStateStore::new(temp.path().join("user-data"));
+        let right_snapshot = sample_workspace_snapshot("src/right.rs");
+        store
+            .save_project(&right, &right_snapshot, "2026-08-13T01:00:00Z")
+            .unwrap();
+        let config = LlmConfig {
+            base_url: "https://test/v1".into(),
+            model: "test-model".into(),
+            api_key: String::new(),
+        };
+        let app = start_query_app(
+            AppState::new_no_project(config, temp.path().join(".env"), "p1")
+                .with_reading_state(Some(store.clone())),
+        )
+        .await;
+        let client = reqwest::Client::new();
+
+        let empty: serde_json::Value = client
+            .get(format!("{}/api/workspace/current", app.http_base_url))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(empty["projectRoot"], serde_json::Value::Null);
+        assert_eq!(empty["snapshot"], serde_json::Value::Null);
+        assert_eq!(empty["warnings"], serde_json::json!([]));
+
+        let opened_left: serde_json::Value = client
+            .post(format!("{}/api/project/open", app.http_base_url))
+            .json(&serde_json::json!({ "path": left }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let left_root = canonical_project_root(&left).unwrap();
+        assert_eq!(opened_left["root"], left_root);
+        assert_eq!(opened_left["snapshot"], serde_json::Value::Null);
+        assert_eq!(opened_left["warnings"], serde_json::json!([]));
+
+        let left_snapshot = sample_workspace_snapshot("src/left.rs");
+        let saved: serde_json::Value = client
+            .put(format!("{}/api/workspace/current", app.http_base_url))
+            .json(&serde_json::json!({
+                "projectRoot": left_root,
+                "snapshot": left_snapshot,
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(saved, serde_json::json!({ "saved": true }));
+
+        let current: serde_json::Value = client
+            .get(format!("{}/api/workspace/current", app.http_base_url))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(current["projectRoot"], left_root);
+        assert_eq!(
+            current["snapshot"],
+            serde_json::to_value(&left_snapshot).unwrap()
+        );
+        assert_eq!(current["warnings"], serde_json::json!([]));
+
+        let opened_right: serde_json::Value = client
+            .post(format!("{}/api/project/open", app.http_base_url))
+            .json(&serde_json::json!({ "path": right }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let right_root = canonical_project_root(&right).unwrap();
+        assert_eq!(opened_right["root"], right_root);
+        assert_eq!(
+            opened_right["snapshot"],
+            serde_json::to_value(&right_snapshot).unwrap()
+        );
+        assert_eq!(opened_right["warnings"], serde_json::json!([]));
+
+        let stale = client
+            .put(format!("{}/api/workspace/current", app.http_base_url))
+            .json(&serde_json::json!({
+                "projectRoot": left_root,
+                "snapshot": sample_workspace_snapshot("src/left.rs"),
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            store.load_project(&left).unwrap().value.unwrap().snapshot,
+            left_snapshot
+        );
+        assert_eq!(
+            store
+                .load_index()
+                .unwrap()
+                .value
+                .unwrap()
+                .recent_project_root,
+            Some(right_root)
+        );
+    }
+
+    #[tokio::test]
+    async fn recent_index_failure_does_not_roll_back_a_successful_project_open() {
+        let temp = TmpDir::new();
+        let left = temp.path().join("left");
+        let right = temp.path().join("right");
+        std::fs::create_dir_all(&left).unwrap();
+        std::fs::create_dir_all(&right).unwrap();
+        let store = ReadingStateStore::new(temp.path().join("user-data"));
+        store.save_recent_project(&left).unwrap();
+        store.fail_next_atomic_replace_for_test();
+        let config = LlmConfig {
+            base_url: "https://test/v1".into(),
+            model: "test-model".into(),
+            api_key: String::new(),
+        };
+        let app = start_query_app(
+            AppState::new_no_project(config, temp.path().join(".env"), "p1")
+                .with_reading_state(Some(store.clone())),
+        )
+        .await;
+
+        let response = reqwest::Client::new()
+            .post(format!("{}/api/project/open", app.http_base_url))
+            .json(&serde_json::json!({ "path": right }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["root"], canonical_project_root(&right).unwrap());
+        assert_eq!(body["warnings"][0]["kind"], "io");
+        assert_eq!(
+            app.state
+                .project
+                .read()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .reader
+                .root(),
+            right.canonicalize().unwrap()
+        );
+        assert_eq!(
+            store
+                .load_index()
+                .unwrap()
+                .value
+                .unwrap()
+                .recent_project_root,
+            Some(canonical_project_root(&left).unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_routes_keep_projects_open_when_user_persistence_is_unavailable() {
+        let temp = TmpDir::new();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let config = LlmConfig {
+            base_url: "https://test/v1".into(),
+            model: "test-model".into(),
+            api_key: String::new(),
+        };
+        let app = start_query_app(AppState::new_no_project(
+            config,
+            temp.path().join(".env"),
+            "p1",
+        ))
+        .await;
+        let client = reqwest::Client::new();
+
+        let opened = client
+            .post(format!("{}/api/project/open", app.http_base_url))
+            .json(&serde_json::json!({ "path": project }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(opened.status(), StatusCode::OK);
+        let opened: serde_json::Value = opened.json().await.unwrap();
+        assert_eq!(opened["snapshot"], serde_json::Value::Null);
+        assert_eq!(opened["warnings"][0]["kind"], "io");
+
+        let save = client
+            .put(format!("{}/api/workspace/current", app.http_base_url))
+            .json(&serde_json::json!({
+                "projectRoot": canonical_project_root(&project).unwrap(),
+                "snapshot": sample_workspace_snapshot("a.rs"),
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(save.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            app.state
+                .project
+                .read()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .reader
+                .root(),
+            project.canonicalize().unwrap()
+        );
     }
 
     #[tokio::test]

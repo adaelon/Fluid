@@ -12,9 +12,6 @@ mod llm_proxy;
 #[allow(dead_code)]
 mod orientation;
 mod project_reader;
-// S-WSTATE-1 lands the user-level reading-state persistence boundary before
-// startup/routes consume it in S-WSTART-1.
-#[allow(dead_code)]
 mod reading_state;
 // S-QTHREAD-1 lands the project-scoped persistence boundary before S-QAPI-1
 // adds the first route consumer. Keep the staged allowance local to the module.
@@ -37,13 +34,16 @@ use clap::Parser;
 
 use cache_store::CacheStore;
 use graph_loader::GraphCatalog;
-use project_reader::ProjectReader;
 use query_history::QueryThreadStore;
+use reading_state::ReadingStateStore;
 use routes::AppState;
 #[cfg(windows)]
 use settings::windows_env_path;
 use settings::LlmConfig;
-use startup::{select_listener, StartupSelection};
+use startup::{
+    handoff_project_if_present, record_startup_project, select_listener, select_startup_project,
+    StartupProjectDecision, StartupProjectSource, StartupSelection,
+};
 
 /// Prompt template version — bump when the generation prompt changes (invalidates
 /// cache, ADR-0003). The model version is now the real model id (S6); both feed the
@@ -53,8 +53,8 @@ const PROMPT_VERSION: &str = "p1";
 #[derive(Parser)]
 #[command(name = "fluid", about = "Fluid — read-only code understanding backend")]
 struct Args {
-    /// Path to the project directory to serve. Optional — omit it to start without a
-    /// project and pick one from the UI (Open Folder).
+    /// Path to the project directory to serve. Optional — omit it to restore the
+    /// recent project when available, otherwise pick one from the UI (Open Folder).
     project: Option<PathBuf>,
 
     /// Port to bind on 127.0.0.1. When omitted, Fluid reuses a compatible server
@@ -106,8 +106,11 @@ async fn main() -> anyhow::Result<()> {
     let (listener, url) = match startup {
         StartupSelection::Reuse { url } => {
             println!("Fluid 已在运行,复用现有实例 → {url}");
-            if let Some(project) = args.project.as_deref() {
-                startup::handoff_project(&url, project).await?;
+            if handoff_project_if_present(&url, args.project.as_deref()).await? {
+                let project = args
+                    .project
+                    .as_deref()
+                    .expect("successful handoff requires an explicit project");
                 println!("已将项目交给现有实例: {}", project.display());
             }
             let _ = open::that(&url);
@@ -121,6 +124,22 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     let (env_path, llm_config) = load_llm_config()?;
+    let reading_state = match ReadingStateStore::for_current_user() {
+        Ok(store) => Some(store),
+        Err(error) => {
+            eprintln!("warning: user-level reading-state persistence is unavailable: {error}");
+            None
+        }
+    };
+    let StartupProjectDecision {
+        project,
+        source,
+        diagnostics,
+    } = select_startup_project(args.project, reading_state.as_ref())
+        .map_err(|error| anyhow::anyhow!("cannot open project directory: {error}"))?;
+    for diagnostic in diagnostics {
+        eprintln!("warning: {diagnostic}");
+    }
 
     // The model id drives both the LLM call and the cache key, so they stay in
     // lock-step (a model switch invalidates the cache). All three values live in a
@@ -134,13 +153,19 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Project is optional: with a path we serve it immediately; without one we start
-    // empty and let the user open a folder from the UI (which calls /api/project/open).
-    let state = match args.project {
-        Some(path) => {
-            let reader = ProjectReader::new(path)
-                .map_err(|e| anyhow::anyhow!("cannot open project directory: {e}"))?;
-            println!("Fluid serving project: {}", reader.root().display());
+    // Project is optional: an explicit path wins; otherwise a valid recent root is
+    // restored, falling back to an empty Open Folder state.
+    let state = match project {
+        Some(reader) => {
+            match source {
+                StartupProjectSource::Explicit => {
+                    println!("Fluid serving project: {}", reader.root().display())
+                }
+                StartupProjectSource::Recent => {
+                    println!("Fluid restored recent project: {}", reader.root().display())
+                }
+                StartupProjectSource::None => unreachable!("project source must identify a root"),
+            }
             let graphs = GraphCatalog::discover(reader.root());
             debug_assert_eq!(graphs.project_root(), reader.root());
             if graphs.is_empty() {
@@ -180,6 +205,10 @@ async fn main() -> anyhow::Result<()> {
             }
             let cache = CacheStore::new(reader.root(), &llm_config.model, PROMPT_VERSION);
             let query_threads = QueryThreadStore::new(reader.root())?;
+            if let Some(diagnostic) = record_startup_project(reading_state.as_ref(), Some(&reader))
+            {
+                eprintln!("warning: {diagnostic}");
+            }
             AppState::new(
                 reader,
                 graphs,
@@ -189,10 +218,12 @@ async fn main() -> anyhow::Result<()> {
                 env_path,
                 PROMPT_VERSION,
             )
+            .with_reading_state(reading_state)
         }
         None => {
             println!("No project specified — open a folder from the UI to begin");
             AppState::new_no_project(llm_config, env_path, PROMPT_VERSION)
+                .with_reading_state(reading_state)
         }
     };
 
