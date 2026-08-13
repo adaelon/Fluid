@@ -28,6 +28,15 @@ import {
   type RenderedHighlightRect,
   type RenderedTextIndex,
 } from './markdownFind.ts'
+import {
+  captureMarkdownReadingAnchor,
+  correctedMarkdownAnchorScrollTop,
+  indexMarkdownContentBlocks,
+  normalizeMarkdownReadingAnchor,
+  resolveMarkdownReadingAnchor,
+  type MarkdownBlockIdentity,
+  type MarkdownReadingAnchor,
+} from './readingAnchor.ts'
 
 const props = defineProps<{
   source: string
@@ -36,10 +45,12 @@ const props = defineProps<{
 }>()
 const emit = defineEmits<{
   'find-state': [InFileFindSnapshot]
+  'reading-anchor': [MarkdownReadingAnchor]
 }>()
 
 const html = ref('')
 const scroll = ref<HTMLElement | null>(null)
+const head = ref<HTMLElement | null>(null)
 const article = ref<HTMLElement | null>(null)
 const findOverlayRects = ref<RenderedHighlightRect[]>([])
 // 'en' shows props.source; 'zh' shows the translated chunks joined in order.
@@ -72,8 +83,212 @@ let appliedFindQuery = createInFileSearchQuery(EMPTY_FIND_QUERY)
 let findResizeObserver: ResizeObserver | null = null
 let findResizeFrame = 0
 
+const MARKDOWN_CONTENT_BLOCK_SELECTOR = 'h1,h2,h3,h4,h5,h6,p,li,pre,blockquote,table'
+const READING_ANCHOR_SCROLL_EPSILON_PX = 0.5
+const READING_ANCHOR_RATIO_EPSILON = 0.000_001
+const READING_ANCHOR_NAVIGATION_KEYS = new Set([
+  'ArrowUp',
+  'ArrowDown',
+  'ArrowLeft',
+  'ArrowRight',
+  'PageUp',
+  'PageDown',
+  'Home',
+  'End',
+  ' ',
+  'Spacebar',
+])
+
+interface IndexedMarkdownBlock {
+  element: HTMLElement
+  identity: MarkdownBlockIdentity
+}
+
+interface MeasuredMarkdownBlock extends IndexedMarkdownBlock {
+  rect: DOMRect
+}
+
+let renderedAnchorBlocks: IndexedMarkdownBlock[] = []
+let readingAnchorRestoreSequence = 0
+let restoredReadingAnchor: MarkdownReadingAnchor | null = null
+let lastEmittedReadingAnchor: MarkdownReadingAnchor | null = null
+let readingAnchorCorrectionFrame = 0
+let readingAnchorEmitFrame = 0
+
 function zhSource(): string {
   return zhChunks.value.join('')
+}
+
+function rebuildMarkdownAnchorBlocks(): void {
+  const root = article.value
+  if (!root) {
+    renderedAnchorBlocks = []
+    return
+  }
+
+  const elements = Array.from(
+    root.querySelectorAll<HTMLElement>(MARKDOWN_CONTENT_BLOCK_SELECTOR),
+  ).filter((element) => element.getClientRects().length > 0)
+  const identities = indexMarkdownContentBlocks(elements.map((element) => element.innerText))
+  renderedAnchorBlocks = elements.flatMap((element, index) => {
+    const identity = identities[index]
+    return identity ? [{ element, identity }] : []
+  })
+}
+
+function measuredMarkdownBlocks(): MeasuredMarkdownBlock[] {
+  return renderedAnchorBlocks.flatMap((block) => {
+    if (!block.element.isConnected || block.element.getClientRects().length === 0) return []
+    const rect = block.element.getBoundingClientRect()
+    return rect.width > 0 && rect.height > 0 ? [{ ...block, rect }] : []
+  })
+}
+
+function markdownContentViewportTop(scroller: HTMLElement): number {
+  const viewport = scroller.getBoundingClientRect()
+  const stickyBottom = head.value?.getBoundingClientRect().bottom ?? viewport.top
+  return Math.min(viewport.bottom, Math.max(viewport.top, stickyBottom))
+}
+
+function topVisibleMarkdownBlock(
+  blocks: readonly MeasuredMarkdownBlock[],
+  contentViewportTop: number,
+  viewportBottom: number,
+): MeasuredMarkdownBlock | null {
+  const visible = blocks.filter((block) => (
+    block.rect.bottom > contentViewportTop && block.rect.top < viewportBottom
+  ))
+  visible.sort((left, right) => {
+    const leftIntersectsTop = left.rect.top <= contentViewportTop
+    const rightIntersectsTop = right.rect.top <= contentViewportTop
+    if (leftIntersectsTop !== rightIntersectsTop) return leftIntersectsTop ? -1 : 1
+    if (leftIntersectsTop) {
+      return (right.rect.top - left.rect.top) || (left.rect.height - right.rect.height)
+    }
+    return (left.rect.top - right.rect.top) || (left.rect.height - right.rect.height)
+  })
+  return visible[0] ?? null
+}
+
+function captureReadingAnchor(): MarkdownReadingAnchor | null {
+  const scroller = scroll.value
+  if (!scroller || !renderedText) return null
+  const viewport = scroller.getBoundingClientRect()
+  const contentViewportTop = markdownContentViewportTop(scroller)
+  const block = topVisibleMarkdownBlock(
+    measuredMarkdownBlocks(),
+    contentViewportTop,
+    viewport.bottom,
+  )
+  if (!block) return null
+
+  return captureMarkdownReadingAnchor({
+    ...block.identity,
+    offsetPx: block.rect.top - contentViewportTop,
+    scrollTop: scroller.scrollTop,
+    scrollHeight: scroller.scrollHeight,
+    clientHeight: scroller.clientHeight,
+  })
+}
+
+function sameReadingAnchor(
+  left: MarkdownReadingAnchor | null,
+  right: MarkdownReadingAnchor,
+): boolean {
+  return left !== null
+    && left.blockDigest === right.blockDigest
+    && left.occurrence === right.occurrence
+    && Math.abs(left.offsetPx - right.offsetPx) < READING_ANCHOR_SCROLL_EPSILON_PX
+    && Math.abs(left.scrollRatio - right.scrollRatio) < READING_ANCHOR_RATIO_EPSILON
+}
+
+function scheduleReadingAnchorEmit(): void {
+  const fileToken = token
+  const request = renderRequest
+  const filePath = props.path
+  window.cancelAnimationFrame(readingAnchorEmitFrame)
+  readingAnchorEmitFrame = window.requestAnimationFrame(() => {
+    readingAnchorEmitFrame = 0
+    if (fileToken !== token || request !== renderRequest || filePath !== props.path) return
+    const anchor = captureReadingAnchor()
+    if (!anchor || sameReadingAnchor(lastEmittedReadingAnchor, anchor)) return
+    lastEmittedReadingAnchor = anchor
+    emit('reading-anchor', anchor)
+  })
+}
+
+function cancelReadingAnchorRestore(): void {
+  readingAnchorRestoreSequence++
+  restoredReadingAnchor = null
+  window.cancelAnimationFrame(readingAnchorCorrectionFrame)
+  readingAnchorCorrectionFrame = 0
+}
+
+function scheduleReadingAnchorCorrection(): void {
+  const anchor = restoredReadingAnchor
+  if (!renderedText || !anchor || mode.value !== 'en') return
+  const sequence = readingAnchorRestoreSequence
+  const fileToken = token
+  const request = renderRequest
+  const filePath = props.path
+  window.cancelAnimationFrame(readingAnchorCorrectionFrame)
+  readingAnchorCorrectionFrame = window.requestAnimationFrame(() => {
+    readingAnchorCorrectionFrame = 0
+    const scroller = scroll.value
+    if (
+      !scroller
+      || !renderedText
+      || anchor !== restoredReadingAnchor
+      || sequence !== readingAnchorRestoreSequence
+      || fileToken !== token
+      || request !== renderRequest
+      || filePath !== props.path
+      || mode.value !== 'en'
+    ) return
+
+    const blocks = measuredMarkdownBlocks()
+    const resolved = resolveMarkdownReadingAnchor(
+      anchor,
+      blocks.map((block) => block.identity),
+    )
+    if (!resolved) return
+    const contentViewportTop = markdownContentViewportTop(scroller)
+    const target = resolved.mode === 'block' ? blocks[resolved.blockIndex] : null
+    const currentOffsetPx = target ? target.rect.top - contentViewportTop : null
+    const nextScrollTop = correctedMarkdownAnchorScrollTop(resolved, {
+      scrollTop: scroller.scrollTop,
+      currentOffsetPx,
+      maxScrollTop: scroller.scrollHeight - scroller.clientHeight,
+    })
+    if (nextScrollTop === null) return
+    if (Math.abs(scroller.scrollTop - nextScrollTop) >= READING_ANCHOR_SCROLL_EPSILON_PX) {
+      scroller.scrollTop = nextScrollTop
+    }
+    scheduleReadingAnchorEmit()
+  })
+}
+
+function restoreReadingAnchor(anchor: MarkdownReadingAnchor): boolean {
+  const normalized = normalizeMarkdownReadingAnchor(anchor)
+  if (!normalized || !scroll.value || mode.value !== 'en') {
+    cancelReadingAnchorRestore()
+    return false
+  }
+
+  readingAnchorRestoreSequence++
+  restoredReadingAnchor = normalized
+  scheduleReadingAnchorCorrection()
+  return true
+}
+
+function onReadingAnchorPointerDown(event: PointerEvent): void {
+  const scroller = scroll.value
+  if (!scroller || (event.button !== 1 && event.target !== scroller)) return
+  cancelReadingAnchorRestore()
+}
+
+function onReadingAnchorKeyDown(event: KeyboardEvent): void {
+  if (READING_ANCHOR_NAVIGATION_KEYS.has(event.key)) cancelReadingAnchorRestore()
 }
 
 function sameRange(left: FindRange, right: FindRange): boolean {
@@ -108,6 +323,7 @@ function scrollRangeIntoView(range: Range | null): void {
 }
 
 function paintFindHighlights(scrollCurrent: boolean): void {
+  if (scrollCurrent) cancelReadingAnchorRestore()
   if (!renderedText) return
   const mapped = findHighlights.apply(
     findRevision,
@@ -142,6 +358,12 @@ function scheduleFindRepaint(): void {
     findResizeFrame = 0
     if (renderedText && findMatches.length > 0) paintFindHighlights(false)
   })
+}
+
+function onArticleResize(): void {
+  scheduleFindRepaint()
+  scheduleReadingAnchorCorrection()
+  scheduleReadingAnchorEmit()
 }
 
 function applyFindQuery(
@@ -188,6 +410,7 @@ function applyFindQuery(
 }
 
 function moveFind(direction: InFileFindDirection): void {
+  cancelReadingAnchorRestore()
   if (!renderedText || !appliedFindQuery.valid || findMatches.length === 0) {
     emitFindState()
     return
@@ -202,7 +425,19 @@ function focusContent(): void {
   article.value?.focus({ preventScroll: true })
 }
 
-defineExpose({ moveFind, focusContent } satisfies InFileFindSurfaceHandle)
+interface MarkdownSurfaceHandle extends InFileFindSurfaceHandle {
+  captureReadingAnchor(): MarkdownReadingAnchor | null
+  restoreReadingAnchor(anchor: MarkdownReadingAnchor): boolean
+  cancelReadingAnchorRestore(): void
+}
+
+defineExpose({
+  moveFind,
+  focusContent,
+  captureReadingAnchor,
+  restoreReadingAnchor,
+  cancelReadingAnchorRestore,
+} satisfies MarkdownSurfaceHandle)
 
 // Render whichever source the current mode selects (en original / zh-so-far).
 async function renderActive(preserveCurrent = true): Promise<void> {
@@ -213,6 +448,7 @@ async function renderActive(preserveCurrent = true): Promise<void> {
   findRevision = findHighlights.beginRevision()
   findOverlayRects.value = []
   renderedText = null
+  renderedAnchorBlocks = []
   const src = mode.value === 'zh' ? zhSource() : props.source
   const out = await renderDoc(src)
   if (t !== token || request !== renderRequest) return
@@ -221,11 +457,13 @@ async function renderActive(preserveCurrent = true): Promise<void> {
   if (t !== token || request !== renderRequest || !article.value) return
   await typesetMath(article.value)
   if (t !== token || request !== renderRequest || !article.value) return
+  rebuildMarkdownAnchorBlocks()
   renderedText = buildRenderedTextIndex(article.value)
   applyFindQuery(props.findQuery, {
     preserveQuery: preservedQuery,
     preserveRange: preservedRange,
   })
+  scheduleReadingAnchorCorrection()
 }
 
 function teardownStream(): void {
@@ -235,6 +473,7 @@ function teardownStream(): void {
 
 // Reset to the English original on every file switch (vacuum the translation state).
 function reset(): void {
+  cancelReadingAnchorRestore()
   token++
   teardownStream()
   mode.value = 'en'
@@ -247,16 +486,20 @@ function reset(): void {
   findMatches = []
   findCurrent = 0
   activeFindRange = null
+  lastEmittedReadingAnchor = null
+  renderedAnchorBlocks = []
   void renderActive(false)
 }
 
 async function showOriginal(): Promise<void> {
+  cancelReadingAnchorRestore()
   if (mode.value === 'en') return
   mode.value = 'en'
   await renderActive() // the stream (if any) keeps running in the background
 }
 
 function showChinese(): void {
+  cancelReadingAnchorRestore()
   error.value = ''
   mode.value = 'zh'
   // Already translated (or mid-stream) → just view what we have, no new request.
@@ -308,25 +551,41 @@ function showChinese(): void {
 
 onMounted(() => {
   if (typeof ResizeObserver !== 'undefined' && article.value) {
-    findResizeObserver = new ResizeObserver(scheduleFindRepaint)
+    findResizeObserver = new ResizeObserver(onArticleResize)
     findResizeObserver.observe(article.value)
   }
+  scroll.value?.addEventListener('scroll', scheduleReadingAnchorEmit, { passive: true })
+  scroll.value?.addEventListener('wheel', cancelReadingAnchorRestore, { passive: true })
+  scroll.value?.addEventListener('touchstart', cancelReadingAnchorRestore, { passive: true })
+  scroll.value?.addEventListener('pointerdown', onReadingAnchorPointerDown)
+  scroll.value?.addEventListener('keydown', onReadingAnchorKeyDown)
   void renderActive(false)
 })
 watch(() => [props.source, props.path], reset)
 watch(
   () => props.findQuery,
-  (query) => applyFindQuery(query, { scrollCurrent: true }),
+  (query) => {
+    cancelReadingAnchorRestore()
+    applyFindQuery(query, { scrollCurrent: true })
+  },
   { deep: true },
 )
 onBeforeUnmount(() => {
   token++
   renderRequest++
   window.cancelAnimationFrame(findResizeFrame)
+  window.cancelAnimationFrame(readingAnchorEmitFrame)
+  scroll.value?.removeEventListener('scroll', scheduleReadingAnchorEmit)
+  scroll.value?.removeEventListener('wheel', cancelReadingAnchorRestore)
+  scroll.value?.removeEventListener('touchstart', cancelReadingAnchorRestore)
+  scroll.value?.removeEventListener('pointerdown', onReadingAnchorPointerDown)
+  scroll.value?.removeEventListener('keydown', onReadingAnchorKeyDown)
+  cancelReadingAnchorRestore()
   findResizeObserver?.disconnect()
   findResizeObserver = null
   teardownStream()
   renderedText = null
+  renderedAnchorBlocks = []
   findMatches = []
   activeFindRange = null
   findOverlayRects.value = []
@@ -336,7 +595,7 @@ onBeforeUnmount(() => {
 
 <template>
   <div ref="scroll" class="fluid-doc-scroll">
-    <div class="fluid-doc-head">
+    <div ref="head" class="fluid-doc-head">
       <div class="fluid-doc-toggle" role="group" aria-label="原文或译文">
         <button
           type="button"
