@@ -54,6 +54,13 @@ import {
   type InFileFindSnapshot,
   type InFileFindSurfaceHandle,
 } from './inFileFind.ts'
+import {
+  captureCodeReadingAnchor,
+  correctedCodeAnchorScrollTop,
+  normalizeCodeReadingAnchor,
+  resolveCodeReadingAnchor,
+  type CodeReadingAnchor,
+} from './readingAnchor.ts'
 
 interface EvidenceReveal extends CodeEvidenceRef {
   revealKey: number
@@ -74,6 +81,7 @@ const emit = defineEmits<{
   progress: [GenerationProgress]
   context: [QueryContext]
   'find-state': [InFileFindSnapshot]
+  'reading-anchor': [CodeReadingAnchor]
 }>()
 
 // Push the current-file query snapshot up to QueryPanel (S10b-cap). Called on
@@ -100,6 +108,156 @@ const host = shallowRef<HTMLDivElement | null>(null)
 // ADR-0014: the CM6 EditorView is an imperative object. Hold it in a
 // shallowRef so Vue never deep-proxies its internal state. NEVER a plain ref().
 const view = shallowRef<EditorView | null>(null)
+
+const READING_ANCHOR_SCROLL_EPSILON_PX = 0.5
+const READING_ANCHOR_NAVIGATION_KEYS = new Set([
+  'ArrowUp',
+  'ArrowDown',
+  'ArrowLeft',
+  'ArrowRight',
+  'PageUp',
+  'PageDown',
+  'Home',
+  'End',
+  ' ',
+  'Spacebar',
+])
+const readingAnchorCorrectionMeasureKey = {}
+const readingAnchorEmitMeasureKey = {}
+let readingAnchorRestoreSequence = 0
+let restoredReadingAnchor: CodeReadingAnchor | null = null
+let lastEmittedReadingAnchor: CodeReadingAnchor | null = null
+
+function captureReadingAnchorFromView(editor: EditorView): CodeReadingAnchor | null {
+  const scrollerTop = editor.scrollDOM.getBoundingClientRect().top
+  const topBlock = editor.lineBlockAtHeight(scrollerTop - editor.documentTop)
+  const line = editor.state.doc.lineAt(topBlock.from)
+  const offsetPx = editor.documentTop + editor.lineBlockAt(line.from).top - scrollerTop
+  return captureCodeReadingAnchor({
+    topLine: line.number,
+    offsetPx,
+    totalLines: editor.state.doc.lines,
+  })
+}
+
+function captureReadingAnchor(): CodeReadingAnchor | null {
+  const editor = view.value
+  return editor ? captureReadingAnchorFromView(editor) : null
+}
+
+function sameReadingAnchor(
+  left: CodeReadingAnchor | null,
+  right: CodeReadingAnchor,
+): boolean {
+  return left !== null
+    && left.topLine === right.topLine
+    && left.totalLines === right.totalLines
+    && Math.abs(left.offsetPx - right.offsetPx) < READING_ANCHOR_SCROLL_EPSILON_PX
+}
+
+function scheduleReadingAnchorEmit(): void {
+  const editor = view.value
+  if (!editor || !currentPath) return
+  const token = activationToken
+  const filePath = currentPath
+  editor.requestMeasure({
+    key: readingAnchorEmitMeasureKey,
+    read: (measuredView) => captureReadingAnchorFromView(measuredView),
+    write: (anchor, measuredView) => {
+      if (
+        !anchor
+        || measuredView !== view.value
+        || token !== activationToken
+        || filePath !== currentPath
+        || sameReadingAnchor(lastEmittedReadingAnchor, anchor)
+      ) return
+      lastEmittedReadingAnchor = anchor
+      emit('reading-anchor', anchor)
+    },
+  })
+}
+
+function cancelReadingAnchorRestore(): void {
+  readingAnchorRestoreSequence++
+  restoredReadingAnchor = null
+}
+
+function scheduleReadingAnchorCorrection(): void {
+  const editor = view.value
+  const anchor = restoredReadingAnchor
+  if (!editor || !anchor) return
+
+  const sequence = readingAnchorRestoreSequence
+  const token = activationToken
+  const filePath = currentPath
+  editor.requestMeasure({
+    key: readingAnchorCorrectionMeasureKey,
+    read: (measuredView) => {
+      if (
+        measuredView !== view.value
+        || sequence !== readingAnchorRestoreSequence
+        || anchor !== restoredReadingAnchor
+        || token !== activationToken
+        || filePath !== currentPath
+      ) return null
+
+      const target = resolveCodeReadingAnchor(anchor, measuredView.state.doc.lines)
+      if (!target) return null
+      const line = measuredView.state.doc.line(target.lineNumber)
+      const scrollerTop = measuredView.scrollDOM.getBoundingClientRect().top
+      const currentOffsetPx = measuredView.documentTop
+        + measuredView.lineBlockAt(line.from).top
+        - scrollerTop
+      return correctedCodeAnchorScrollTop({
+        scrollTop: measuredView.scrollDOM.scrollTop,
+        currentOffsetPx,
+        savedOffsetPx: target.offsetPx,
+        maxScrollTop: measuredView.scrollDOM.scrollHeight - measuredView.scrollDOM.clientHeight,
+      })
+    },
+    write: (nextScrollTop, measuredView) => {
+      if (
+        nextScrollTop === null
+        || measuredView !== view.value
+        || sequence !== readingAnchorRestoreSequence
+        || anchor !== restoredReadingAnchor
+        || token !== activationToken
+        || filePath !== currentPath
+      ) return
+      if (
+        Math.abs(measuredView.scrollDOM.scrollTop - nextScrollTop)
+        >= READING_ANCHOR_SCROLL_EPSILON_PX
+      ) {
+        measuredView.scrollDOM.scrollTop = nextScrollTop
+      }
+    },
+  })
+}
+
+function restoreReadingAnchor(anchor: CodeReadingAnchor): boolean {
+  const editor = view.value
+  const normalized = normalizeCodeReadingAnchor(anchor)
+  if (!editor || !normalized || !resolveCodeReadingAnchor(normalized, editor.state.doc.lines)) {
+    cancelReadingAnchorRestore()
+    return false
+  }
+
+  readingAnchorRestoreSequence++
+  restoredReadingAnchor = normalized
+  scheduleReadingAnchorCorrection()
+  return true
+}
+
+function onReadingAnchorPointerDown(event: PointerEvent): void {
+  const editor = view.value
+  if (!editor || (event.button !== 1 && event.target !== editor.scrollDOM)) return
+  cancelReadingAnchorRestore()
+}
+
+function onReadingAnchorKeyDown(event: KeyboardEvent): void {
+  if (READING_ANCHOR_NAVIGATION_KEYS.has(event.key)) cancelReadingAnchorRestore()
+}
+
 let suppressFindStateEmit = false
 // GhostStore + scheduler are imperative too — plain (non-reactive) component state.
 const store = new GhostStore()
@@ -218,6 +376,7 @@ function emitFindState(state: EditorState): void {
 }
 
 function selectFindRange(editor: EditorView, range: FindRange): void {
+  cancelReadingAnchorRestore()
   const selection = EditorSelection.single(range.from, range.to)
   suppressFindStateEmit = true
   try {
@@ -229,6 +388,7 @@ function selectFindRange(editor: EditorView, range: FindRange): void {
   } finally {
     suppressFindStateEmit = false
   }
+  scheduleReadingAnchorEmit()
   emitFindState(editor.state)
 }
 
@@ -270,6 +430,7 @@ function moveFind(direction: InFileFindDirection): void {
   }
 
   const expectedCurrent = moveInFileFindCurrent(before.current, matches.length, direction)
+  cancelReadingAnchorRestore()
   suppressFindStateEmit = true
   let moved = false
   try {
@@ -287,6 +448,7 @@ function moveFind(direction: InFileFindDirection): void {
     selectFindRange(editor, matches[expectedCurrent - 1])
     return
   }
+  scheduleReadingAnchorEmit()
   emitFindState(editor.state)
 }
 
@@ -296,9 +458,19 @@ function focusContent(): void {
 
 interface EditorSurfaceHandle extends InFileFindSurfaceHandle {
   toggleGeneration(): void
+  captureReadingAnchor(): CodeReadingAnchor | null
+  restoreReadingAnchor(anchor: CodeReadingAnchor): boolean
+  cancelReadingAnchorRestore(): void
 }
 
-defineExpose({ moveFind, focusContent, toggleGeneration } satisfies EditorSurfaceHandle)
+defineExpose({
+  moveFind,
+  focusContent,
+  toggleGeneration,
+  captureReadingAnchor,
+  restoreReadingAnchor,
+  cancelReadingAnchorRestore,
+} satisfies EditorSurfaceHandle)
 
 function buildState(source: string, lang: string): EditorState {
   return EditorState.create({
@@ -315,6 +487,8 @@ function buildState(source: string, lang: string): EditorState {
       // Scroll → re-order the pending generation queue by the new viewport (S8).
       EditorView.updateListener.of((u) => {
         if (u.viewportChanged) scheduler?.reprioritize(viewportDist())
+        if (u.viewportChanged) scheduleReadingAnchorEmit()
+        if (u.geometryChanged) scheduleReadingAnchorCorrection()
         if (u.selectionSet) {
           const findSelection = u.transactions.some((transaction) => (
             transaction.isUserEvent('select.search')
@@ -405,6 +579,7 @@ function viewportDist(): Map<string, number> {
 
 function refresh(): void {
   view.value?.dispatch({ effects: refreshGhosts.of() })
+  scheduleReadingAnchorCorrection()
 }
 
 function cancelOrientationRequest(): void {
@@ -436,7 +611,10 @@ async function startCapsulesAfterOrientation(token: number, filePath: string): P
   refresh()
 
   const ids = currentRoster.map((fn) => fn.id)
-  if (ids.length > 0) scheduler.start(ids, viewportDist())
+  if (ids.length > 0) {
+    scheduleReadingAnchorCorrection()
+    scheduler.start(ids, viewportDist())
+  }
 }
 
 function requestOrientation(token: number, filePath: string): void {
@@ -668,6 +846,8 @@ async function explainLine(id: string, lineNumber: number): Promise<void> {
 
 // Activate a file: parse → orient → show card → schedule per-function generation.
 async function activate(source: string, lang: string, path: string): Promise<void> {
+  cancelReadingAnchorRestore()
+  lastEmittedReadingAnchor = null
   const token = ++activationToken
   scheduler?.stop()
   cancelOrientationRequest()
@@ -724,6 +904,10 @@ onMounted(() => {
     state: buildState(props.source, props.lang),
     parent: host.value!,
   })
+  view.value.scrollDOM.addEventListener('wheel', cancelReadingAnchorRestore, { passive: true })
+  view.value.scrollDOM.addEventListener('touchstart', cancelReadingAnchorRestore, { passive: true })
+  view.value.scrollDOM.addEventListener('pointerdown', onReadingAnchorPointerDown)
+  view.value.contentDOM.addEventListener('keydown', onReadingAnchorKeyDown)
   applyFindQuery(props.findQuery)
   window.addEventListener('keydown', onFontKey)
   window.addEventListener('keydown', onSelectionKey)
@@ -735,6 +919,7 @@ onMounted(() => {
 watch(
   () => [props.source, props.lang, props.path] as const,
   () => {
+    cancelReadingAnchorRestore()
     view.value?.setState(buildState(props.source, props.lang))
     applyFindQuery(props.findQuery)
     void activate(props.source, props.lang, props.path)
@@ -761,10 +946,12 @@ watch(
       )
       const position = editor.state.doc.line(lineNumber).from
       closeSelectionUi()
+      cancelReadingAnchorRestore()
       editor.dispatch({
         selection: { anchor: position },
         effects: EditorView.scrollIntoView(position, { y: 'center' }),
       })
+      scheduleReadingAnchorEmit()
       editor.focus()
     })
   },
@@ -772,10 +959,15 @@ watch(
 
 onBeforeUnmount(() => {
   activationToken++
+  view.value?.scrollDOM.removeEventListener('wheel', cancelReadingAnchorRestore)
+  view.value?.scrollDOM.removeEventListener('touchstart', cancelReadingAnchorRestore)
+  view.value?.scrollDOM.removeEventListener('pointerdown', onReadingAnchorPointerDown)
+  view.value?.contentDOM.removeEventListener('keydown', onReadingAnchorKeyDown)
   window.removeEventListener('keydown', onFontKey)
   window.removeEventListener('keydown', onSelectionKey)
   window.removeEventListener('resize', updateSelectionAnchor)
   document.removeEventListener('pointerdown', onDocumentPointerDown, true)
+  cancelReadingAnchorRestore()
   cancelOrientationRequest()
   cancelSelectionRequest()
   scheduler?.stop()
